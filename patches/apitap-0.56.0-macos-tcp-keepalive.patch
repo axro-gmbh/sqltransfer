@@ -1,0 +1,18 @@
+diff --git a/crates/apitap-core/src/wire/mywire.rs b/crates/apitap-core/src/wire/mywire.rs
+index a38bfe2..ae4bbcc 100644
+--- a/crates/apitap-core/src/wire/mywire.rs
++++ b/crates/apitap-core/src/wire/mywire.rs
+@@ -477,7 +477,12 @@ fn set_keepalive(tcp: &TcpStream) {
+         let idle: libc::c_int = 30;
+         let intvl: libc::c_int = 10;
+         let cnt: libc::c_int = 3;
+-        set(libc::IPPROTO_TCP, libc::TCP_KEEPIDLE, &idle);
++        // TCP_KEEPIDLE is Linux-only; Apple platforms spell the same option TCP_KEEPALIVE.
++        #[cfg(target_vendor = "apple")]
++        let keepidle = libc::TCP_KEEPALIVE;
++        #[cfg(not(target_vendor = "apple"))]
++        let keepidle = libc::TCP_KEEPIDLE;
++        set(libc::IPPROTO_TCP, keepidle, &idle);
+         set(libc::IPPROTO_TCP, libc::TCP_KEEPINTVL, &intvl);
+         set(libc::IPPROTO_TCP, libc::TCP_KEEPCNT, &cnt);
+     }

@@ -40,7 +40,29 @@ Minimal macOS desktop app (Python + Flet) for moving data from remote databases 
 - Connection test validates reachability at the TCP level (direct host:port or SSH-forwarded local port).
 - Source table browser uses direct metadata queries (`pymysql` for MySQL, `psycopg` for Postgres).
 - The UI targets Flet 1.0 (`page.show_dialog`, `page.window.*`, `ft.Clipboard()`); the older `page.snack_bar`/`page.window_width`/`page.clipboard` calls are gone and were silently ignored before they were replaced.
-- `apitap` is **not** installed from PyPI: it is built from the local checkout in `.vendor/apitap-lib/py-apitap` (editable install, currently v0.21.0). PyPI only ships Linux x86_64 wheels for apitap, so on macOS it has to come from source.
+- `apitap` is **not** installed from PyPI: PyPI only ships Linux x86_64 wheels, so on macOS it has to
+  be built from source (`.vendor/apitap-lib`, a Rust workspace built with maturin).
+- The installed build is **v0.56.0 with one local patch**. Upstream v0.56.0 does not compile on macOS:
+  `crates/apitap-core/src/wire/mywire.rs` sets TCP keepalive with the Linux-only `libc::TCP_KEEPIDLE`,
+  which Apple platforms call `TCP_KEEPALIVE`. The fix is in
+  `patches/apitap-0.56.0-macos-tcp-keepalive.patch` and is worth sending upstream.
+
+  Rebuilding it, without touching the checkout in `.vendor`:
+
+  ```zsh
+  cd /Volumes/T7/Projects/playground/sqltransfer
+  git -C .vendor/apitap-lib worktree add --detach /tmp/apitap-0.56 v0.56.0
+  git -C /tmp/apitap-0.56 apply "$PWD/patches/apitap-0.56.0-macos-tcp-keepalive.patch"
+  (cd /tmp/apitap-0.56/py-apitap && uv build --wheel --out-dir /tmp/apitap-wheels .)
+  VIRTUAL_ENV=$PWD/.venv314 uv pip install --reinstall /tmp/apitap-wheels/apitap-0.56.0-*.whl
+  git -C .vendor/apitap-lib worktree remove /tmp/apitap-0.56
+  ```
+
+  Going back to the previous setup (editable install off the local checkout at its own version):
+
+  ```zsh
+  VIRTUAL_ENV=$PWD/.venv314 uv pip install -e .vendor/apitap-lib/py-apitap
+  ```
 
 ## Quick Start
 

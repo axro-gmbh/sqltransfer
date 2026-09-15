@@ -6,7 +6,8 @@ readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
   "flet[desktop]>=1.0.0,<2.0",
-  "apitap>=0.5.0",
+  "apitap>=0.56.0",  # built locally on macOS, see README
+
   "sshtunnel>=0.4.0",
   "paramiko<4",
   "keyring>=25.6.0",
