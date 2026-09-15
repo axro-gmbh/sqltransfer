@@ -7,7 +7,6 @@ requires-python = ">=3.10"
 dependencies = [
   "flet[desktop]>=1.0.0,<2.0",
   "apitap>=0.56.0",  # built locally on macOS, see README
-
   "sshtunnel>=0.4.0",
   "paramiko<4",
   "keyring>=25.6.0",
@@ -19,6 +18,17 @@ dependencies = [
 dev = [
   "pytest>=8.3.0",
 ]
+
+[tool.flet]
+product = "SQL Transfer"
+company = "Axro"
+org = "de.axro"
+bundle_id = "de.axro.sqltransfer"
+
+# apitap has no macOS wheel on PyPI (Linux x86_64 only), so the bundle is built
+# against the locally built wheel. Rebuild instructions: see MACOS_BUILD.md.
+[tool.flet.dev_packages]
+apitap = ".vendor/apitap-0.56.0-cp39-abi3-macosx_11_0_arm64.whl"
 
 [build-system]
 requires = ["setuptools>=68", "wheel"]

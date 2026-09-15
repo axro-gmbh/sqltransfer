@@ -41,59 +41,80 @@ python -m compileall -q src run.py
 
 ## 4) App icon
 
-`flet build` picks icons up from the `assets/` folder next to the app, not from the project root:
+`flet build` reads icons from `assets/`, not from the project root:
 
-- `assets/icon.png` - used for every platform
-- `assets/icon_macos.png` - optional, overrides `icon.png` for the macOS bundle
+- `assets/icon.png` - default for every platform
+- `assets/icon_macos.png` - overrides it for the macOS bundle
 
-The current icon is `assets/icon.png` (1254x1254, transparent background, macOS-style rounded
-square with the shape already baked in). `flet build` hands it to `flutter_launcher_icons`, which
-generates the 16 to 1024 px variants inside the bundle.
+**The macOS source must be full-bleed.** `flutter_launcher_icons` draws the image onto a white
+rounded background inside the standard content box. A source that already carries its own rounded
+shape plus a transparent margin ends up framed twice: a white ring with the artwork shrunk to about
+60% of the tile. `assets/icon_macos.png` is therefore a flattened, edge-to-edge 1024x1024 version of
+`assets/icon.png` (transparent margin cropped on pixels with alpha > 200, corners filled with the
+tile colour).
 
-The icon only shows up in a bundle built with `flet build macos`. Running the app straight from
-`run.py` keeps the generic Flet icon in the Dock, because that window belongs to the prebuilt
-Flet client app. There is no runtime API to change it: `page.window.icon` has an effect on
-Windows only.
+Verifying the result without installing anything:
 
-## 5) Packaging options
+```zsh
+sips -s format png build/macos/sqltransfer.app/Contents/Resources/AppIcon.icns --out /tmp/icon.png
+open /tmp/icon.png
+```
 
-## Option A - Flet CLI (recommended if available)
+## 5) Packaging
 
-Install CLI tools first:
+Prerequisites, all of them hit during the first build:
+
+- **Full Xcode**, and the developer directory must point at it, not at the Command Line Tools:
+  ```zsh
+  sudo xcode-select --switch /Applications/Xcode.app/Contents/Developer
+  sudo xcodebuild -runFirstLaunch
+  xcode-select -p   # must print /Applications/Xcode.app/Contents/Developer
+  ```
+- **CocoaPods**: `brew install cocoapods`
+- **Flutter** is downloaded automatically on first build (about 3.8 GB into `~/flutter`)
+- **flet-cli must match flet**: `uv pip install "flet-cli==1.0.0"`
+
+The build itself:
 
 ```zsh
 cd /Volumes/T7/Projects/playground/sqltransfer
-source .venv314/bin/activate
-uv pip install "flet[all]" flet-cli
-flet --help
+.venv314/bin/flet build macos --arch arm64 --module-name run \
+  --exclude .venv .venv314 .vendor build tests .git .pytest_cache .idea patches --yes
 ```
 
-Depending on your installed CLI version, use one of these:
+- `--module-name run` because the entry point is `run.py`, not `main.py`
+- `--exclude` matters: without it the build copies `.vendor` (about 1 GB) into the bundle
+- app metadata (product name, bundle id, org) comes from `[tool.flet]` in `pyproject.toml`
+- `apitap` comes from the locally built wheel via `[tool.flet.dev_packages]`, since PyPI has no
+  macOS wheel
+
+Result: `build/macos/sqltransfer.app`, about 187 MB. The Flutter shell is universal, but every
+Python extension inside (apitap, psycopg, cffi) is arm64, so the bundle is arm64 only.
+
+## Signing and distribution
+
+Out of the box the bundle is **ad-hoc signed** (`Signature=adhoc`, `TeamIdentifier=not set`). That
+runs on the machine that built it. On any other Mac, Gatekeeper blocks it as soon as the download
+carries the quarantine flag, and the recipient has to allow it by hand in System Settings.
+
+For real distribution, Flet has the flags built in:
 
 ```zsh
-# Newer CLI variants
-flet build macos run.py
-
-# Older CLI variants
-flet pack run.py --name sqltransfer
+.venv314/bin/flet build macos --arch arm64 --module-name run \
+  --macos-distribution developer-id \
+  --macos-signing-identity "Developer ID Application: <name> (<TEAMID>)" \
+  --macos-notary-profile <notarytool-keychain-profile>
 ```
 
-If one command is not recognized, use the other and check `flet --help` output.
+This needs an Apple Developer Program membership. As of the last check this machine had no signing
+identity at all (`security find-identity -v -p codesigning` returned none).
 
-## Option B - PyInstaller fallback
-
-Use this if Flet CLI packaging is unavailable in your environment:
+Workaround for handing the app to a colleague without a certificate: use a transport that does not
+set quarantine (internal share, `scp`, USB), or have them run once:
 
 ```zsh
-cd /Volumes/T7/Projects/playground/sqltransfer
-source .venv314/bin/activate
-uv pip install pyinstaller
-pyinstaller --name sqltransfer --windowed --onedir run.py
+xattr -dr com.apple.quarantine /Applications/sqltransfer.app
 ```
-
-App output will be under:
-
-- `dist/sqltransfer.app` (or a `dist/sqltransfer/` bundle depending options)
 
 ## 6) First run checks
 
@@ -102,17 +123,6 @@ After building:
 1. Open the app and test `Test SSH connection` in Step 1.
 2. Test `Test DB form` / `Test SSH tunnel target` in DB profile setup.
 3. Run a small table transfer first.
-
-## 7) Optional signing (distribution)
-
-For distribution outside your machine, you will usually need code signing and (optionally) notarization:
-
-```zsh
-codesign --deep --force --verify --verbose --sign "Developer ID Application: YOUR NAME (TEAMID)" dist/sqltransfer.app
-codesign --verify --deep --strict --verbose=2 dist/sqltransfer.app
-```
-
-Notarization commands depend on your Apple developer setup and are intentionally omitted here.
 
 ## Notes
 
