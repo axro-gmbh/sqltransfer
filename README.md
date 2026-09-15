@@ -39,7 +39,8 @@ Minimal macOS desktop app (Python + Flet) for moving data from remote databases 
 - SSH tunneling currently requires `paramiko<4` due `sshtunnel` compatibility (`DSSKey` removal in newer Paramiko).
 - Connection test validates reachability at the TCP level (direct host:port or SSH-forwarded local port).
 - Source table browser uses direct metadata queries (`pymysql` for MySQL, `psycopg` for Postgres).
-- The UI targets Flet 0.86 (`page.show_dialog`, `page.window.*`); older `page.snack_bar`/`page.window_width` calls are silently ignored by that version.
+- The UI targets Flet 1.0 (`page.show_dialog`, `page.window.*`, `ft.Clipboard()`); the older `page.snack_bar`/`page.window_width`/`page.clipboard` calls are gone and were silently ignored before they were replaced.
+- `apitap` is **not** installed from PyPI: it is built from the local checkout in `.vendor/apitap-lib/py-apitap` (editable install, currently v0.21.0). PyPI only ships Linux x86_64 wheels for apitap, so on macOS it has to come from source.
 
 ## Quick Start
 
@@ -62,9 +63,10 @@ pip install -r requirements.txt
 python run.py
 ```
 
-`flet` is pinned to `>=0.86.2,<0.90`. The UI calls `page.show_dialog`, `page.window.*` and
-`ft.Clipboard()`; on 0.2x those calls are silently ignored (no error, no snack bar, no window
-size), and 0.90 drops APIs this version still relies on.
+`flet` is pinned to `flet[desktop]>=1.0.0,<2.0`. The UI calls `page.show_dialog`,
+`page.window.*` and `ft.Clipboard()`; on 0.2x those calls are silently ignored (no error, no
+snack bar, no window size). The `desktop` extra matters: without `flet-desktop` installed,
+Flet 1.0 tries to pull it at first start and then fails with `No module named 'flet_desktop'`.
 
 ## Run Tests
 

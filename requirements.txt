@@ -1,4 +1,4 @@
-flet>=0.86.2,<0.90
+flet[desktop]>=1.0.0,<2.0
 sshtunnel>=0.4.0
 paramiko<4
 keyring>=25.6.0
