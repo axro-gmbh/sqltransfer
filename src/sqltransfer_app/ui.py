@@ -251,7 +251,7 @@ def run_history_row(record: dict, on_reuse: Callable[[dict], None] | None = None
     )
     facts = ft.Row(
         [
-            _fact(ft.Icons.TABLE_CHART_OUTLINED, f"{record.get('scope_mode') or '?'}: {truncate(scope, 40)}"),
+            _fact(ft.Icons.TABLE_CHART_OUTLINED, f"{record.get('scope_mode') or '?'}: {truncate(scope, 40)}", expand=True),
             _fact(ft.Icons.STORAGE, f"{format_rows(record.get('rows_copied'))} rows"),
             _fact(ft.Icons.TIMER_OUTLINED, format_duration(record.get("elapsed_ms"))),
         ],
@@ -259,10 +259,19 @@ def run_history_row(record: dict, on_reuse: Callable[[dict], None] | None = None
         wrap=True,
     )
     children: list[ft.Control] = [header, route, facts]
-    message = truncate(record.get("message"), 140)
+    message = truncate(record.get("message"), 220)
     if message:
+        # max_lines alone clips mid-word without a marker; ELLIPSIS puts the marker
+        # wherever the line actually ends, whatever the card width turns out to be.
         children.append(
-            ft.Text(message, size=11, color=ft.Colors.ON_SURFACE_VARIANT, tooltip=record.get("message"), max_lines=2)
+            ft.Text(
+                message,
+                size=11,
+                color=ft.Colors.ON_SURFACE_VARIANT,
+                tooltip=record.get("message"),
+                max_lines=2,
+                overflow=ft.TextOverflow.ELLIPSIS,
+            )
         )
     return ft.Container(
         padding=12,
@@ -272,11 +281,21 @@ def run_history_row(record: dict, on_reuse: Callable[[dict], None] | None = None
     )
 
 
-def _fact(icon: ft.IconData, text: str) -> ft.Control:
+def _fact(icon: ft.IconData, text: str, expand: bool = False) -> ft.Control:
     return ft.Row(
-        [ft.Icon(icon, size=13, color=ft.Colors.ON_SURFACE_VARIANT), ft.Text(text, size=11, color=ft.Colors.ON_SURFACE_VARIANT)],
+        [
+            ft.Icon(icon, size=13, color=ft.Colors.ON_SURFACE_VARIANT),
+            ft.Text(
+                text,
+                size=11,
+                color=ft.Colors.ON_SURFACE_VARIANT,
+                max_lines=1,
+                overflow=ft.TextOverflow.ELLIPSIS,
+                expand=expand or None,
+            ),
+        ],
         spacing=4,
-        tight=True,
+        tight=not expand,
     )
 
 
