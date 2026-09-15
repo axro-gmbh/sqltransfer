@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# virtual environments
+.venv/
+.venv*/
+
+# vendored checkouts (own git repos, not part of this project)
+.vendor/
+
+# editors
+.idea/
+.vscode/
+
+# macOS
+.DS_Store
+
+# build output
+build/
+dist/
+*.egg-info/
