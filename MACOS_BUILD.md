@@ -39,7 +39,23 @@ pytest -q
 python -m compileall -q src run.py
 ```
 
-## 4) Packaging options
+## 4) App icon
+
+`flet build` picks icons up from the `assets/` folder next to the app, not from the project root:
+
+- `assets/icon.png` - used for every platform
+- `assets/icon_macos.png` - optional, overrides `icon.png` for the macOS bundle
+
+The current icon is `assets/icon.png` (1254x1254, transparent background, macOS-style rounded
+square with the shape already baked in). `flet build` hands it to `flutter_launcher_icons`, which
+generates the 16 to 1024 px variants inside the bundle.
+
+The icon only shows up in a bundle built with `flet build macos`. Running the app straight from
+`run.py` keeps the generic Flet icon in the Dock, because that window belongs to the prebuilt
+Flet client app. There is no runtime API to change it: `page.window.icon` has an effect on
+Windows only.
+
+## 5) Packaging options
 
 ## Option A - Flet CLI (recommended if available)
 
@@ -79,7 +95,7 @@ App output will be under:
 
 - `dist/sqltransfer.app` (or a `dist/sqltransfer/` bundle depending options)
 
-## 5) First run checks
+## 6) First run checks
 
 After building:
 
@@ -87,7 +103,7 @@ After building:
 2. Test `Test DB form` / `Test SSH tunnel target` in DB profile setup.
 3. Run a small table transfer first.
 
-## 6) Optional signing (distribution)
+## 7) Optional signing (distribution)
 
 For distribution outside your machine, you will usually need code signing and (optionally) notarization:
 

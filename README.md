@@ -118,6 +118,7 @@ and use the macOS build command shown there.
 ## Project Layout
 
 - `run.py` - app launcher
+- `assets/icon.png` - app icon, picked up by `flet build` (see MACOS_BUILD.md)
 - `src/sqltransfer_app/app.py` - Flet UI wiring and transfer flow
 - `src/sqltransfer_app/ui.py` - presentation helpers (cards, log panel, formatting)
 - `src/sqltransfer_app/scope.py` - turns the scope choice into a transfer mode/value
