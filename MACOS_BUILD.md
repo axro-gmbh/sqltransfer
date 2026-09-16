@@ -93,28 +93,82 @@ Python extension inside (apitap, psycopg, cffi) is arm64, so the bundle is arm64
 
 ## Signing and distribution
 
-Out of the box the bundle is **ad-hoc signed** (`Signature=adhoc`, `TeamIdentifier=not set`). That
-runs on the machine that built it. On any other Mac, Gatekeeper blocks it as soon as the download
-carries the quarantine flag, and the recipient has to allow it by hand in System Settings.
+This works and has been done once end to end. Prerequisites: an Apple Developer Program
+membership, a **Developer ID Application** certificate in the keychain, and a stored notarytool
+profile.
 
-For real distribution, Flet has the flags built in:
+The notary profile is created once, in a normal terminal (the app-specific password comes from
+appleid.apple.com, it is not the Apple ID password):
 
 ```zsh
+xcrun notarytool store-credentials "axro-notary" \
+  --apple-id <apple-id> --team-id <TEAMID> --password <app-specific-password>
+```
+
+Then build:
+
+```zsh
+cd /Volumes/T7/Projects/playground/sqltransfer
 .venv314/bin/flet build macos --arch arm64 --module-name run \
+  --exclude .venv .venv314 .vendor build tests .git .pytest_cache .idea patches --yes \
   --macos-distribution developer-id \
   --macos-signing-identity "Developer ID Application: <name> (<TEAMID>)" \
-  --macos-notary-profile <notarytool-keychain-profile>
+  --macos-notary-profile axro-notary
 ```
 
-This needs an Apple Developer Program membership. As of the last check this machine had no signing
-identity at all (`security find-identity -v -p codesigning` returned none).
+`developer-id` is the path for distribution **outside** the App Store. The upload to Apple is an
+automated malware scan, nothing is published or reviewed. Apple returns a ticket, which Flet
+staples to the bundle. Flet signs every nested binary (86 of them in this app, including the
+Python extensions) and refuses to start without notary credentials.
 
-Workaround for handing the app to a colleague without a certificate: use a transport that does not
-set quarantine (internal share, `scp`, USB), or have them run once:
+**Deployment target (this bites every time Xcode is updated).** The distribution build goes
+through `xcodebuild archive`, which is stricter than a plain build: Xcode 26 only accepts
+deployment targets from 12.0 upwards, while the Flutter template still writes 11.0 and the pods
+10.15. The unsigned build passes, the signed one fails. Fix in the generated project under
+`build/flutter/macos`:
+
+- `Podfile`: `platform :osx, '12.0'`, and inside the **existing** `post_install` hook (CocoaPods
+  allows only one) add:
+  ```ruby
+  target.build_configurations.each do |config|
+    config.build_settings['MACOSX_DEPLOYMENT_TARGET'] = '12.0'
+  end
+  ```
+- `Runner.xcodeproj/project.pbxproj`: replace `MACOSX_DEPLOYMENT_TARGET = 11.0` with `12.0`
+  (3 occurrences)
+
+These files are generated but survive between builds. They are recreated by `flet clean`, so the
+patch has to be reapplied after one. Consequence: **the app requires macOS 12 or newer.**
+
+Notarization of the first submission from a new account took about 43 minutes. Later ones are
+usually a few minutes.
+
+### Verifying the result
 
 ```zsh
-xattr -dr com.apple.quarantine /Applications/sqltransfer.app
+codesign -dv --verbose=4 build/macos/sqltransfer.app   # expect flags=0x10000(runtime), TeamIdentifier
+spctl -a -vvv -t exec build/macos/sqltransfer.app      # expect: accepted, source=Notarized Developer ID
+xcrun stapler validate build/macos/sqltransfer.app
 ```
+
+The honest test is a copy that carries the quarantine flag, the state a download arrives in:
+
+```zsh
+ditto -x -k build/sqltransfer-0.1.0-arm64.zip /tmp/recv
+xattr -w com.apple.quarantine "0081;00000000;Safari;" /tmp/recv/sqltransfer.app
+spctl -a -vvv -t exec /tmp/recv/sqltransfer.app        # must still say accepted
+```
+
+### Handing it out
+
+Pack with `ditto`, not with the Finder, which breaks the signature:
+
+```zsh
+ditto -c -k --keepParent build/macos/sqltransfer.app build/sqltransfer-0.1.0-arm64.zip
+```
+
+Recipients open it normally. No right-click, no trip through System Settings, no
+`xattr -dr com.apple.quarantine`.
 
 ## 6) First run checks
 
