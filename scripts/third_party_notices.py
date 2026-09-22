@@ -23,6 +23,9 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 OUT = ROOT / "THIRD_PARTY_NOTICES.txt"
 APITAP_LICENSE = ROOT / ".vendor" / "apitap-lib" / "LICENSE"
+# The pod is the copy that ships; the release download is the fallback before a first build.
+SPARKLE_LICENSES = [ROOT / "build" / "flutter" / "macos" / "Pods" / "Sparkle" / "LICENSE",
+                    ROOT / ".vendor" / "sparkle" / "LICENSE"]
 
 # Build and test tools listed in the environment but not shipped in the app.
 NOT_SHIPPED = {"pytest", "pluggy", "iniconfig", "packaging", "pygments"}
@@ -41,6 +44,10 @@ Flutter engine, framework and Flutter/Dart packages
     License: BSD-3-Clause for Flutter itself; the complete notices of every
     Flutter and Dart package are shipped inside the app by Flutter:
     sqltransfer.app/Contents/Frameworks/App.framework/Resources/flutter_assets/NOTICES.Z
+
+Sparkle (sqltransfer.app/Contents/Frameworks/Sparkle.framework), the update framework
+    License: MIT, plus the external licenses in its license text below
+    https://sparkle-project.org
 
 Libraries bundled inside psycopg-binary (psycopg_binary/.dylibs)
     libpq                          PostgreSQL License
@@ -134,6 +141,10 @@ def main() -> int:
     if not APITAP_LICENSE.exists():
         print(f"missing {APITAP_LICENSE}: clone apitap-lib as described in README.md", file=sys.stderr)
         return 1
+    sparkle_license = next((path for path in SPARKLE_LICENSES if path.exists()), None)
+    if sparkle_license is None:
+        print("missing Sparkle's LICENSE: run flet build once, or download Sparkle as in MACOS_BUILD.md", file=sys.stderr)
+        return 1
 
     lines = [
         "Third-party components shipped with SQL Transfer",
@@ -169,6 +180,7 @@ def main() -> int:
     lines += [f"{name} {version}    {lic}" for name, version, lic in _rust_crates(dists["apitap"])]
     lines += ["", "", "License texts", "=============", ""]
     lines += ["----- apitap (.vendor/apitap-lib/LICENSE) -----", "", APITAP_LICENSE.read_text(encoding="utf-8").strip(), ""]
+    lines += ["----- Sparkle (LICENSE) -----", "", sparkle_license.read_text(encoding="utf-8").strip(), ""]
     for key in sorted(dists):
         for path, text in _license_texts(dists[key]):
             lines += [f"----- {dists[key].metadata['Name']} ({path}) -----", "", text.strip(), ""]
