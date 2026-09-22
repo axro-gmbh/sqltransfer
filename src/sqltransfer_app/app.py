@@ -911,6 +911,23 @@ async def main(page: ft.Page) -> None:
                 else:
                     log.append("Source is not MySQL: tables get their primary key only, no secondary indexes", "WARN")
 
+                # Foreign keys are lost the same way; they are read now and restored
+                # after the loop, once every outgoing table has released its key names.
+                source_fks: dict[str, dict[str, str]] = {}
+                landed_tables: list[str] = []
+                if src.db_type == "mysql":
+                    fk_ok, source_fks, fk_skipped, fk_msg = await transfer_service.mysql_source_fk_clauses(
+                        src, scoped_tables
+                    )
+                    if fk_ok:
+                        log.append(f"Read foreign keys of {len(source_fks)} source table(s)")
+                        if fk_skipped:
+                            log.append(
+                                "Foreign keys into other schemas are not copied: " + ", ".join(fk_skipped), "WARN"
+                            )
+                    else:
+                        log.append(f"Could not read source foreign keys, none will be restored: {fk_msg}", "WARN")
+
                 async def apply_source_indexes(target_table: str, final_name: str) -> None:
                     clauses = source_indexes.get(final_name, {})
                     if not clauses:
@@ -1023,6 +1040,7 @@ async def main(page: ft.Page) -> None:
                                     )
                                     # The column-only fallback of that path creates no indexes.
                                     await apply_source_indexes(final_name, final_name)
+                                    landed_tables.append(final_name)
                                     continue
                                 fail(
                                     f"Source table {final_name} is empty and transfer produced no output table. "
@@ -1057,11 +1075,14 @@ async def main(page: ft.Page) -> None:
                             if not emptied:
                                 fail(f"Source table {final_name} is empty, but clearing the destination failed: {empty_err}")
                                 return
-                            log.append(
-                                f"Source table {final_name} is empty -> removed {deleted} stale row(s) from destination",
-                                "WARN",
-                            )
-                            notes.append(f"emptied={final_name}")
+                            if deleted:
+                                log.append(
+                                    f"Source table {final_name} is empty -> removed {deleted} stale row(s) from destination",
+                                    "WARN",
+                                )
+                                notes.append(f"emptied={final_name}")
+                            else:
+                                log.append(f"Source table {final_name} is empty, destination already empty")
                         else:
                             # The source gained rows after the transfer had read it.
                             log.append(
@@ -1072,6 +1093,7 @@ async def main(page: ft.Page) -> None:
                             notes.append(f"fallback_skip_swap={final_name}")
                         await apply_source_indexes(final_name, final_name)
 
+                    landed_tables.append(final_name)
                     total_rows += item_result.rows
                     total_elapsed += item_result.elapsed_ms
                     used_parallel = item_result.parallel or used_parallel
@@ -1087,6 +1109,26 @@ async def main(page: ft.Page) -> None:
                         return
                     notes.append("fk_second_pass=ok")
                     log.append("Deferred foreign keys applied")
+
+                # Restore the foreign keys the swap dropped. Runs after a cancel too:
+                # the tables copied so far lost their keys either way. Keys that
+                # already exist (in-place tables, the deferred pass above) are skipped.
+                fk_todo = {table: source_fks[table] for table in landed_tables if table in source_fks}
+                if fk_todo:
+                    log.append(f"Restoring foreign keys of {len(fk_todo)} table(s)")
+                    set_progress(label="Restoring foreign keys")
+                    page.update()
+                    fk_ok, fk_applied, fk_failed, fk_err = await transfer_service.mysql_apply_fk_clauses(dst, fk_todo)
+                    # summarize_notes counts notes per key, so one note per table / failure.
+                    if not fk_ok:
+                        log.append(f"Foreign keys could not be restored: {fk_err}", "WARN")
+                        notes.append("fk_restore_error=1")
+                    else:
+                        for table in fk_applied:
+                            notes.append(f"fk_restored={table}")
+                        for failure in fk_failed:
+                            log.append(f"Foreign key not restored: {failure}", "WARN")
+                            notes.append(f"fk_restore_failed={failure.split(':', 1)[0]}")
 
                 summary = summarize_notes(notes)
                 result = TransferResult(

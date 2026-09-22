@@ -492,6 +492,81 @@ class TransferService:
             if endpoint and endpoint.tunnel:
                 self.tunnel_manager.close_tunnel(endpoint.tunnel)
 
+    async def mysql_source_fk_clauses(
+        self, source: DBProfile, tables: list[str]
+    ) -> tuple[bool, dict[str, dict[str, str]], list[str], str]:
+        """Read the foreign keys of all tables in scope with one source round trip.
+
+        Returns (ok, clauses keyed by bare table name, skipped cross-schema keys, error).
+        """
+        if source.db_type != "mysql":
+            return True, {}, [], "Foreign key copy is only supported from a MySQL source"
+        schemas = sorted({table.rpartition(".")[0].strip("`\"") or source.database for table in tables})
+        endpoint: ResolvedEndpoint | None = None
+        try:
+            endpoint = self._resolve_profile(source)
+            host = endpoint.tunnel.local_host if endpoint.tunnel else source.host
+            port = endpoint.tunnel.local_port if endpoint.tunnel else source.port
+            password = self.secret_store.get_secret(source.password_secret_key) or ""
+            rows_by_schema = await asyncio.to_thread(
+                _mysql_source_fk_rows_sync,
+                host,
+                port,
+                source.database,
+                source.username,
+                password,
+                schemas or [source.database],
+            )
+            clauses_by_table: dict[str, dict[str, str]] = {}
+            skipped: list[str] = []
+            for schema, rows in rows_by_schema.items():
+                per_table: dict[str, list] = {}
+                for table, *fk_row in rows:
+                    per_table.setdefault(table, []).append(tuple(fk_row))
+                for table, fk_rows in per_table.items():
+                    clauses, table_skipped = build_mysql_fk_clauses(fk_rows, source_schema=schema)
+                    if clauses:
+                        clauses_by_table[table] = clauses
+                    skipped.extend(f"{table}.{entry}" for entry in table_skipped)
+            return True, clauses_by_table, skipped, ""
+        except Exception as exc:  # noqa: BLE001
+            return False, {}, [], str(exc)
+        finally:
+            if endpoint and endpoint.tunnel:
+                self.tunnel_manager.close_tunnel(endpoint.tunnel)
+
+    async def mysql_apply_fk_clauses(
+        self,
+        destination: DBProfile,
+        clauses_by_table: dict[str, dict[str, str]],
+    ) -> tuple[bool, dict[str, list[str]], list[str], str]:
+        """Add the missing foreign keys: (ok, applied per table, failures, error)."""
+        if not clauses_by_table:
+            return True, {}, [], ""
+        if destination.db_type != "mysql":
+            return False, {}, [], "Destination is not MySQL"
+        endpoint: ResolvedEndpoint | None = None
+        try:
+            endpoint = self._resolve_profile(destination)
+            host = endpoint.tunnel.local_host if endpoint.tunnel else destination.host
+            port = endpoint.tunnel.local_port if endpoint.tunnel else destination.port
+            password = self.secret_store.get_secret(destination.password_secret_key) or ""
+            applied, failed = await asyncio.to_thread(
+                _mysql_apply_fk_clauses_sync,
+                host,
+                port,
+                destination.database,
+                destination.username,
+                password,
+                clauses_by_table,
+            )
+            return True, applied, failed, ""
+        except Exception as exc:  # noqa: BLE001
+            return False, {}, [], str(exc)
+        finally:
+            if endpoint and endpoint.tunnel:
+                self.tunnel_manager.close_tunnel(endpoint.tunnel)
+
     async def mysql_empty_table(self, destination: DBProfile, table: str) -> tuple[bool, int, str]:
         """Clear a destination table whose source is empty: (ok, rows deleted, error).
 
@@ -869,6 +944,153 @@ def _mysql_apply_index_clauses_sync(
         conn.close()
 
 
+# Foreign keys go the same way as indexes: apitap never creates them and the swap
+# drops the table that had them. Unlike indexes they are restored after the whole
+# run: key names are unique per database, so the outgoing table still holds the
+# name until it is dropped, and the referenced table may be copied later in the run.
+
+_MYSQL_FK_SQL = (
+    "SELECT k.table_name, k.constraint_name, k.column_name, k.ordinal_position, "
+    "k.referenced_table_schema, k.referenced_table_name, k.referenced_column_name, "
+    "rc.update_rule, rc.delete_rule "
+    "FROM information_schema.key_column_usage k "
+    "JOIN information_schema.referential_constraints rc "
+    "ON rc.constraint_schema = k.constraint_schema "
+    "AND rc.constraint_name = k.constraint_name "
+    "AND rc.table_name = k.table_name "
+    "WHERE k.table_schema = %s AND k.referenced_table_name IS NOT NULL"
+)
+
+
+def build_mysql_fk_clauses(rows, source_schema: str) -> tuple[dict[str, str], list[str]]:
+    """Turn the foreign key rows of one table into ALTER TABLE clauses.
+
+    Each row is (constraint_name, column_name, ordinal_position, referenced_schema,
+    referenced_table, referenced_column, update_rule, delete_rule). Keys into another
+    schema are returned as skipped: the destination has no copy of that schema, and
+    pointing them at a same-named local table would be a guess.
+    """
+    grouped: dict[str, dict] = {}
+    for name, column, _pos, ref_schema, ref_table, ref_column, update_rule, delete_rule in sorted(
+        rows, key=lambda r: (r[0], int(r[2]))
+    ):
+        entry = grouped.setdefault(
+            name,
+            {
+                "ref_schema": ref_schema,
+                "ref_table": ref_table,
+                "cols": [],
+                "ref_cols": [],
+                "update": update_rule,
+                "delete": delete_rule,
+            },
+        )
+        entry["cols"].append(_quote_mysql_ident(column))
+        entry["ref_cols"].append(_quote_mysql_ident(ref_column))
+
+    clauses: dict[str, str] = {}
+    skipped: list[str] = []
+    for name, entry in grouped.items():
+        if entry["ref_schema"] != source_schema:
+            skipped.append(f"{name} -> {entry['ref_schema']}.{entry['ref_table']}")
+            continue
+        clauses[name] = (
+            f"ADD CONSTRAINT {_quote_mysql_ident(name)} FOREIGN KEY ({', '.join(entry['cols'])}) "
+            f"REFERENCES {_quote_mysql_ident(entry['ref_table'])} ({', '.join(entry['ref_cols'])}) "
+            f"ON DELETE {entry['delete']} ON UPDATE {entry['update']}"
+        )
+    return clauses, skipped
+
+
+def _mysql_source_fk_rows_sync(
+    host: str,
+    port: int,
+    database: str,
+    username: str,
+    password: str,
+    schemas: list[str],
+) -> dict[str, list[tuple]]:
+    """Foreign key rows keyed by schema, each row starting with its table name."""
+    import pymysql
+
+    conn = pymysql.connect(
+        host=host,
+        port=port,
+        user=username,
+        password=password,
+        database=database,
+        connect_timeout=5,
+        read_timeout=60,
+        write_timeout=60,
+        autocommit=True,
+    )
+    try:
+        with conn.cursor() as cur:
+            result: dict[str, list[tuple]] = {}
+            for schema in schemas:
+                cur.execute(_MYSQL_FK_SQL, (schema,))
+                result[schema] = list(cur.fetchall())
+            return result
+    finally:
+        conn.close()
+
+
+def _mysql_apply_fk_clauses_sync(
+    host: str,
+    port: int,
+    database: str,
+    username: str,
+    password: str,
+    clauses_by_table: dict[str, dict[str, str]],
+) -> tuple[dict[str, list[str]], list[str]]:
+    """Add the missing foreign keys of every table over one connection.
+
+    Returns (applied names per table, failures as "table.key: error").
+    """
+    import pymysql
+
+    conn = pymysql.connect(
+        host=host,
+        port=port,
+        user=username,
+        password=password,
+        database=database,
+        connect_timeout=5,
+        read_timeout=600,
+        write_timeout=600,
+        autocommit=True,
+    )
+    applied: dict[str, list[str]] = {}
+    failed: list[str] = []
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT table_name, constraint_name FROM information_schema.referential_constraints "
+                "WHERE constraint_schema = %s",
+                (database,),
+            )
+            existing = {(table, name) for table, name in cur.fetchall()}
+            # Without the check MySQL does not validate the existing rows, the same
+            # way a dump restore works. Tables copied minutes apart from a live source
+            # would otherwise refuse the key over rows that changed in between.
+            cur.execute("SET FOREIGN_KEY_CHECKS=0")
+            try:
+                for table in sorted(clauses_by_table):
+                    for name, clause in sorted(clauses_by_table[table].items()):
+                        if (table, name) in existing:
+                            continue
+                        try:
+                            cur.execute(f"ALTER TABLE {_quote_mysql_ident(table)} {clause}")
+                            applied.setdefault(table, []).append(name)
+                        except pymysql.MySQLError as exc:
+                            failed.append(f"{table}.{name}: {exc}")
+            finally:
+                cur.execute("SET FOREIGN_KEY_CHECKS=1")
+    finally:
+        conn.close()
+    return applied, failed
+
+
 def _short_backup_name(final_table: str) -> str:
     suffix = f"__old_{int(time.time()) % 100000}"
     allowed = 64 - len(suffix)
@@ -1153,6 +1375,18 @@ def _source_table_row_count_sync(
         conn.close()
 
 
+# Error codes meaning "a foreign key stopped CREATE TABLE". Only 1005 used to be
+# handled, which is what MySQL 5.x and MariaDB return; MySQL 8 reports a missing
+# referenced table as 1824, so on a fresh MySQL 8 destination the run aborted.
+_MYSQL_FK_BLOCKS_CREATE = {
+    1005,  # ER_CANT_CREATE_TABLE (errno 150), MySQL 5.x / MariaDB
+    1215,  # ER_CANNOT_ADD_FOREIGN, MySQL 5.6 / 5.7
+    1822,  # ER_FK_NO_INDEX_PARENT
+    1824,  # ER_FK_CANNOT_OPEN_PARENT, MySQL 8: referenced table missing
+    3780,  # ER_FK_INCOMPATIBLE_COLUMNS
+}
+
+
 def _ensure_empty_mysql_table_from_source_sync(
     src_host: str,
     src_port: int,
@@ -1256,7 +1490,7 @@ def _ensure_empty_mysql_table_from_source_sync(
                             final_table,
                         )
                         return f"Created empty destination table {final_table} using metadata fallback ({meta_msg})", []
-                    if code != 1005:
+                    if code not in _MYSQL_FK_BLOCKS_CREATE:
                         raise
                     stripped_sql, deferred_fk_sql = _strip_mysql_fk_constraints(create_sql, final_table)
                     try:

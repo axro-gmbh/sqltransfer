@@ -144,6 +144,8 @@ def _run_table_like_the_app(table: str) -> None:
     async def flow() -> None:
         ok, source_indexes, message = await service.mysql_source_index_clauses(src, [table])
         assert ok, message
+        ok, source_fks, _skipped, message = await service.mysql_source_fk_clauses(src, [table])
+        assert ok, message
         temp = service.build_mysql_temp_name(table)
         result = await service.transfer_single_table(src, dst, table, dest_table=temp)
         assert result.status == "success", result.message
@@ -153,6 +155,10 @@ def _run_table_like_the_app(table: str) -> None:
         assert ok and not failed, message or failed
         swapped, message = await service.mysql_swap_temp_to_final(dst, temp_table=temp, final_table=table)
         assert swapped, message
+        # Foreign keys come last, once the outgoing table and its key names are gone.
+        if table in source_fks:
+            ok, _applied, failed, message = await service.mysql_apply_fk_clauses(dst, {table: source_fks[table]})
+            assert ok and not failed, message or failed
 
     asyncio.run(flow())
 
@@ -177,8 +183,77 @@ def test_new_destination_gets_the_source_indexes(databases):
     assert _indexes(DST_DB, "items") == expected
 
 
+CATEGORIES_DDL = "CREATE TABLE categories (id INT PRIMARY KEY, name VARCHAR(20)) ENGINE=InnoDB"
+PRODUCTS_DDL = (
+    "CREATE TABLE products (id INT PRIMARY KEY, category_id INT, parent_cat INT, "
+    "KEY idx_cat (category_id), "
+    "CONSTRAINT fk_prod_cat FOREIGN KEY (category_id) REFERENCES categories(id) ON DELETE CASCADE, "
+    "CONSTRAINT fk_prod_parent FOREIGN KEY (parent_cat) REFERENCES categories(id) ON DELETE SET NULL ON UPDATE CASCADE"
+    ") ENGINE=InnoDB"
+)
+
+
+def _foreign_keys(database: str, table: str) -> set[tuple[str, str, str, str, str]]:
+    conn = pymysql.connect(**_conn_args(), autocommit=True)
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT rc.constraint_name, rc.referenced_table_name,
+                       GROUP_CONCAT(k.column_name ORDER BY k.ordinal_position),
+                       rc.delete_rule, rc.update_rule
+                FROM information_schema.referential_constraints rc
+                JOIN information_schema.key_column_usage k
+                  ON k.constraint_schema = rc.constraint_schema
+                 AND k.constraint_name = rc.constraint_name
+                 AND k.table_name = rc.table_name
+                WHERE rc.constraint_schema = %s AND rc.table_name = %s
+                GROUP BY rc.constraint_name, rc.referenced_table_name, rc.delete_rule, rc.update_rule
+                """,
+                (database, table),
+            )
+            return {tuple(row) for row in cur.fetchall()}
+    finally:
+        conn.close()
+
+
+def test_swapped_table_keeps_its_foreign_keys(databases):
+    for db in (SRC_DB, DST_DB):
+        _exec(db, CATEGORIES_DDL, PRODUCTS_DDL, "INSERT INTO categories VALUES (1,'a'),(2,'b')")
+    _exec(SRC_DB, "INSERT INTO products VALUES (10,1,NULL),(11,2,1)")
+    _exec(DST_DB, "INSERT INTO products VALUES (99,1,NULL)")
+    expected = _foreign_keys(SRC_DB, "products")
+    assert _foreign_keys(DST_DB, "products") == expected  # precondition: destination starts with both FKs
+
+    _run_table_like_the_app("products")
+
+    assert _row_count(DST_DB, "products") == 2
+    assert _foreign_keys(DST_DB, "products") == expected
+
+
 def _service() -> TransferService:
     return TransferService(storage=None, secret_store=_Secrets(), tunnel_manager=TunnelManager())
+
+
+def test_empty_table_referencing_a_missing_table_is_still_created(databases):
+    # Fresh destination: the referenced table does not exist yet. MySQL 8 reports that
+    # with 1824, MySQL 5.x and MariaDB with 1005; both must lead to a deferred key.
+    _exec(
+        SRC_DB,
+        CATEGORIES_DDL,
+        "CREATE TABLE archive (id INT PRIMARY KEY, category_id INT, "
+        "CONSTRAINT fk_arch_cat FOREIGN KEY (category_id) REFERENCES categories(id)) ENGINE=InnoDB",
+    )
+
+    created, message, deferred = asyncio.run(
+        _service().ensure_empty_mysql_table_from_source(
+            _profile("remote", SRC_DB), _profile("local", DST_DB), source_table="archive", final_table="archive"
+        )
+    )
+
+    assert created, message
+    assert _row_count(DST_DB, "archive") == 0
+    assert any("fk_arch_cat" in stmt for stmt in deferred)
 
 
 def test_emptying_a_destination_removes_stale_rows(databases):
