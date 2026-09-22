@@ -140,7 +140,18 @@ deployment targets from 12.0 upwards, while the Flutter template still writes 11
 These files are generated but survive between builds. They are recreated by `flet clean`, so the
 patch has to be reapplied after one. Consequence: **the app requires macOS 12 or newer.**
 
-Notarization of the first submission from a new account took about 43 minutes. Later ones are
+**Close Finder windows on `build/macos` while building.** Flet deletes that folder before copying the
+new bundle; a Finder window showing it writes a fresh `.DS_Store` in the middle of that, the delete
+fails with `Errno 66 Directory not empty`, and Flet's error handler (written for read-only files on
+Windows) then sets the folder to write-only (`d-w-------`). Recovery:
+
+```zsh
+chmod 755 build/macos && rm -f build/macos/.DS_Store && rmdir build/macos
+```
+
+then build again. Nothing reaches Apple before the copy step, so a failed run costs no notarization.
+
+Notarization of the first submission from a new account took about 43 minutes. The second one took two minutes. Later ones are
 usually a few minutes.
 
 ### Verifying the result
