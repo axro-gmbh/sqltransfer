@@ -21,6 +21,12 @@ Die App ist signiert und von Apple notarisiert. Es erscheint also **keine** Sich
 
 Der erste Start dauert etwa 15 bis 20 Sekunden, danach geht es zügig.
 
+### Updates
+
+Die App sucht einmal am Tag selbst nach einer neuen Version. Gibt es eine, erscheint ein Fenster (auf Englisch, wie die App) mit "Install Update", "Remind Me Later" und "Skip This Version". Nach "Install Update" lädt die App die neue Version, startet neu und ist aktuell. Mit dem Häkchen "Automatically download and install updates in the future" kommen künftige Updates ohne Nachfrage.
+
+Jedes Update ist signiert: Die App installiert nur Versionen, die nachweislich von uns stammen. Ohne Internetverbindung passiert einfach nichts, die Suche wird später wiederholt.
+
 ## Einmalige Einrichtung
 
 Alles Folgende steht im Bereich **Profiles**. Den brauchst du nur beim Einrichten oder Ändern, im Alltag bleibt er zugeklappt.

@@ -66,7 +66,7 @@ The build itself:
 ```zsh
 cd sqltransfer
 .venv314/bin/flet build macos --arch arm64 --module-name run \
-  --exclude .venv .venv314 .vendor build tests .git .pytest_cache .idea patches --yes
+  --exclude .venv .venv314 .vendor build tests .git .pytest_cache .idea patches dist --yes
 ```
 
 - `--module-name run` because the entry point is `run.py`, not `main.py`
@@ -97,7 +97,7 @@ Then build:
 ```zsh
 cd sqltransfer
 .venv314/bin/flet build macos --arch arm64 --module-name run \
-  --exclude .venv .venv314 .vendor build tests .git .pytest_cache .idea patches --yes \
+  --exclude .venv .venv314 .vendor build tests .git .pytest_cache .idea patches dist --yes \
   --macos-distribution developer-id \
   --macos-signing-identity "Developer ID Application: <name> (<TEAMID>)" \
   --macos-notary-profile axro-notary
@@ -111,21 +111,17 @@ Python extensions) and refuses to start without notary credentials.
 **Deployment target (this bites every time Xcode is updated).** The distribution build goes
 through `xcodebuild archive`, which is stricter than a plain build: Xcode 26 only accepts
 deployment targets from 12.0 upwards, while the Flutter template still writes 11.0 and the pods
-10.15. The unsigned build passes, the signed one fails. Fix in the generated project under
-`build/flutter/macos`:
+10.15. The fix goes into the generated project under `build/flutter/macos` (`Podfile` and
+`Runner.xcodeproj/project.pbxproj`):
 
-- `Podfile`: `platform :osx, '12.0'`, and inside the **existing** `post_install` hook (CocoaPods
-  allows only one) add:
-  ```ruby
-  target.build_configurations.each do |config|
-    config.build_settings['MACOSX_DEPLOYMENT_TARGET'] = '12.0'
-  end
-  ```
-- `Runner.xcodeproj/project.pbxproj`: replace `MACOSX_DEPLOYMENT_TARGET = 11.0` with `12.0`
-  (3 occurrences)
+```zsh
+python scripts/patch_macos_target.py
+```
 
-These files are generated but survive between builds. They are recreated by `flet clean`, so the
-patch has to be reapplied after one. Consequence: **the app requires macOS 12 or newer.**
+Flet regenerates that project whenever its inputs change (`flet clean`, a new Flutter dependency),
+which drops the fix: the build then fails with `The macOS deployment target
+'MACOSX_DEPLOYMENT_TARGET' is set to 11.0`. Run the script and build again; `scripts/release.sh`
+does both on its own. Consequence: **the app requires macOS 12 or newer.**
 
 **Close Finder windows on `build/macos` while building.** Flet deletes that folder before copying the
 new bundle; a Finder window showing it writes a fresh `.DS_Store` in the middle of that, the delete
@@ -167,6 +163,77 @@ ditto -c -k --keepParent build/macos/sqltransfer.app build/sqltransfer-<version>
 
 Recipients open it normally. No right-click, no trip through System Settings, no
 `xattr -dr com.apple.quarantine`.
+
+## Releases and updates
+
+Installed apps update themselves through [Sparkle](https://sparkle-project.org). The Flutter
+plugin `auto_updater` (see `[tool.flet.flutter.pubspec.dependencies]`) starts Sparkle's standard
+updater on launch, which reads two keys from `[tool.flet.macos.info]`:
+
+- `SUFeedURL`: `https://github.com/axro-gmbh/sqltransfer/releases/latest/download/appcast.xml`,
+  the appcast attached to the newest GitHub release
+- `SUPublicEDKey`: the public half of the EdDSA key every release is signed with
+
+Sparkle checks once a day, shows its update dialog and swaps the app in place. It only installs
+archives signed with the matching private key, and compares **build numbers**
+(`[tool.flet].build_number`, `CFBundleVersion`), not version strings. There is no "Check for
+updates" menu item: Flet has no hook for it.
+
+### One-time setup
+
+1. **Sparkle tools**, into `.vendor/sparkle` (only the command line tools are used; the framework in
+   the app comes from CocoaPods):
+   ```zsh
+   mkdir -p .vendor/sparkle && cd .vendor/sparkle
+   curl -LO https://github.com/sparkle-project/Sparkle/releases/download/2.10.0/Sparkle-2.10.0.tar.xz
+   shasum -a 256 Sparkle-2.10.0.tar.xz   # c2bf58aa8387266ac179357b1415d6f2635f044da8be41042af32425dae6da0c
+   tar -xf Sparkle-2.10.0.tar.xz
+   ```
+2. **Signing key.** Exists once, in the login keychain of the machine that releases, under the
+   account `sqltransfer`. Its public key is `SUPublicEDKey`. Print it with
+   `.vendor/sparkle/bin/generate_keys --account sqltransfer -p`.
+
+   **Back it up.** Without the private key no installed app accepts another update; a new key
+   means everybody downloads the next version by hand once. Export it into a password manager or
+   another safe place, never into the repository:
+   ```zsh
+   .vendor/sparkle/bin/generate_keys --account sqltransfer -x sparkle-private-key.txt
+   ```
+   and import it on another machine with `-f sparkle-private-key.txt`.
+3. The notary profile and signing identity from [Signing and distribution](#signing-and-distribution),
+   and `gh auth login`.
+
+### Every release
+
+1. Raise `version` in `[project]` **and** `build_number` in `[tool.flet]` (by one), plus
+   `__version__` in `src/sqltransfer_app/__init__.py` (a test checks they agree).
+2. Merge to `main` as usual.
+3. On `main`:
+   ```zsh
+   scripts/release.sh            # tests, notices, signed build, zip and appcast in dist/<version>/
+   scripts/release.sh --publish  # the same, then the GitHub release with both files
+   ```
+   The script refuses a build number that is not above the published one, a dirty or outdated
+   `main`, an existing tag, and changed third-party notices.
+
+Only the newest release carries an appcast, and it lists only itself: that is all Sparkle needs.
+Deleting the newest release makes the feed point at the one before, so installed apps simply see no
+update.
+
+**Testing an update without GitHub.** Build two versions (`flet build ... --build-version 1.0.1
+--build-number 2` leaves `pyproject.toml` alone), zip the newer one into a folder, run
+`generate_appcast --account sqltransfer --download-url-prefix http://127.0.0.1:8765/ <folder>` and
+serve the folder with `python3 -m http.server 8765 --bind 127.0.0.1`. In a copy of the older app,
+point `SUFeedURL` in `Contents/Info.plist` at `http://127.0.0.1:8765/appcast.xml` and re-sign it
+ad hoc (`codesign --force --deep -s -`); Sparkle ignores a feed URL in the user defaults. Then:
+```zsh
+defaults write de.axro.sqltransfer SUAutomaticallyUpdate -bool true
+defaults write de.axro.sqltransfer SULastCheckTime -date "2020-01-01 00:00:00 +0000"
+```
+start the copy, wait for the download (`log show --last 2m --predicate 'subsystem BEGINSWITH
+"org.sparkle-project"'`), quit it, and read its `CFBundleShortVersionString`. Remove both
+defaults afterwards, they apply to the real app as well. Ad hoc signed builds log a code signature
+mismatch; Sparkle installs anyway because the EdDSA signature is valid.
 
 ## 6) First run checks
 
