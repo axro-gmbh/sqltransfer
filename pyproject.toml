@@ -25,6 +25,19 @@ product = "SQL Transfer"
 company = "Axro"
 org = "de.axro"
 bundle_id = "de.axro.sqltransfer"
+# CFBundleVersion. Sparkle compares this, not the version string: raise it with
+# every release, never reuse one.
+build_number = 1
+
+# Sparkle auto-updates. The plugin starts Sparkle's standard updater on launch,
+# which reads the feed and the public key below; see MACOS_BUILD.md, "Releases".
+[tool.flet.flutter.pubspec.dependencies]
+auto_updater = "1.0.0"
+
+[tool.flet.macos.info]
+SUFeedURL = "https://github.com/axro-gmbh/sqltransfer/releases/latest/download/appcast.xml"
+SUPublicEDKey = "plOoFrteTxIp3kCx2Tr3pG4qS/cXdFUXppcr4XuVZxc="
+SUEnableAutomaticChecks = true
 
 # apitap has no macOS wheel on PyPI (Linux x86_64 only), so the bundle is built
 # against the locally built wheel. Rebuild instructions: see MACOS_BUILD.md.
