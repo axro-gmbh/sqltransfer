@@ -22,6 +22,10 @@ SCOPE_CHOICES = {
 }
 
 
+HISTORY_LIMIT = 20
+HISTORY_COLLAPSED = 5
+
+
 def _app_data_dir() -> Path:
     return Path.home() / "Library" / "Application Support" / "sqltransfer"
 
@@ -231,6 +235,7 @@ async def main(page: ft.Page) -> None:
     progress_label = ft.Text("", size=11, color=ft.Colors.ON_SURFACE_VARIANT, visible=False)
 
     runs_list = ft.Column(spacing=8)
+    history_state = {"expanded": False}
 
     busy_controls = [
         run_button,
@@ -322,10 +327,29 @@ async def main(page: ft.Page) -> None:
         ] or [ui.empty_hint("No database profiles yet.")]
 
     def refresh_run_history() -> None:
-        rows = [dict(row) for row in storage.list_recent_runs(limit=20)]
-        runs_list.controls = [
-            ui.run_history_row(row, on_reuse=reuse_run) for row in rows
-        ] or [ui.empty_hint("No transfers yet.")]
+        rows = [dict(row) for row in storage.list_recent_runs(limit=HISTORY_LIMIT)]
+        if not rows:
+            runs_list.controls = [ui.empty_hint("No transfers yet.")]
+            return
+        expanded = history_state["expanded"]
+        shown = rows if expanded else rows[:HISTORY_COLLAPSED]
+        controls: list[ft.Control] = [ui.run_history_row(row, on_reuse=reuse_run) for row in shown]
+        hidden = len(rows) - HISTORY_COLLAPSED
+        if hidden > 0:
+            controls.append(
+                ft.TextButton(
+                    "Show less" if expanded else f"Show {hidden} more",
+                    icon=ft.Icons.EXPAND_LESS if expanded else ft.Icons.EXPAND_MORE,
+                    on_click=toggle_history,
+                )
+            )
+        runs_list.controls = controls
+
+    def toggle_history(_: object) -> None:
+        # Kept across refreshes, so a finished run does not collapse the list under you.
+        history_state["expanded"] = not history_state["expanded"]
+        refresh_run_history()
+        page.update()
 
     def reuse_run(record: dict) -> None:
         mode = record.get("scope_mode")
@@ -1314,7 +1338,7 @@ async def main(page: ft.Page) -> None:
     history_section = ui.section_card(
         "Recent runs",
         runs_list,
-        "The last 20 transfers.",
+        f"The last {HISTORY_LIMIT} transfers.",
         ft.Icons.HISTORY,
     )
 
