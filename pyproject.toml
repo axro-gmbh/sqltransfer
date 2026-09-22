@@ -38,6 +38,9 @@ auto_updater = "1.0.0"
 SUFeedURL = "https://github.com/axro-gmbh/sqltransfer/releases/latest/download/appcast.xml"
 SUPublicEDKey = "plOoFrteTxIp3kCx2Tr3pG4qS/cXdFUXppcr4XuVZxc="
 SUEnableAutomaticChecks = true
+# About window. Set here rather than in tool.flet.copyright, whose template
+# appends "All rights reserved.", which does not fit an Apache-2.0 app.
+NSHumanReadableCopyright = "Copyright © 2026 Axro GmbH"
 
 # apitap has no macOS wheel on PyPI (Linux x86_64 only), so the bundle is built
 # against the locally built wheel. Rebuild instructions: see MACOS_BUILD.md.
