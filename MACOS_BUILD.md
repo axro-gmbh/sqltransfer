@@ -2,42 +2,29 @@
 
 This guide packages the project as a macOS desktop app.
 
-## 1) Prepare environment
+## 1) Environment and apitap
+
+Set up the environment and build apitap from source exactly as in the README section
+[Development](README.md#development). `flet build` takes apitap from the wheel that step leaves in
+`.vendor/`.
+
+## 2) Validate before packaging
 
 ```zsh
-cd /Volumes/T7/Projects/playground/sqltransfer
-uv python install 3.14
-uv venv --python 3.14 .venv314
+cd sqltransfer
 source .venv314/bin/activate
+python -m pytest -q
 ```
 
-Install runtime dependencies used by the app:
+## 3) Third-party notices
+
+Regenerate the notices from the environment you build with, so they list exactly what ships:
 
 ```zsh
-uv pip install flet sshtunnel "paramiko<4" keyring pymysql "psycopg[binary]" pytest
+python scripts/third_party_notices.py
 ```
 
-## 2) Install `apitap` from source (macOS workaround)
-
-`apitap` wheels may not be available for macOS/arm64 in your environment, so install from source:
-
-```zsh
-cd /Volumes/T7/Projects/playground/sqltransfer
-mkdir -p .vendor
-git clone --depth 1 https://github.com/apitap/apitap-lib.git .vendor/apitap-lib
-source .venv314/bin/activate
-uv pip install -e .vendor/apitap-lib/py-apitap
-python -u -c "import apitap; print('IMPORT_OK')"
-```
-
-## 3) Validate before packaging
-
-```zsh
-cd /Volumes/T7/Projects/playground/sqltransfer
-source .venv314/bin/activate
-pytest -q
-python -m compileall -q src run.py
-```
+Commit `THIRD_PARTY_NOTICES.txt` if it changed. It lands in the bundle next to the app code.
 
 ## 4) App icon
 
@@ -77,7 +64,7 @@ Prerequisites, all of them hit during the first build:
 The build itself:
 
 ```zsh
-cd /Volumes/T7/Projects/playground/sqltransfer
+cd sqltransfer
 .venv314/bin/flet build macos --arch arm64 --module-name run \
   --exclude .venv .venv314 .vendor build tests .git .pytest_cache .idea patches --yes
 ```
@@ -108,7 +95,7 @@ xcrun notarytool store-credentials "axro-notary" \
 Then build:
 
 ```zsh
-cd /Volumes/T7/Projects/playground/sqltransfer
+cd sqltransfer
 .venv314/bin/flet build macos --arch arm64 --module-name run \
   --exclude .venv .venv314 .vendor build tests .git .pytest_cache .idea patches --yes \
   --macos-distribution developer-id \

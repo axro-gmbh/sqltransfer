@@ -1,147 +1,123 @@
-# sqltransfer
+# SQL Transfer
 
-Minimal macOS desktop app (Python + Flet) for moving data from remote databases to local databases using `apitap`, with optional SSH key tunneling.
+macOS app that copies MySQL and PostgreSQL tables from remote servers into a local database,
+through SSH tunnels, with indexes, foreign keys and TLS handled. Built with Python and
+[Flet](https://flet.dev); the rows themselves are moved by [apitap](https://github.com/apitap/apitap-lib).
 
-## MVP Features
+## Download
 
-- Save SSH profiles (key path + optional passphrase)
-- Load/edit/delete SSH profiles
-- Test SSH connection directly from the SSH profile form
-- Save database profiles for:
-  - source/remote (`mysql` or `postgres`)
-  - destination/local (`mysql` or `postgres`)
-- Load/edit/delete DB profiles
-- Test DB connectivity directly from the DB profile form (before saving)
-- Test SSH tunnel target explicitly from DB form (DataGrip-like SSH flow)
-- Test source and destination connectivity before transfer
-- Preview transfer plan (dry-run validation for scope and profile routing)
-- One scope question with three answers: single table, selected tables, whole database
-- Browse source tables, filter them in the table picker, multi-select via checkboxes, select all or clear in one click
-- Live progress while a transfer runs (table x of y) and a cancel button that stops after the current table
-- Level-coloured, auto-scrolling transfer log (INFO/WARN/ERROR)
-- Deleting a profile asks for confirmation before the keychain entry goes away
-- Run transfers via `apitap.transfer()` in modes:
-  - `table`
-  - `tables` (comma-separated)
-  - `schema`
-- Optional parallel override in UI; defaults to `1` when SSH tunneling is used to avoid channel-limit failures
-- MySQL destinations go through a per-table temp table and the app's own atomic `RENAME TABLE` swap. Long table names are no longer the reason (apitap 0.56 shortens staging names itself). The swap stays because apitap's own swap breaks tables other tables reference (InnoDB moves the foreign key onto the renamed old table, then the DROP fails), and because indexes are built before the table is published
-- An empty source table empties the destination table. apitap's 0-row guard alone would leave the old rows in place
-- Per-profile database encryption (Automatic / Off / Encrypted, not verified / Encrypted and verified) applied the same way to apitap (`ssl-mode` / `sslmode` in the URL), pymysql and psycopg. Automatic mirrors apitap's own default since 0.55.1: off for loopback and SSH tunnels, verified TLS for any other host. A custom CA works for PostgreSQL only; apitap trusts its bundled public roots for MySQL
-- SSH host keys are checked on both tunnel backends against `~/.ssh/known_hosts` (first contact is recorded, like OpenSSH's accept-new); a changed key stops the connection instead of falling back
-- Foreign keys (with ON DELETE / ON UPDATE rules) are copied from the source and restored after the whole run, with FOREIGN_KEY_CHECKS=0 like a dump restore. Keys into other schemas are skipped and reported
-- MySQL -> MySQL copies secondary indexes (unique, fulltext, prefix, functional) from the source, because apitap creates destination tables with columns and primary key only. Source indexes are read once per run and applied to the temp table before the swap
-- If empty MySQL fallback tables require FK references not yet present, app auto-creates table with deferred FKs and applies those constraints in a second pass
-- Keep recent run history in local SQLite, summarised per run instead of one note per table
-- Store DB passwords and SSH passphrases in macOS Keychain via `keyring`
-- Remove related Keychain secrets when deleting profiles
+Signed and notarized builds for Apple Silicon (macOS 12 or newer) are on the
+[Releases](https://github.com/axro-gmbh/sqltransfer/releases) page. Unzip, move the app to
+Applications, open it.
 
-## Notes
+A user guide (German) is in [docs/benutzerhandbuch.md](docs/benutzerhandbuch.md).
 
-- SSH tunneling is handled by the app (`sshtunnel`), then `apitap` receives local forwarded DSNs.
-- DataGrip-style semantics: DB host/port must be reachable from the SSH server (not necessarily from your Mac directly).
-- SSH tunneling currently requires `paramiko<4` due `sshtunnel` compatibility (`DSSKey` removal in newer Paramiko).
-- Connection test validates reachability at the TCP level (direct host:port or SSH-forwarded local port).
-- Source table browser uses direct metadata queries (`pymysql` for MySQL, `psycopg` for Postgres).
-- The UI targets Flet 1.0 (`page.show_dialog`, `page.window.*`, `ft.Clipboard()`); the older `page.snack_bar`/`page.window_width`/`page.clipboard` calls are gone and were silently ignored before they were replaced.
-- `apitap` is **not** installed from PyPI: PyPI only ships Linux x86_64 wheels, so on macOS it has to
-  be built from source (`.vendor/apitap-lib`, a Rust workspace built with maturin).
-- The installed build is **v0.56.0 with one local patch**. Upstream v0.56.0 does not compile on macOS:
-  `crates/apitap-core/src/wire/mywire.rs` sets TCP keepalive with the Linux-only `libc::TCP_KEEPIDLE`,
-  which Apple platforms call `TCP_KEEPALIVE`. The fix is in
-  `patches/apitap-0.56.0-macos-tcp-keepalive.patch` and is worth sending upstream.
+## Features
 
-  Rebuilding it, without touching the checkout in `.vendor`:
+- SSH and database profiles; passwords and key passphrases live in the macOS Keychain and are
+  removed with the profile
+- Transfer one table, a selection of tables or a whole database; preview the plan first
+- Live progress (table x of y), a cancel button that stops after the current table, and a
+  colour-coded, auto-scrolling log
+- MySQL and PostgreSQL as source and destination
+- MySQL to MySQL keeps the source's secondary indexes (unique, fulltext, prefix, functional) and
+  foreign keys, including their `ON DELETE` / `ON UPDATE` rules
+- Per-profile encryption: Automatic, Off, Encrypted (certificate not checked), Encrypted and
+  verified; a custom CA for PostgreSQL
+- SSH host keys are checked against `~/.ssh/known_hosts`; a changed key stops the connection
+- The connection test logs in for real and reports whether the session is encrypted
+- Run history with the last 20 transfers, reusable with one click
 
-  ```zsh
-  cd /Volumes/T7/Projects/playground/sqltransfer
-  git -C .vendor/apitap-lib worktree add --detach /tmp/apitap-0.56 v0.56.0
-  git -C /tmp/apitap-0.56 apply "$PWD/patches/apitap-0.56.0-macos-tcp-keepalive.patch"
-  (cd /tmp/apitap-0.56/py-apitap && uv build --wheel --out-dir /tmp/apitap-wheels .)
-  VIRTUAL_ENV=$PWD/.venv314 uv pip install --reinstall /tmp/apitap-wheels/apitap-0.56.0-*.whl
-  git -C .vendor/apitap-lib worktree remove /tmp/apitap-0.56
-  ```
+## How it works
 
-  Going back to the previous setup (editable install off the local checkout at its own version):
+- **SSH:** the app opens the tunnel itself (OpenSSH, or paramiko for keys with a passphrase) and
+  hands apitap a local forwarded address. Host and port in a profile are as seen from the SSH
+  server, like in DataGrip. Both backends share `~/.ssh/known_hosts`: the first key seen is
+  recorded (like OpenSSH's `accept-new`), any later change is refused and never retried over the
+  other backend.
+- **MySQL destinations** go through a per-table temp table and the app's own atomic
+  `RENAME TABLE` swap. apitap creates tables with columns and primary key only, so the source's
+  indexes are read once per run and added to the temp table before the swap; foreign keys follow
+  after the whole run (key names are unique per database, and the referenced table may be copied
+  later), with `FOREIGN_KEY_CHECKS=0` like a dump restore. Tables that other tables reference are
+  not swapped (InnoDB would move those keys onto the outgoing table) but have their rows replaced
+  in place.
+- **Empty source tables** empty the destination table, or create it when missing. apitap's 0-row
+  guard alone would leave old rows in place.
+- **Encryption** is one setting applied the same way to apitap (`ssl-mode` / `sslmode` in the
+  URL), pymysql and psycopg. Automatic mirrors apitap's own default since 0.55.1: off for
+  loopback addresses and SSH tunnels, verified TLS for any other host. A custom CA works for
+  PostgreSQL only, because apitap trusts its bundled public roots for MySQL.
 
-  ```zsh
-  VIRTUAL_ENV=$PWD/.venv314 uv pip install -e .vendor/apitap-lib/py-apitap
-  ```
+## Development
 
-## Quick Start
-
-The working environment is `.venv314`:
+Requirements: macOS on Apple Silicon, Python 3.12 or newer (developed on 3.14) and a Rust
+toolchain ([rustup](https://rustup.rs)) to build apitap.
 
 ```zsh
-cd /Volumes/T7/Projects/playground/sqltransfer
-.venv314/bin/python run.py
-```
-
-The window takes about 15 to 20 seconds on first start.
-
-Rebuilding the environment from scratch:
-
-```zsh
-cd /Volumes/T7/Projects/playground/sqltransfer
+git clone https://github.com/axro-gmbh/sqltransfer.git
+cd sqltransfer
 python3 -m venv .venv314
 source .venv314/bin/activate
 pip install -r requirements.txt
+```
+
+### apitap
+
+apitap is not installed from PyPI, which only has Linux x86_64 wheels. It is built from source,
+and upstream v0.56.0 needs one patch to compile on macOS: `crates/apitap-core/src/wire/mywire.rs`
+uses the Linux-only `libc::TCP_KEEPIDLE`, which Apple platforms call `TCP_KEEPALIVE`
+([patch](patches/apitap-0.56.0-macos-tcp-keepalive.patch)).
+
+```zsh
+git clone --branch v0.56.0 --depth 1 https://github.com/apitap/apitap-lib.git .vendor/apitap-lib
+git -C .vendor/apitap-lib apply ../../patches/apitap-0.56.0-macos-tcp-keepalive.patch
+DEVELOPER_DIR=/Library/Developer/CommandLineTools pip wheel --no-deps -w .vendor .vendor/apitap-lib/py-apitap
+pip install .vendor/apitap-0.56.0-*.whl
+python -c "import apitap"
+```
+
+`DEVELOPER_DIR` builds apitap with the Command Line Tools (macOS 26 SDK) instead of Xcode. Built
+with the Xcode 27 toolchain, the module compiles but fails to load (`mis-aligned LINKEDIT string
+pool`); the last line catches that. Install the Command Line Tools with `xcode-select --install` if
+that directory does not exist. Only this step needs them; `flet build` itself uses Xcode.
+
+The wheel stays in `.vendor`, because `flet build` picks it up from there (see
+`[tool.flet.dev_packages]` in `pyproject.toml`).
+
+### Run and test
+
+```zsh
 python run.py
+python -m pytest -q
 ```
 
-`flet` is pinned to `flet[desktop]>=1.0.0,<2.0`. The UI calls `page.show_dialog`,
-`page.window.*` and `ft.Clipboard()`; on 0.2x those calls are silently ignored (no error, no
-snack bar, no window size). The `desktop` extra matters: without `flet-desktop` installed,
-Flet 1.0 tries to pull it at first start and then fails with `No module named 'flet_desktop'`.
+The window takes 15 to 20 seconds on first start. Integration tests against real MySQL,
+PostgreSQL and SSH servers are skipped unless their environment variable is set; each test file
+explains how to start a disposable server for it.
 
-## Run Tests
+### Build and release
 
-```zsh
-cd /Volumes/T7/Projects/playground/sqltransfer
-.venv314/bin/python -m pytest -q
-```
+Signing, notarization and packaging are described in [MACOS_BUILD.md](MACOS_BUILD.md).
 
-## Package as macOS app
-
-If your environment has Flet CLI commands available, you can package the app:
-
-```zsh
-cd /Volumes/T7/Projects/playground/sqltransfer
-source .venv314/bin/activate
-flet pack run.py --name sqltransfer
-```
-
-If `flet pack` is unavailable in your installed version, check:
-
-```zsh
-flet --help
-```
-
-and use the macOS build command shown there.
-
-## Project Layout
+## Project layout
 
 - `run.py` - app launcher
-- `assets/icon.png` - app icon, picked up by `flet build` (see MACOS_BUILD.md)
-- `src/sqltransfer_app/app.py` - Flet UI wiring and transfer flow
-- `src/sqltransfer_app/ui.py` - presentation helpers (cards, log panel, formatting)
-- `src/sqltransfer_app/scope.py` - turns the scope choice into a transfer mode/value
-- `src/sqltransfer_app/storage.py` - SQLite profile/run storage
+- `assets/` - app icon (`icon_macos.png` is the full-bleed variant for the macOS bundle)
+- `src/sqltransfer_app/app.py` - Flet UI and transfer flow
+- `src/sqltransfer_app/ui.py` - presentation helpers
+- `src/sqltransfer_app/transfer.py` - apitap orchestration and MySQL/PostgreSQL helpers
+- `src/sqltransfer_app/tunnel.py` - SSH tunnels and host key checks
+- `src/sqltransfer_app/tls.py` - encryption settings for all three database clients
+- `src/sqltransfer_app/scope.py` - turns the scope choice into a transfer mode
+- `src/sqltransfer_app/storage.py` - SQLite storage for profiles and run history
 - `src/sqltransfer_app/secrets.py` - Keychain access
-- `src/sqltransfer_app/tunnel.py` - SSH tunnel manager
-- `src/sqltransfer_app/transfer.py` - `apitap` transfer orchestration
-- `tests/` - persistence, scope and formatting tests
+- `patches/` - local patches to dependencies
+- `docs/` - user guide
+- `tests/` - unit tests, plus integration tests that need a disposable server
 
+## License
 
-
-
-
-
-
-
-
-
-
-
-
-
+[Apache License 2.0](LICENSE). Components shipped inside the app bundle are listed with their
+licenses in [THIRD_PARTY_NOTICES.txt](THIRD_PARTY_NOTICES.txt). The AXRO name and logo are not
+covered by this license.
