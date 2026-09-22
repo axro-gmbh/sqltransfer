@@ -25,8 +25,8 @@ Minimal macOS desktop app (Python + Flet) for moving data from remote databases 
   - `tables` (comma-separated)
   - `schema`
 - Optional parallel override in UI; defaults to `1` when SSH tunneling is used to avoid channel-limit failures
-- Automatic MySQL staging-name pre-check blocks transfers that would exceed MySQL 64-char table-name limits (`__apitap_staging` suffix)
-- For long MySQL table names, transfer now auto-falls back to short temporary `dest_table` names and atomic `RENAME TABLE` swap to keep final table names unchanged
+- MySQL destinations go through a per-table temp table and the app's own atomic `RENAME TABLE` swap. Long table names are no longer the reason (apitap 0.56 shortens staging names itself). The swap stays because apitap's own swap breaks tables other tables reference (InnoDB moves the foreign key onto the renamed old table, then the DROP fails), and because indexes are built before the table is published
+- An empty source table empties the destination table. apitap's 0-row guard alone would leave the old rows in place
 - MySQL -> MySQL copies secondary indexes (unique, fulltext, prefix, functional) from the source, because apitap creates destination tables with columns and primary key only. Source indexes are read once per run and applied to the temp table before the swap
 - If empty MySQL fallback tables require FK references not yet present, app auto-creates table with deferred FKs and applies those constraints in a second pass
 - Keep recent run history in local SQLite, summarised per run instead of one note per table

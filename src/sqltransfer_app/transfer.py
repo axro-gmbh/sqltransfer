@@ -492,6 +492,36 @@ class TransferService:
             if endpoint and endpoint.tunnel:
                 self.tunnel_manager.close_tunnel(endpoint.tunnel)
 
+    async def mysql_empty_table(self, destination: DBProfile, table: str) -> tuple[bool, int, str]:
+        """Clear a destination table whose source is empty: (ok, rows deleted, error).
+
+        apitap's 0-row guard leaves an existing destination untouched when the
+        source has no rows, which would keep rows in the copy the source no longer has.
+        """
+        if destination.db_type != "mysql":
+            return False, 0, "Destination is not MySQL"
+        endpoint: ResolvedEndpoint | None = None
+        try:
+            endpoint = self._resolve_profile(destination)
+            host = endpoint.tunnel.local_host if endpoint.tunnel else destination.host
+            port = endpoint.tunnel.local_port if endpoint.tunnel else destination.port
+            password = self.secret_store.get_secret(destination.password_secret_key) or ""
+            deleted = await asyncio.to_thread(
+                _mysql_empty_table_sync,
+                host,
+                port,
+                destination.database,
+                destination.username,
+                password,
+                table,
+            )
+            return True, deleted, ""
+        except Exception as exc:  # noqa: BLE001
+            return False, 0, str(exc)
+        finally:
+            if endpoint and endpoint.tunnel:
+                self.tunnel_manager.close_tunnel(endpoint.tunnel)
+
     async def ensure_empty_mysql_table_from_source(
         self,
         source: DBProfile,
@@ -1026,6 +1056,44 @@ def _mysql_replace_final_from_temp_sync(
     if last_exc:
         raise last_exc
     raise RuntimeError("In-place replace failed unexpectedly")
+
+
+def _mysql_empty_table_sync(
+    host: str,
+    port: int,
+    database: str,
+    username: str,
+    password: str,
+    table: str,
+) -> int:
+    """Delete every row, returning how many went.
+
+    DELETE rather than TRUNCATE: MySQL refuses TRUNCATE on a table other tables
+    reference, and the in-place path already handles those tables the same way.
+    """
+    import pymysql
+
+    conn = pymysql.connect(
+        host=host,
+        port=port,
+        user=username,
+        password=password,
+        database=database,
+        connect_timeout=5,
+        read_timeout=600,
+        write_timeout=600,
+        autocommit=True,
+    )
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SET FOREIGN_KEY_CHECKS=0")
+            try:
+                deleted = cur.execute(f"DELETE FROM {_quote_mysql_ident(table)}")
+            finally:
+                cur.execute("SET FOREIGN_KEY_CHECKS=1")
+            return int(deleted)
+    finally:
+        conn.close()
 
 
 def _source_table_row_count_sync(

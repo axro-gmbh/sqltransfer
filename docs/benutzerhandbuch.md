@@ -113,11 +113,11 @@ Rechts stehen die letzten 20 Läufe mit Status, Quelle, Ziel, Umfang, Zeilenzahl
 
 **Die Zieltabelle wird ersetzt, nicht ergänzt.** Eine Übertragung überschreibt die Tabelle im Ziel. Sie hängt keine Zeilen an und gleicht nichts ab. Deshalb gilt: Ziel ist deine lokale Entwicklungsdatenbank, niemals etwas, dessen Inhalt jemand braucht.
 
-**Sonderbehandlung bei MySQL als Ziel.** MySQL begrenzt Tabellennamen auf 64 Zeichen, und die Zwischentabelle beim Übertragen braucht davon einen Teil. Bei langen Namen weicht die App automatisch auf kurze Zwischennamen aus und benennt am Ende um, sodass der endgültige Name stimmt. Hängen an einer Tabelle Fremdschlüssel anderer Tabellen, tauscht die App nicht die Tabelle aus, sondern ersetzt die Daten darin. Beides taucht im Protokoll als WARN auf. Das ist kein Fehler, sondern der Hinweis, dass ein Umweg genommen wurde.
+**Sonderbehandlung bei MySQL als Ziel.** Die App überträgt jede Tabelle zuerst in eine Zwischentabelle und tauscht sie am Ende in einem Schritt aus, sodass niemand eine halb gefüllte Tabelle sieht. Verweisen andere Tabellen per Fremdschlüssel auf die Zieltabelle, tauscht die App sie nicht aus, sondern ersetzt nur die Daten darin, denn ein Austausch würde diese Verweise brechen. Das taucht im Protokoll als WARN auf. Das ist kein Fehler, sondern der Hinweis, dass ein Umweg genommen wurde.
 
 **Indizes werden von der Quelle übernommen.** Bei MySQL zu MySQL legt die App im Ziel dieselben Indizes an wie in der Quelle, auch UNIQUE-, FULLTEXT- und Präfix-Indizes. Das geschieht vor dem Austausch, die Tabelle ist also vom ersten Moment an vollständig indiziert. Bei großen Tabellen kostet das spürbar Zeit, im Protokoll steht dann "Building … index(es)". Kommt die Quelle aus PostgreSQL, bekommt die Zieltabelle nur ihren Primärschlüssel. Fremdschlüssel übernimmt die App nicht.
 
-**Leere Quelltabellen** werden im Ziel als leere Tabelle angelegt. Fehlen dafür noch Fremdschlüsselziele, holt die App das in einem zweiten Durchgang am Ende nach.
+**Leere Quelltabellen** führen zu einer leeren Zieltabelle: Fehlt sie, wird sie angelegt, hat sie noch alte Zeilen, werden diese entfernt. Beides steht als WARN im Protokoll. Legt die App eine leere Tabelle an, deren Fremdschlüsselziele noch fehlen, setzt sie die Fremdschlüssel in einem zweiten Durchgang am Ende.
 
 **Abbruch bei anderen Zielen als MySQL.** Dort läuft die Übertragung als ein einziger Vorgang. **Cancel** wird vorgemerkt und im Protokoll bestätigt, wirkt aber erst, wenn der laufende Vorgang von sich aus endet.
 

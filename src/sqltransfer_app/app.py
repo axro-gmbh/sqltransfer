@@ -792,22 +792,6 @@ async def main(page: ft.Page) -> None:
             return False, [], message
         return True, tables, message
 
-    async def _detect_mysql_long_tables(
-        dst: DBProfile, src: DBProfile, mode: str, scope: str
-    ) -> tuple[bool, list[str], str]:
-        if dst.db_type != "mysql":
-            return True, [], ""
-        ok, tables, detail = await _scope_tables_for_check(src, mode, scope)
-        if not ok:
-            return False, [], f"Name pre-check failed while reading source tables: {detail}"
-        suffix = "__apitap_staging"
-        invalid = [
-            table.split(".")[-1].strip('`"')
-            for table in tables
-            if len(table.split(".")[-1].strip('`"') + suffix) > 64
-        ]
-        return True, invalid, ""
-
     # ------------------------------------------------------------------ preview
 
     async def preview_plan_task() -> None:
@@ -831,14 +815,6 @@ async def main(page: ft.Page) -> None:
         page.update()
 
         parsed_mode, parsed_value, count = transfer_service.preview_scope(mode, scope)
-        names_ok, long_tables, names_message = await _detect_mysql_long_tables(dst, src, parsed_mode, parsed_value)
-        if not names_ok:
-            set_status("Preview blocked", "error")
-            log.append(names_message, "ERROR")
-            notify_error(names_message)
-            set_running(False)
-            page.update()
-            return
 
         log.clear()
         log.append(f"Source: {src.name} ({src.db_type}) via {'SSH' if src.use_ssh else 'direct'}")
@@ -850,13 +826,6 @@ async def main(page: ft.Page) -> None:
         else:
             log.append(f"Scope: single table '{parsed_value}'")
         log.append(f"Parallel pipes: {parallel if parallel is not None else 'auto'}")
-        if long_tables:
-            preview = ", ".join(long_tables[:5])
-            more = "" if len(long_tables) <= 5 else f" (+{len(long_tables) - 5} more)"
-            log.append(
-                f"Long MySQL names will transfer via short temp names and atomic rename: {preview}{more}",
-                "WARN",
-            )
         set_status("Preview ready", "ok")
         set_running(False)
         page.update()
@@ -911,18 +880,12 @@ async def main(page: ft.Page) -> None:
             refresh_run_history()
 
         try:
-            names_ok, long_table_bases, names_message = await _detect_mysql_long_tables(dst, src, mode, scope)
-            if not names_ok:
-                fail(names_message)
-                return
-
             if dst.db_type == "mysql":
                 scope_ok, scoped_tables, scoped_msg = await _scope_tables_for_check(src, mode, scope)
                 if not scope_ok:
                     fail(f"Could not resolve table scope: {scoped_msg}")
                     return
 
-                long_set = set(long_table_bases)
                 notes: list[str] = []
                 deferred_fk_sql: list[str] = []
                 total_rows = 0
@@ -931,8 +894,6 @@ async def main(page: ft.Page) -> None:
                 cancelled = False
 
                 log.append("MySQL destination detected: using per-table temp/finalize flow")
-                if long_set:
-                    log.append("Long-name tables: " + ", ".join(sorted(long_set)), "WARN")
 
                 # apitap creates tables with columns and primary key only; the other
                 # indexes come from the source, read once for the whole run.
@@ -1079,7 +1040,36 @@ async def main(page: ft.Page) -> None:
                             )
                             fail(detail)
                             return
-                        notes.append(f"fallback_skip_swap={final_name}")
+                        # apitap published nothing: its 0-row guard leaves an existing
+                        # destination untouched, which for a copy means stale rows.
+                        # Clear the table once the source is confirmed empty.
+                        count_ok, source_count, count_err = await transfer_service.source_table_row_count(
+                            src, full_name
+                        )
+                        if not count_ok:
+                            log.append(
+                                f"Could not count rows of source {final_name}, destination left unchanged: {count_err}",
+                                "WARN",
+                            )
+                            notes.append(f"fallback_skip_swap={final_name}")
+                        elif source_count == 0:
+                            emptied, deleted, empty_err = await transfer_service.mysql_empty_table(dst, final_name)
+                            if not emptied:
+                                fail(f"Source table {final_name} is empty, but clearing the destination failed: {empty_err}")
+                                return
+                            log.append(
+                                f"Source table {final_name} is empty -> removed {deleted} stale row(s) from destination",
+                                "WARN",
+                            )
+                            notes.append(f"emptied={final_name}")
+                        else:
+                            # The source gained rows after the transfer had read it.
+                            log.append(
+                                f"Source table {final_name} had no rows during transfer but has {source_count} now; "
+                                "destination left unchanged, run this table again",
+                                "WARN",
+                            )
+                            notes.append(f"fallback_skip_swap={final_name}")
                         await apply_source_indexes(final_name, final_name)
 
                     total_rows += item_result.rows

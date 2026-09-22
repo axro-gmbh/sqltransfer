@@ -1,10 +1,13 @@
-"""Integration test: secondary indexes must survive a MySQL -> MySQL transfer.
+"""Integration tests for the MySQL -> MySQL finalize steps.
 
 Needs a disposable MySQL server and is skipped otherwise, e.g.:
 
     docker run -d --name sqltransfer-indextest -e MYSQL_ROOT_PASSWORD=test \
         -p 127.0.0.1:3398:3306 mysql:8.4
-    SQLTRANSFER_TEST_MYSQL=127.0.0.1:3398:root:test pytest tests/test_mysql_indexes.py
+    docker exec sqltransfer-indextest mysql -uroot -ptest -e "SET PERSIST local_infile=1"
+    SQLTRANSFER_TEST_MYSQL=127.0.0.1:3398:root:test pytest tests/test_mysql_integration.py
+
+apitap loads with LOAD DATA LOCAL, which MySQL 8.4 disables server-side by default.
 
 The test drops and recreates the databases `sqlt_src_idx` and `sqlt_dst_idx`,
 so never point it at a server whose data matters.
@@ -172,3 +175,38 @@ def test_new_destination_gets_the_source_indexes(databases):
 
     assert _row_count(DST_DB, "items") == 5
     assert _indexes(DST_DB, "items") == expected
+
+
+def _service() -> TransferService:
+    return TransferService(storage=None, secret_store=_Secrets(), tunnel_manager=TunnelManager())
+
+
+def test_emptying_a_destination_removes_stale_rows(databases):
+    # apitap's 0-row guard leaves an existing destination untouched when the source
+    # table is empty, so the app has to clear it or the copy keeps rows the source lost.
+    _exec(DST_DB, "CREATE TABLE audit (id INT PRIMARY KEY, note VARCHAR(20))",
+          "INSERT INTO audit VALUES (1,'stale'),(2,'stale')")
+
+    ok, deleted, error = asyncio.run(_service().mysql_empty_table(_profile("local", DST_DB), "audit"))
+
+    assert ok, error
+    assert deleted == 2
+    assert _row_count(DST_DB, "audit") == 0
+
+
+def test_emptying_works_on_a_table_other_tables_reference(databases):
+    # TRUNCATE is refused for a parent table; the app must still be able to clear it.
+    _exec(
+        DST_DB,
+        "CREATE TABLE categories (id INT PRIMARY KEY)",
+        "INSERT INTO categories VALUES (1),(2)",
+        "CREATE TABLE products (id INT PRIMARY KEY, category_id INT, "
+        "CONSTRAINT fk_prod_cat FOREIGN KEY (category_id) REFERENCES categories(id))",
+        "INSERT INTO products VALUES (10,1)",
+    )
+
+    ok, deleted, error = asyncio.run(_service().mysql_empty_table(_profile("local", DST_DB), "categories"))
+
+    assert ok, error
+    assert deleted == 2
+    assert _row_count(DST_DB, "categories") == 0
