@@ -67,9 +67,10 @@ def _login_check_sync(
             password=password or "", connect_timeout=int(timeout_s),
         )
         try:
-            if conn.pgconn.ssl_in_use:
-                cipher = conn.pgconn.ssl_attribute("cipher")
-                return f"encrypted ({cipher.decode() if isinstance(cipher, bytes) else cipher})"
+            # Ask the server; psycopg's client-side TLS accessors differ between versions.
+            row = conn.execute("SELECT ssl, cipher FROM pg_stat_ssl WHERE pid = pg_backend_pid()").fetchone()
+            if row and row[0]:
+                return f"encrypted ({row[1]})"
             return "not encrypted"
         finally:
             conn.close()
