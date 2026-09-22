@@ -7,7 +7,7 @@ import socket
 
 import flet as ft
 
-from . import ui
+from . import __version__, ui
 from .models import DBProfile, SSHProfile, TransferResult
 from .scope import ScopeError, resolve_scope, summarize_notes
 from .secrets import SecretStore
@@ -1410,6 +1410,7 @@ async def main(page: ft.Page) -> None:
             [
                 ft.Icon(ft.Icons.SYNC_ALT, color=ft.Colors.PRIMARY, size=22),
                 ft.Text("SQL Transfer", size=22, weight=ft.FontWeight.BOLD),
+                ft.Text(f"v{__version__}", size=12, color=ft.Colors.ON_SURFACE_VARIANT),
                 ft.Text(
                     "MySQL and Postgres between remote and local, optionally through SSH",
                     size=12,

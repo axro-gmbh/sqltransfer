@@ -1,6 +1,6 @@
 [project]
 name = "sqltransfer"
-version = "0.1.0"
+version = "1.0.0"
 description = "Flet desktop app for transferring SQL data with optional SSH tunneling"
 readme = "README.md"
 requires-python = ">=3.10"

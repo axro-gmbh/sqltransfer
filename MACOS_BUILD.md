@@ -165,7 +165,7 @@ xcrun stapler validate build/macos/sqltransfer.app
 The honest test is a copy that carries the quarantine flag, the state a download arrives in:
 
 ```zsh
-ditto -x -k build/sqltransfer-0.1.0-arm64.zip /tmp/recv
+ditto -x -k build/sqltransfer-<version>-arm64.zip /tmp/recv
 xattr -w com.apple.quarantine "0081;00000000;Safari;" /tmp/recv/sqltransfer.app
 spctl -a -vvv -t exec /tmp/recv/sqltransfer.app        # must still say accepted
 ```
@@ -175,7 +175,7 @@ spctl -a -vvv -t exec /tmp/recv/sqltransfer.app        # must still say accepted
 Pack with `ditto`, not with the Finder, which breaks the signature:
 
 ```zsh
-ditto -c -k --keepParent build/macos/sqltransfer.app build/sqltransfer-0.1.0-arm64.zip
+ditto -c -k --keepParent build/macos/sqltransfer.app build/sqltransfer-<version>-arm64.zip
 ```
 
 Recipients open it normally. No right-click, no trip through System Settings, no
