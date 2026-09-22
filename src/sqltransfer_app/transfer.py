@@ -424,6 +424,74 @@ class TransferService:
             if endpoint and endpoint.tunnel:
                 self.tunnel_manager.close_tunnel(endpoint.tunnel)
 
+    async def mysql_source_index_clauses(
+        self, source: DBProfile, tables: list[str]
+    ) -> tuple[bool, dict[str, dict[str, str]], str]:
+        """Read the secondary indexes of all tables in scope with one source round trip.
+
+        Returns clauses keyed by bare table name. Reading them per table would open
+        an SSH tunnel per table, which roughly doubles a schema-wide run.
+        """
+        if source.db_type != "mysql":
+            return True, {}, "Index copy is only supported from a MySQL source"
+        schemas = sorted({table.rpartition(".")[0].strip("`\"") or source.database for table in tables})
+        endpoint: ResolvedEndpoint | None = None
+        try:
+            endpoint = self._resolve_profile(source)
+            host = endpoint.tunnel.local_host if endpoint.tunnel else source.host
+            port = endpoint.tunnel.local_port if endpoint.tunnel else source.port
+            password = self.secret_store.get_secret(source.password_secret_key) or ""
+            rows = await asyncio.to_thread(
+                _mysql_source_index_rows_sync,
+                host,
+                port,
+                source.database,
+                source.username,
+                password,
+                schemas or [source.database],
+            )
+            return True, group_mysql_index_rows_by_table(rows), ""
+        except Exception as exc:  # noqa: BLE001
+            return False, {}, str(exc)
+        finally:
+            if endpoint and endpoint.tunnel:
+                self.tunnel_manager.close_tunnel(endpoint.tunnel)
+
+    async def mysql_apply_index_clauses(
+        self,
+        destination: DBProfile,
+        *,
+        target_table: str,
+        clauses: dict[str, str],
+    ) -> tuple[bool, list[str], list[str], str]:
+        """Add the missing indexes to a destination table: (ok, applied, failed, error)."""
+        if not clauses:
+            return True, [], [], ""
+        if destination.db_type != "mysql":
+            return False, [], [], "Destination is not MySQL"
+        endpoint: ResolvedEndpoint | None = None
+        try:
+            endpoint = self._resolve_profile(destination)
+            host = endpoint.tunnel.local_host if endpoint.tunnel else destination.host
+            port = endpoint.tunnel.local_port if endpoint.tunnel else destination.port
+            password = self.secret_store.get_secret(destination.password_secret_key) or ""
+            applied, failed = await asyncio.to_thread(
+                _mysql_apply_index_clauses_sync,
+                host,
+                port,
+                destination.database,
+                destination.username,
+                password,
+                target_table,
+                clauses,
+            )
+            return True, applied, failed, ""
+        except Exception as exc:  # noqa: BLE001
+            return False, [], [], str(exc)
+        finally:
+            if endpoint and endpoint.tunnel:
+                self.tunnel_manager.close_tunnel(endpoint.tunnel)
+
     async def ensure_empty_mysql_table_from_source(
         self,
         source: DBProfile,
@@ -612,6 +680,163 @@ def _quote_mysql_ident(name: str) -> str:
 
 def _quote_pg_ident(name: str) -> str:
     return '"' + name.replace('"', '""') + '"'
+
+
+# apitap creates destination tables with columns and the primary key only. Every
+# other index has to be carried over from the source, or it is gone after the swap.
+
+_MYSQL_INDEX_STATS_SQL = (
+    "SELECT table_name, index_name, non_unique, seq_in_index, column_name, sub_part, "
+    "collation, index_type, {expression} "
+    "FROM information_schema.statistics WHERE table_schema IN ({schemas})"
+)
+
+
+def build_mysql_index_clauses(rows) -> dict[str, str]:
+    """Turn information_schema.statistics rows of one table into ALTER TABLE clauses.
+
+    Each row is (index_name, non_unique, seq_in_index, column_name, sub_part,
+    collation, index_type, expression). PRIMARY is skipped, apitap creates it.
+    """
+    grouped: dict[str, dict] = {}
+    for name, non_unique, _seq, column, sub_part, collation, index_type, expression in sorted(
+        rows, key=lambda r: (r[0], int(r[2]))
+    ):
+        if name == "PRIMARY":
+            continue
+        entry = grouped.setdefault(
+            name,
+            {"unique": not int(non_unique), "type": (index_type or "BTREE").upper(), "parts": []},
+        )
+        if column is None and expression:
+            # Functional key parts need their own parentheses.
+            part = f"({expression})"
+        else:
+            part = _quote_mysql_ident(column)
+            if sub_part:
+                part += f"({int(sub_part)})"
+        if (collation or "").upper() == "D":
+            part += " DESC"
+        entry["parts"].append(part)
+
+    clauses: dict[str, str] = {}
+    for name, entry in grouped.items():
+        if entry["type"] == "FULLTEXT":
+            kind = "FULLTEXT INDEX"
+        elif entry["type"] == "SPATIAL":
+            kind = "SPATIAL INDEX"
+        elif entry["unique"]:
+            kind = "UNIQUE INDEX"
+        else:
+            kind = "INDEX"
+        clauses[name] = f"ADD {kind} {_quote_mysql_ident(name)} ({', '.join(entry['parts'])})"
+    return clauses
+
+
+def group_mysql_index_rows_by_table(rows) -> dict[str, dict[str, str]]:
+    """Split schema-wide statistics rows per table and build the clauses for each."""
+    per_table: dict[str, list] = {}
+    for table, *index_row in rows:
+        per_table.setdefault(table, []).append(tuple(index_row))
+    return {table: build_mysql_index_clauses(index_rows) for table, index_rows in per_table.items()}
+
+
+def _mysql_source_index_rows_sync(
+    host: str,
+    port: int,
+    database: str,
+    username: str,
+    password: str,
+    schemas: list[str],
+) -> list[tuple]:
+    import pymysql
+
+    conn = pymysql.connect(
+        host=host,
+        port=port,
+        user=username,
+        password=password,
+        database=database,
+        connect_timeout=5,
+        read_timeout=60,
+        write_timeout=60,
+        autocommit=True,
+    )
+    try:
+        with conn.cursor() as cur:
+            placeholders = ", ".join(["%s"] * len(schemas))
+            try:
+                cur.execute(
+                    _MYSQL_INDEX_STATS_SQL.format(expression="expression", schemas=placeholders),
+                    tuple(schemas),
+                )
+            except pymysql.MySQLError:
+                # MariaDB and MySQL < 8.0.13 have no EXPRESSION column, and no functional indexes.
+                cur.execute(
+                    _MYSQL_INDEX_STATS_SQL.format(expression="NULL", schemas=placeholders),
+                    tuple(schemas),
+                )
+            return list(cur.fetchall())
+    finally:
+        conn.close()
+
+
+def _mysql_apply_index_clauses_sync(
+    host: str,
+    port: int,
+    database: str,
+    username: str,
+    password: str,
+    table: str,
+    clauses: dict[str, str],
+) -> tuple[list[str], list[str]]:
+    """Add every index from `clauses` the table does not have yet.
+
+    One ALTER TABLE first, so a big table is rebuilt once. If that fails (InnoDB
+    for example builds only one FULLTEXT index per statement), fall back to one
+    index at a time and report the ones that still fail instead of aborting.
+    """
+    import pymysql
+
+    conn = pymysql.connect(
+        host=host,
+        port=port,
+        user=username,
+        password=password,
+        database=database,
+        connect_timeout=5,
+        # Index builds on million-row tables take minutes.
+        read_timeout=3600,
+        write_timeout=3600,
+        autocommit=True,
+    )
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT DISTINCT index_name FROM information_schema.statistics "
+                "WHERE table_schema = %s AND table_name = %s",
+                (database, table),
+            )
+            existing = {row[0] for row in cur.fetchall()}
+            missing = {name: clause for name, clause in clauses.items() if name not in existing}
+            if not missing:
+                return [], []
+            try:
+                cur.execute(f"ALTER TABLE {_quote_mysql_ident(table)} " + ", ".join(missing.values()))
+                return sorted(missing), []
+            except pymysql.MySQLError:
+                pass
+            applied: list[str] = []
+            failed: list[str] = []
+            for name in sorted(missing):
+                try:
+                    cur.execute(f"ALTER TABLE {_quote_mysql_ident(table)} {missing[name]}")
+                    applied.append(name)
+                except pymysql.MySQLError as exc:
+                    failed.append(f"{name}: {exc}")
+            return applied, failed
+    finally:
+        conn.close()
 
 
 def _short_backup_name(final_table: str) -> str:

@@ -934,6 +934,42 @@ async def main(page: ft.Page) -> None:
                 if long_set:
                     log.append("Long-name tables: " + ", ".join(sorted(long_set)), "WARN")
 
+                # apitap creates tables with columns and primary key only; the other
+                # indexes come from the source, read once for the whole run.
+                source_indexes: dict[str, dict[str, str]] = {}
+                if src.db_type == "mysql":
+                    idx_ok, source_indexes, idx_msg = await transfer_service.mysql_source_index_clauses(
+                        src, scoped_tables
+                    )
+                    if idx_ok:
+                        log.append(f"Read secondary indexes of {len(source_indexes)} source table(s)")
+                    else:
+                        log.append(
+                            f"Could not read source indexes, tables get their primary key only: {idx_msg}", "WARN"
+                        )
+                else:
+                    log.append("Source is not MySQL: tables get their primary key only, no secondary indexes", "WARN")
+
+                async def apply_source_indexes(target_table: str, final_name: str) -> None:
+                    clauses = source_indexes.get(final_name, {})
+                    if not clauses:
+                        return
+                    log.append(f"Building {len(clauses)} index(es) for {final_name}")
+                    page.update()
+                    ok, applied, failed, idx_err = await transfer_service.mysql_apply_index_clauses(
+                        dst, target_table=target_table, clauses=clauses
+                    )
+                    if not ok:
+                        log.append(f"Indexes for {final_name} could not be applied: {idx_err}", "WARN")
+                        notes.append(f"index_failed={final_name}")
+                        return
+                    if applied:
+                        notes.append(f"indexed={final_name}")
+                    for failure in failed:
+                        log.append(f"Index for {final_name} not created: {failure}", "WARN")
+                    if failed:
+                        notes.append(f"index_failed={final_name}")
+
                 total = len(scoped_tables)
                 notes.append(f"tables_total={total}")
                 for index, full_name in enumerate(scoped_tables, start=1):
@@ -986,7 +1022,12 @@ async def main(page: ft.Page) -> None:
                                 return
                             log.append(f"In-place replace done for {final_name}: {replace_msg}")
                             notes.append(f"inplace={final_name}")
+                            # The table stays in place; this repairs indexes an earlier swap removed.
+                            await apply_source_indexes(final_name, final_name)
                         else:
+                            # Index the temp table before the swap, so the table that gets
+                            # published is complete from its first moment.
+                            await apply_source_indexes(temp_name, final_name)
                             swapped, swap_msg = await transfer_service.mysql_swap_temp_to_final(
                                 dst, temp_table=temp_name, final_table=final_name
                             )
@@ -1019,6 +1060,8 @@ async def main(page: ft.Page) -> None:
                                     log.append(
                                         f"Source table {final_name} is empty -> {create_msg}", "WARN"
                                     )
+                                    # The column-only fallback of that path creates no indexes.
+                                    await apply_source_indexes(final_name, final_name)
                                     continue
                                 fail(
                                     f"Source table {final_name} is empty and transfer produced no output table. "
@@ -1037,6 +1080,7 @@ async def main(page: ft.Page) -> None:
                             fail(detail)
                             return
                         notes.append(f"fallback_skip_swap={final_name}")
+                        await apply_source_indexes(final_name, final_name)
 
                     total_rows += item_result.rows
                     total_elapsed += item_result.elapsed_ms

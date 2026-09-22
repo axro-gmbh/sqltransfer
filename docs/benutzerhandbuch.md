@@ -115,6 +115,8 @@ Rechts stehen die letzten 20 Läufe mit Status, Quelle, Ziel, Umfang, Zeilenzahl
 
 **Sonderbehandlung bei MySQL als Ziel.** MySQL begrenzt Tabellennamen auf 64 Zeichen, und die Zwischentabelle beim Übertragen braucht davon einen Teil. Bei langen Namen weicht die App automatisch auf kurze Zwischennamen aus und benennt am Ende um, sodass der endgültige Name stimmt. Hängen an einer Tabelle Fremdschlüssel anderer Tabellen, tauscht die App nicht die Tabelle aus, sondern ersetzt die Daten darin. Beides taucht im Protokoll als WARN auf. Das ist kein Fehler, sondern der Hinweis, dass ein Umweg genommen wurde.
 
+**Indizes werden von der Quelle übernommen.** Bei MySQL zu MySQL legt die App im Ziel dieselben Indizes an wie in der Quelle, auch UNIQUE-, FULLTEXT- und Präfix-Indizes. Das geschieht vor dem Austausch, die Tabelle ist also vom ersten Moment an vollständig indiziert. Bei großen Tabellen kostet das spürbar Zeit, im Protokoll steht dann "Building … index(es)". Kommt die Quelle aus PostgreSQL, bekommt die Zieltabelle nur ihren Primärschlüssel. Fremdschlüssel übernimmt die App nicht.
+
 **Leere Quelltabellen** werden im Ziel als leere Tabelle angelegt. Fehlen dafür noch Fremdschlüsselziele, holt die App das in einem zweiten Durchgang am Ende nach.
 
 **Abbruch bei anderen Zielen als MySQL.** Dort läuft die Übertragung als ein einziger Vorgang. **Cancel** wird vorgemerkt und im Protokoll bestätigt, wirkt aber erst, wenn der laufende Vorgang von sich aus endet.
