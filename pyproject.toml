@@ -3,6 +3,7 @@ name = "sqltransfer"
 version = "1.0.0"
 description = "Flet desktop app for transferring SQL data with optional SSH tunneling"
 readme = "README.md"
+license = {text = "Apache-2.0"}
 requires-python = ">=3.10"
 dependencies = [
   "flet[desktop]>=1.0.0,<2.0",
