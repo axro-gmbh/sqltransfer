@@ -27,6 +27,8 @@ A user guide (German) is in [docs/benutzerhandbuch.md](docs/benutzerhandbuch.md)
 - SSH host keys are checked against `~/.ssh/known_hosts`; a changed key stops the connection
 - The connection test logs in for real and reports whether the session is encrypted
 - Run history with the last 20 transfers, reusable with one click
+- Automatic updates through [Sparkle](https://sparkle-project.org), signed and served from GitHub
+  Releases
 
 ## How it works
 
@@ -98,7 +100,8 @@ explains how to start a disposable server for it.
 
 ### Build and release
 
-Signing, notarization and packaging are described in [MACOS_BUILD.md](MACOS_BUILD.md).
+Signing, notarization, packaging and releases (`scripts/release.sh`, Sparkle keys and appcast) are
+described in [MACOS_BUILD.md](MACOS_BUILD.md).
 
 ## Project layout
 
@@ -113,6 +116,7 @@ Signing, notarization and packaging are described in [MACOS_BUILD.md](MACOS_BUIL
 - `src/sqltransfer_app/storage.py` - SQLite storage for profiles and run history
 - `src/sqltransfer_app/secrets.py` - Keychain access
 - `patches/` - local patches to dependencies
+- `scripts/` - release script, third-party notices, deployment target fix for the Xcode project
 - `docs/` - user guide
 - `tests/` - unit tests, plus integration tests that need a disposable server
 
