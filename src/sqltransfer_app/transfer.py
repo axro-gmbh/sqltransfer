@@ -6,12 +6,13 @@ import re
 import socket
 import time
 from dataclasses import dataclass
-from typing import Literal
-from urllib.parse import quote_plus
+from typing import Any, Literal
+from urllib.parse import quote_plus, urlencode
 
 from .models import DBProfile, SSHProfile, TransferResult
 from .secrets import SecretStore
 from .storage import Storage
+from .tls import TlsSettings, apitap_query_params, mysql_connect_kwargs, postgres_connect_kwargs, resolve_tls
 from .tunnel import OpenTunnel, TunnelManager
 
 
@@ -19,18 +20,83 @@ from .tunnel import OpenTunnel, TunnelManager
 class ResolvedEndpoint:
     dsn: str
     tunnel: OpenTunnel | None = None
+    # Where the client really connects (the tunnel's local end when tunnelled)
+    # and the encryption that applies there.
+    host: str = ""
+    port: int = 0
+    tls: TlsSettings = TlsSettings("off")
 
 
 def _default_port(db_type: str) -> int:
     return 5432 if db_type == "postgres" else 3306
 
 
-def _check_tcp(host: str, port: int, timeout_s: float) -> None:
-    with socket.create_connection((host, port), timeout_s):
-        return
+def _mysql_connect(tls: TlsSettings, **kwargs: Any):
+    """The only place that opens a pymysql connection, so none can skip the encryption setting."""
+    import pymysql
+
+    return pymysql.connect(**kwargs, **mysql_connect_kwargs(tls))
 
 
-def build_dsn(profile: DBProfile, password: str | None, host: str | None = None, port: int | None = None) -> str:
+def _pg_connect(tls: TlsSettings, **kwargs: Any):
+    """The only place that opens a psycopg connection, so none can skip the encryption setting."""
+    import psycopg
+
+    return psycopg.connect(**kwargs, **postgres_connect_kwargs(tls))
+
+
+def _login_check_sync(
+    db_type: str,
+    host: str,
+    port: int,
+    database: str,
+    username: str,
+    password: str | None,
+    timeout_s: float,
+    *,
+    tls: TlsSettings,
+) -> str:
+    """Log in for real and report whether the session is encrypted.
+
+    A bare port check used to pass for settings that fail at the first query,
+    wrong password and wrong encryption setting alike.
+    """
+    if db_type == "postgres":
+        conn = _pg_connect(
+            tls, host=host, port=port, dbname=database, user=username,
+            password=password or "", connect_timeout=int(timeout_s),
+        )
+        try:
+            if conn.pgconn.ssl_in_use:
+                cipher = conn.pgconn.ssl_attribute("cipher")
+                return f"encrypted ({cipher.decode() if isinstance(cipher, bytes) else cipher})"
+            return "not encrypted"
+        finally:
+            conn.close()
+
+    conn = _mysql_connect(
+        tls, host=host, port=port, user=username, password=password or "",
+        database=database, connect_timeout=int(timeout_s), read_timeout=int(timeout_s),
+    )
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SHOW SESSION STATUS LIKE 'Ssl_cipher'")
+            row = cur.fetchone()
+        cipher = (row[1] if row else "") or ""
+        if isinstance(cipher, bytes):
+            cipher = cipher.decode()
+        return f"encrypted ({cipher})" if cipher else "not encrypted"
+    finally:
+        conn.close()
+
+
+def build_dsn(
+    profile: DBProfile,
+    password: str | None,
+    host: str | None = None,
+    port: int | None = None,
+    tls: TlsSettings | None = None,
+) -> str:
     scheme = "postgres" if profile.db_type == "postgres" else "mysql"
     user = quote_plus(profile.username)
     pwd = quote_plus(password) if password else ""
@@ -38,7 +104,11 @@ def build_dsn(profile: DBProfile, password: str | None, host: str | None = None,
     final_host = host or profile.host
     final_port = port or profile.port or _default_port(profile.db_type)
     db_name = quote_plus(profile.database)
-    return f"{scheme}://{auth}@{final_host}:{final_port}/{db_name}"
+    dsn = f"{scheme}://{auth}@{final_host}:{final_port}/{db_name}"
+    if tls is not None:
+        # Always explicit: apitap's own default depends on the host, and ours must match it.
+        dsn += "?" + urlencode(apitap_query_params(profile.db_type, tls))
+    return dsn
 
 
 def _get_apitap_transfer_callable():
@@ -101,10 +171,16 @@ class TransferService:
                 remote_port=profile.port,
                 passphrase=passphrase,
             )
-            dsn = build_dsn(profile, password, host=tunnel.local_host, port=tunnel.local_port)
-            return ResolvedEndpoint(dsn=dsn, tunnel=tunnel)
+            tls = resolve_tls(profile.tls_mode, profile.tls_ca_path, tunnel.local_host)
+            dsn = build_dsn(profile, password, host=tunnel.local_host, port=tunnel.local_port, tls=tls)
+            return ResolvedEndpoint(
+                dsn=dsn, tunnel=tunnel, host=tunnel.local_host, port=tunnel.local_port, tls=tls
+            )
 
-        return ResolvedEndpoint(dsn=build_dsn(profile, password))
+        tls = resolve_tls(profile.tls_mode, profile.tls_ca_path, profile.host)
+        return ResolvedEndpoint(
+            dsn=build_dsn(profile, password, tls=tls), host=profile.host, port=profile.port, tls=tls
+        )
 
     def preview_scope(self, scope_mode: Literal["table", "tables", "schema"], scope_value: str) -> tuple[str, str, int]:
         cleaned = scope_value.strip()
@@ -121,18 +197,28 @@ class TransferService:
             raise ValueError("'table' mode requires a table value")
         return "table", cleaned, 1
 
+    async def _login_check(
+        self, profile: DBProfile, endpoint: ResolvedEndpoint, password: str | None, timeout_s: float
+    ) -> str:
+        state = await asyncio.to_thread(
+            _login_check_sync,
+            profile.db_type,
+            endpoint.host,
+            endpoint.port,
+            profile.database,
+            profile.username,
+            password,
+            timeout_s,
+            tls=endpoint.tls,
+        )
+        return f"Connected: {profile.name} ({endpoint.host}:{endpoint.port}), {state}"
+
     async def test_profile_connection(self, profile: DBProfile, timeout_s: float = 4.0) -> tuple[bool, str]:
         endpoint: ResolvedEndpoint | None = None
         try:
             endpoint = self._resolve_profile(profile)
-            if endpoint.tunnel:
-                host = endpoint.tunnel.local_host
-                port = endpoint.tunnel.local_port
-            else:
-                host = profile.host
-                port = profile.port
-            await asyncio.to_thread(_check_tcp, host, port, timeout_s)
-            return True, f"Reachable: {profile.name} ({host}:{port})"
+            password = self.secret_store.get_secret(profile.password_secret_key)
+            return True, await self._login_check(profile, endpoint, password, timeout_s)
         except Exception as exc:  # noqa: BLE001
             return False, f"Connection test failed: {exc}"
         finally:
@@ -150,14 +236,9 @@ class TransferService:
         endpoint: ResolvedEndpoint | None = None
         try:
             endpoint = self._resolve_profile(profile, password_override=password, ssh_profile_override=ssh_profile)
-            if endpoint.tunnel:
-                host = endpoint.tunnel.local_host
-                port = endpoint.tunnel.local_port
-            else:
-                host = profile.host
-                port = profile.port
-            await asyncio.to_thread(_check_tcp, host, port, timeout_s)
-            return True, f"Reachable: {profile.name} ({host}:{port})"
+            # An empty form field means "keep the stored password", so fall back to the keychain.
+            effective_password = password if password else self.secret_store.get_secret(profile.password_secret_key)
+            return True, await self._login_check(profile, endpoint, effective_password, timeout_s)
         except Exception as exc:  # noqa: BLE001
             return False, f"Connection test failed: {exc}"
         finally:
@@ -310,6 +391,7 @@ class TransferService:
                 password,
                 temp_table,
                 final_table,
+                tls=endpoint.tls,
             )
             return True, result
         except Exception as exc:  # noqa: BLE001
@@ -335,6 +417,7 @@ class TransferService:
                 destination.username,
                 password,
                 table_name,
+                tls=endpoint.tls,
             )
             return exists, ""
         except Exception as exc:  # noqa: BLE001
@@ -360,6 +443,7 @@ class TransferService:
                 destination.username,
                 password,
                 table_name,
+                tls=endpoint.tls,
             )
             return True, has_fk, ""
         except Exception as exc:  # noqa: BLE001
@@ -392,6 +476,7 @@ class TransferService:
                 password,
                 temp_table,
                 final_table,
+                tls=endpoint.tls,
             )
             return True, result
         except Exception as exc:  # noqa: BLE001
@@ -416,6 +501,7 @@ class TransferService:
                 source.username,
                 password,
                 table_name,
+                tls=endpoint.tls,
             )
             return True, count, ""
         except Exception as exc:  # noqa: BLE001
@@ -449,6 +535,7 @@ class TransferService:
                 source.username,
                 password,
                 schemas or [source.database],
+                tls=endpoint.tls,
             )
             return True, group_mysql_index_rows_by_table(rows), ""
         except Exception as exc:  # noqa: BLE001
@@ -484,6 +571,7 @@ class TransferService:
                 password,
                 target_table,
                 clauses,
+                tls=endpoint.tls,
             )
             return True, applied, failed, ""
         except Exception as exc:  # noqa: BLE001
@@ -516,6 +604,7 @@ class TransferService:
                 source.username,
                 password,
                 schemas or [source.database],
+                tls=endpoint.tls,
             )
             clauses_by_table: dict[str, dict[str, str]] = {}
             skipped: list[str] = []
@@ -559,6 +648,7 @@ class TransferService:
                 destination.username,
                 password,
                 clauses_by_table,
+                tls=endpoint.tls,
             )
             return True, applied, failed, ""
         except Exception as exc:  # noqa: BLE001
@@ -589,6 +679,7 @@ class TransferService:
                 destination.username,
                 password,
                 table,
+                tls=endpoint.tls,
             )
             return True, deleted, ""
         except Exception as exc:  # noqa: BLE001
@@ -636,6 +727,8 @@ class TransferService:
                 destination.username,
                 dst_password,
                 final_table,
+                src_tls=src_ep.tls,
+                dst_tls=dst_ep.tls,
             )
             return True, msg, deferred_fk_sql
         except Exception as exc:  # noqa: BLE001
@@ -669,6 +762,7 @@ class TransferService:
                 destination.username,
                 password,
                 statements,
+                tls=endpoint.tls,
             )
             return len(failures) == 0, failures
         except Exception as exc:  # noqa: BLE001
@@ -699,6 +793,7 @@ class TransferService:
                 password,
                 schema_hint,
                 limit,
+                tls=endpoint.tls,
             )
             if not rows:
                 return True, [], "No tables found"
@@ -719,12 +814,14 @@ def _list_tables_sync(
     password: str | None,
     schema_hint: str | None,
     limit: int,
+    *,
+    tls: TlsSettings,
 ) -> list[str]:
     if db_type == "postgres":
         import psycopg
 
         schema = (schema_hint or "public").strip() or "public"
-        conn = psycopg.connect(
+        conn = _pg_connect(tls,
             host=host,
             port=port,
             dbname=database,
@@ -750,7 +847,7 @@ def _list_tables_sync(
 
     import pymysql
 
-    conn = pymysql.connect(
+    conn = _mysql_connect(tls,
         host=host,
         port=port,
         user=username,
@@ -853,10 +950,12 @@ def _mysql_source_index_rows_sync(
     username: str,
     password: str,
     schemas: list[str],
+    *,
+    tls: TlsSettings,
 ) -> list[tuple]:
     import pymysql
 
-    conn = pymysql.connect(
+    conn = _mysql_connect(tls,
         host=host,
         port=port,
         user=username,
@@ -894,6 +993,8 @@ def _mysql_apply_index_clauses_sync(
     password: str,
     table: str,
     clauses: dict[str, str],
+    *,
+    tls: TlsSettings,
 ) -> tuple[list[str], list[str]]:
     """Add every index from `clauses` the table does not have yet.
 
@@ -903,7 +1004,7 @@ def _mysql_apply_index_clauses_sync(
     """
     import pymysql
 
-    conn = pymysql.connect(
+    conn = _mysql_connect(tls,
         host=host,
         port=port,
         user=username,
@@ -1009,11 +1110,13 @@ def _mysql_source_fk_rows_sync(
     username: str,
     password: str,
     schemas: list[str],
+    *,
+    tls: TlsSettings,
 ) -> dict[str, list[tuple]]:
     """Foreign key rows keyed by schema, each row starting with its table name."""
     import pymysql
 
-    conn = pymysql.connect(
+    conn = _mysql_connect(tls,
         host=host,
         port=port,
         user=username,
@@ -1042,6 +1145,8 @@ def _mysql_apply_fk_clauses_sync(
     username: str,
     password: str,
     clauses_by_table: dict[str, dict[str, str]],
+    *,
+    tls: TlsSettings,
 ) -> tuple[dict[str, list[str]], list[str]]:
     """Add the missing foreign keys of every table over one connection.
 
@@ -1049,7 +1154,7 @@ def _mysql_apply_fk_clauses_sync(
     """
     import pymysql
 
-    conn = pymysql.connect(
+    conn = _mysql_connect(tls,
         host=host,
         port=port,
         user=username,
@@ -1106,10 +1211,12 @@ def _mysql_swap_table_sync(
     password: str,
     temp_table: str,
     final_table: str,
+    *,
+    tls: TlsSettings,
 ) -> str:
     import pymysql
 
-    conn = pymysql.connect(
+    conn = _mysql_connect(tls,
         host=host,
         port=port,
         user=username,
@@ -1163,10 +1270,12 @@ def _mysql_table_exists_sync(
     username: str,
     password: str,
     table_name: str,
+    *,
+    tls: TlsSettings,
 ) -> bool:
     import pymysql
 
-    conn = pymysql.connect(
+    conn = _mysql_connect(tls,
         host=host,
         port=port,
         user=username,
@@ -1199,10 +1308,12 @@ def _mysql_table_has_inbound_fk_sync(
     username: str,
     password: str,
     table_name: str,
+    *,
+    tls: TlsSettings,
 ) -> bool:
     import pymysql
 
-    conn = pymysql.connect(
+    conn = _mysql_connect(tls,
         host=host,
         port=port,
         user=username,
@@ -1237,12 +1348,14 @@ def _mysql_replace_final_from_temp_sync(
     password: str,
     temp_table: str,
     final_table: str,
+    *,
+    tls: TlsSettings,
 ) -> str:
     import pymysql
 
     last_exc: Exception | None = None
     for attempt in range(1, 3):
-        conn = pymysql.connect(
+        conn = _mysql_connect(tls,
             host=host,
             port=port,
             user=username,
@@ -1287,6 +1400,8 @@ def _mysql_empty_table_sync(
     username: str,
     password: str,
     table: str,
+    *,
+    tls: TlsSettings,
 ) -> int:
     """Delete every row, returning how many went.
 
@@ -1295,7 +1410,7 @@ def _mysql_empty_table_sync(
     """
     import pymysql
 
-    conn = pymysql.connect(
+    conn = _mysql_connect(tls,
         host=host,
         port=port,
         user=username,
@@ -1326,6 +1441,8 @@ def _source_table_row_count_sync(
     username: str,
     password: str,
     table_name: str,
+    *,
+    tls: TlsSettings,
 ) -> int:
     if db_type == "postgres":
         import psycopg
@@ -1336,7 +1453,7 @@ def _source_table_row_count_sync(
             table = table.strip('`"')
         else:
             schema, table = "public", table_name.strip('`"')
-        conn = psycopg.connect(
+        conn = _pg_connect(tls,
             host=host,
             port=port,
             dbname=database,
@@ -1356,7 +1473,7 @@ def _source_table_row_count_sync(
     import pymysql
 
     tbl = table_name.split(".")[-1].strip('`"')
-    conn = pymysql.connect(
+    conn = _mysql_connect(tls,
         host=host,
         port=port,
         user=username,
@@ -1400,11 +1517,14 @@ def _ensure_empty_mysql_table_from_source_sync(
     dst_username: str,
     dst_password: str,
     final_table: str,
+    *,
+    src_tls: TlsSettings,
+    dst_tls: TlsSettings,
 ) -> tuple[str, list[str]]:
     import pymysql
 
     src_tbl = source_table.split(".")[-1].strip('`"')
-    src_conn = pymysql.connect(
+    src_conn = _mysql_connect(src_tls,
         host=src_host,
         port=src_port,
         user=src_username,
@@ -1427,7 +1547,7 @@ def _ensure_empty_mysql_table_from_source_sync(
     finally:
         src_conn.close()
 
-    dst_conn = pymysql.connect(
+    dst_conn = _mysql_connect(dst_tls,
         host=dst_host,
         port=dst_port,
         user=dst_username,
@@ -1488,6 +1608,8 @@ def _ensure_empty_mysql_table_from_source_sync(
                             dst_username,
                             dst_password,
                             final_table,
+                            src_tls=src_tls,
+                            dst_tls=dst_tls,
                         )
                         return f"Created empty destination table {final_table} using metadata fallback ({meta_msg})", []
                     if code not in _MYSQL_FK_BLOCKS_CREATE:
@@ -1511,6 +1633,8 @@ def _ensure_empty_mysql_table_from_source_sync(
                                 dst_username,
                                 dst_password,
                                 final_table,
+                                src_tls=src_tls,
+                                dst_tls=dst_tls,
                             )
                             return (
                                 f"Created empty destination table {final_table} using metadata fallback after FK strip "
@@ -1672,10 +1796,12 @@ def _mysql_execute_statements_sync(
     username: str,
     password: str,
     statements: list[str],
+    *,
+    tls: TlsSettings,
 ) -> list[str]:
     import pymysql
 
-    conn = pymysql.connect(
+    conn = _mysql_connect(tls,
         host=host,
         port=port,
         user=username,
@@ -1712,11 +1838,14 @@ def _create_empty_table_from_source_columns_sync(
     dst_username: str,
     dst_password: str,
     final_table: str,
+    *,
+    src_tls: TlsSettings,
+    dst_tls: TlsSettings,
 ) -> str:
     import pymysql
 
     src_tbl = source_table.split(".")[-1].strip('`"')
-    src_conn = pymysql.connect(
+    src_conn = _mysql_connect(src_tls,
         host=src_host,
         port=src_port,
         user=src_username,
@@ -1762,7 +1891,7 @@ def _create_empty_table_from_source_columns_sync(
         + "\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"
     )
 
-    dst_conn = pymysql.connect(
+    dst_conn = _mysql_connect(dst_tls,
         host=dst_host,
         port=dst_port,
         user=dst_username,

@@ -12,6 +12,7 @@ from .models import DBProfile, SSHProfile, TransferResult
 from .scope import ScopeError, resolve_scope, summarize_notes
 from .secrets import SecretStore
 from .storage import Storage
+from .tls import TLS_MODES, TlsError, validate_tls
 from .transfer import TransferService
 from .tunnel import TunnelManager
 
@@ -176,6 +177,17 @@ async def main(page: ft.Page) -> None:
     )
     db_use_ssh = ft.Checkbox(label="Use SSH tunnel")
     db_ssh_profile = ft.Dropdown(label="SSH profile", col={"sm": 12, "md": 6})
+    db_tls_mode = ft.Dropdown(
+        label="Encryption",
+        value="auto",
+        options=[ft.dropdown.Option(key, label) for key, label in TLS_MODES],
+        col={"sm": 12, "md": 6},
+    )
+    db_tls_ca = ft.TextField(
+        label="CA certificate (PEM), PostgreSQL only",
+        helper="Optional, for an internal certificate authority",
+        col={"sm": 12, "md": 6},
+    )
     db_save_button = ft.FilledTonalButton("Save DB profile", icon=ft.Icons.SAVE_OUTLINED)
     db_test_form_button = ft.OutlinedButton("Test connection", icon=ft.Icons.NETWORK_CHECK)
     db_test_tunnel_button = ft.OutlinedButton("Test through tunnel", icon=ft.Icons.VPN_KEY_OUTLINED)
@@ -318,7 +330,9 @@ async def main(page: ft.Page) -> None:
         db_rows.controls = [
             ui.profile_row(
                 p.name,
-                f"{p.db_type}://{p.username}@{p.host}:{p.port}/{p.database}" + ("  ssh" if p.use_ssh else ""),
+                f"{p.db_type}://{p.username}@{p.host}:{p.port}/{p.database}"
+                + ("  ssh" if p.use_ssh else "")
+                + (f"  tls:{p.tls_mode}" if p.tls_mode and p.tls_mode != "auto" else ""),
                 ft.Icons.STORAGE,
                 on_edit=lambda pid=p.id: load_db_into_form(pid),
                 on_delete=lambda pid=p.id, name=p.name: ask_delete_db(pid, name),
@@ -443,6 +457,9 @@ async def main(page: ft.Page) -> None:
         db_password.value = ""
         db_use_ssh.value = profile.use_ssh
         db_ssh_profile.value = str(profile.ssh_profile_id) if profile.ssh_profile_id else None
+        db_tls_mode.value = profile.tls_mode or "auto"
+        db_tls_ca.value = profile.tls_ca_path or ""
+        db_tls_ca.error = None
         db_tile.expanded = True
         page.update()
 
@@ -500,6 +517,8 @@ async def main(page: ft.Page) -> None:
             page.update()
             return
         db_ssh_profile.error_text = None
+        if not tls_form_ok():
+            return
         try:
             profile_name = db_name.value.strip()
             existing = next((p for p in storage.list_db_profiles() if p.name == profile_name), None)
@@ -521,6 +540,8 @@ async def main(page: ft.Page) -> None:
                     password_secret_key=password_secret_key,
                     use_ssh=bool(db_use_ssh.value),
                     ssh_profile_id=int(db_ssh_profile.value) if (db_use_ssh.value and db_ssh_profile.value) else None,
+                    tls_mode=db_tls_mode.value or "auto",
+                    tls_ca_path=form_ca_path(),
                 )
             )
             refresh_db_options()
@@ -531,10 +552,32 @@ async def main(page: ft.Page) -> None:
 
     # ------------------------------------------------------------------ tests
 
+    def form_ca_path() -> str | None:
+        value = (db_tls_ca.value or "").strip()
+        return str(Path(value).expanduser()) if value else None
+
+    def tls_form_ok() -> bool:
+        ca_path = form_ca_path()
+        try:
+            validate_tls(db_type.value, db_tls_mode.value, ca_path)
+            if ca_path and not Path(ca_path).is_file():
+                raise TlsError(f"CA certificate not found: {ca_path}")
+        except TlsError as exc:
+            db_tls_ca.error = str(exc)
+            notify_error(str(exc))
+            page.update()
+            return False
+        db_tls_ca.error = None
+        return True
+
     def _form_db_profile() -> DBProfile:
+        name = db_name.value.strip() or "unsaved-profile"
+        # Testing a saved profile leaves the password field empty (it lives in the
+        # keychain); a real login needs it, so carry the stored secret over.
+        existing = next((p for p in storage.list_db_profiles() if p.name == name), None)
         return DBProfile(
             id=None,
-            name=db_name.value.strip() or "unsaved-profile",
+            name=name,
             role=db_role.value,
             db_type=db_type.value,
             host=db_host.value.strip(),
@@ -543,10 +586,15 @@ async def main(page: ft.Page) -> None:
             username=db_user.value.strip(),
             use_ssh=bool(db_use_ssh.value),
             ssh_profile_id=int(db_ssh_profile.value) if db_ssh_profile.value else None,
+            password_secret_key=existing.password_secret_key if existing else None,
+            tls_mode=db_tls_mode.value or "auto",
+            tls_ca_path=form_ca_path(),
         )
 
     async def test_db_form_task() -> None:
         if not require((db_name, "profile name"), (db_host, "host"), (db_database, "database"), (db_user, "username")):
+            return
+        if not tls_form_ok():
             return
         ssh_profile = None
         if db_use_ssh.value:
@@ -576,6 +624,8 @@ async def main(page: ft.Page) -> None:
 
     async def test_db_tunnel_task() -> None:
         if not require((db_name, "profile name"), (db_host, "host"), (db_database, "database"), (db_user, "username")):
+            return
+        if not tls_form_ok():
             return
         if not db_use_ssh.value:
             notify_error("Enable 'Use SSH tunnel' first")
@@ -1318,6 +1368,13 @@ async def main(page: ft.Page) -> None:
                         ui.field_row(db_name, db_role, db_type),
                         ui.field_row(db_host, db_port, db_database, db_user),
                         ui.field_row(db_password, db_ssh_profile),
+                        ui.field_row(db_tls_mode, db_tls_ca),
+                        ft.Text(
+                            "Automatic: off for localhost and SSH tunnels (SSH already encrypts), "
+                            "encrypted and verified for any other host.",
+                            size=11,
+                            color=ft.Colors.ON_SURFACE_VARIANT,
+                        ),
                         ft.Row([db_use_ssh, db_save_button, db_test_form_button, db_test_tunnel_button], spacing=8, wrap=True),
                         ft.Divider(height=1, color=ft.Colors.OUTLINE_VARIANT),
                         db_rows,

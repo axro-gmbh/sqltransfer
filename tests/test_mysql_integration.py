@@ -285,3 +285,60 @@ def test_emptying_works_on_a_table_other_tables_reference(databases):
     assert ok, error
     assert deleted == 2
     assert _row_count(DST_DB, "categories") == 0
+
+
+# --- encryption -------------------------------------------------------------
+# The disposable server generates its own self-signed certificate on first start,
+# which is exactly the case "encrypted, certificate not checked" exists for.
+
+
+def _with_tls(profile: DBProfile, mode: str) -> DBProfile:
+    profile.tls_mode = mode
+    return profile
+
+
+def test_login_check_reports_encryption_for_each_setting(databases):
+    service = _service()
+
+    ok, message = asyncio.run(service.test_profile_connection(_with_tls(_profile("local", DST_DB), "off")))
+    assert ok, message
+    assert message.endswith("not encrypted")
+
+    ok, message = asyncio.run(service.test_profile_connection(_with_tls(_profile("local", DST_DB), "required")))
+    assert ok, message
+    assert "encrypted (TLS" in message
+
+    # A self-signed certificate must not pass a verified connection.
+    ok, message = asyncio.run(service.test_profile_connection(_with_tls(_profile("local", DST_DB), "verified")))
+    assert not ok
+    assert "certificate" in message.lower()
+
+
+def test_off_really_disables_tls(databases):
+    # pymysql's own default tries TLS and would pass here silently; "off" must not.
+    _exec(None, "SET GLOBAL require_secure_transport = ON")
+    try:
+        service = _service()
+        ok, message = asyncio.run(service.test_profile_connection(_with_tls(_profile("local", DST_DB), "off")))
+        assert not ok
+        assert "insecure transport" in message.lower()
+
+        ok, message = asyncio.run(service.test_profile_connection(_with_tls(_profile("local", DST_DB), "required")))
+        assert ok, message
+    finally:
+        _exec(None, "SET GLOBAL require_secure_transport = OFF")
+
+
+def test_apitap_transfer_follows_the_setting(databases):
+    service = _service()
+
+    src = _with_tls(_profile("remote", SRC_DB), "required")
+    dst = _with_tls(_profile("local", DST_DB), "required")
+    result = asyncio.run(service.transfer_single_table(src, dst, "items", dest_table="items_tls"))
+    assert result.status == "success", result.message
+    assert _row_count(DST_DB, "items_tls") == 5
+
+    src = _with_tls(_profile("remote", SRC_DB), "verified")
+    result = asyncio.run(service.transfer_single_table(src, dst, "items", dest_table="items_verified"))
+    assert result.status == "failed"
+    assert "certificate" in result.message.lower()  # refused for the right reason

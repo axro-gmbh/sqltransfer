@@ -46,10 +46,22 @@ Du brauchst zwei: eine Quelle und ein Ziel.
 3. **Database** wählen: MySQL oder PostgreSQL.
 4. Host, Port, Datenbankname, Benutzername, Passwort eintragen.
 5. Wenn ein Tunnel nötig ist: **Use SSH tunnel** ankreuzen und das SSH-Profil auswählen.
-6. **Test connection** prüft die Verbindung, **Test through tunnel** prüft zusätzlich den Weg über den Sprungserver.
-7. **Save DB profile**.
+6. **Encryption** festlegen, siehe unten. Für fast alle Profile ist **Automatic** richtig.
+7. **Test connection** meldet sich wirklich an und sagt dir, ob die Verbindung verschlüsselt ist. **Test through tunnel** prüft zusätzlich den Weg über den Sprungserver. Ist das Passwortfeld leer, nimmt der Test das gespeicherte aus dem Schlüsselbund.
+8. **Save DB profile**.
 
 > **Wichtig bei Tunnelbetrieb:** Host und Port sind die Adressen, unter denen die Datenbank **vom SSH-Server aus** erreichbar ist, nicht von deinem Rechner. Das ist dieselbe Logik wie in DataGrip. Häufig ist das `127.0.0.1` oder ein interner Hostname, der von außen gar nicht auflösbar wäre.
+
+### Verschlüsselung der Datenbankverbindung
+
+| Einstellung | Bedeutung |
+|---|---|
+| **Automatic** | Aus für `localhost` und für Verbindungen durch einen SSH-Tunnel (der verschlüsselt bereits), verschlüsselt und geprüft für jeden anderen Host |
+| **Off** | nie verschlüsselt, nur für Datenbanken auf diesem Rechner oder in einem vertrauenswürdigen Netz |
+| **Encrypted, certificate not checked** | verschlüsselt, aber ohne Prüfung, mit wem man spricht. Schützt vor Mitlesen, nicht vor einem gefälschten Server. Für Server mit selbst signiertem Zertifikat, bei MySQL der Normalfall |
+| **Encrypted and verified** | verschlüsselt und das Zertifikat samt Hostname geprüft |
+
+Eine eigene Zertifizierungsstelle (Feld **CA certificate**) geht nur bei PostgreSQL. Bei MySQL vertraut die Übertragung nur öffentlich anerkannten Zertifizierungsstellen; für interne Server dort **Encrypted, certificate not checked** wählen.
 
 Passwörter und Passphrasen landen im **macOS-Schlüsselbund**, nicht in einer Datei der App. Löschst du ein Profil, wird der zugehörige Schlüsselbund-Eintrag mitgelöscht. Deshalb fragt die App vor dem Löschen nach.
 
@@ -130,6 +142,8 @@ Rechts stehen die letzten 20 Läufe mit Status, Quelle, Ziel, Umfang, Zeilenzahl
 | **Missing: …** unter einem Feld | Pflichtfeld ist leer. Das Feld ist rot markiert. |
 | SSH-Test scheitert | Schlüsselpfad prüfen, Passphrase prüfen, Erreichbarkeit des Sprungservers prüfen. |
 | Datenbanktest scheitert trotz funktionierendem SSH | Host und Port sind aus Sicht des SSH-Servers einzutragen, nicht aus deiner. |
+| `certificate verify failed` oder `UnknownIssuer` | Der Server hat ein selbst signiertes oder internes Zertifikat. Bei PostgreSQL die CA-Datei eintragen, bei MySQL **Encrypted, certificate not checked** wählen. |
+| `SSH host key … does not match` | Der Sprungserver meldet sich mit einem anderen Schlüssel als beim ersten Kontakt. Nicht wegklicken, erst mit dem Betreiber klären. Der Befehl zum Entfernen des alten Eintrags steht in der Meldung. |
 | Übertragung bricht mit Kanalfehler ab | **Parallel pipes** auf 1 setzen. |
 | Tabellenliste bleibt leer | Falsches Schema unter **Source schema hint**, bei PostgreSQL meist `public`. |
 | App reagiert scheinbar nicht | Während eines Laufs sind die Knöpfe absichtlich gesperrt. Fortschrittsbalken und Protokoll zeigen, dass es weitergeht. |

@@ -28,6 +28,8 @@ class DBProfile:
     password_secret_key: Optional[str] = None
     use_ssh: bool = False
     ssh_profile_id: Optional[int] = None
+    tls_mode: str = "auto"  # "auto" | "off" | "required" | "verified", see tls.py
+    tls_ca_path: Optional[str] = None
 
 
 @dataclass(slots=True)

@@ -44,6 +44,8 @@ class Storage:
                     password_secret_key TEXT,
                     use_ssh INTEGER NOT NULL DEFAULT 0,
                     ssh_profile_id INTEGER,
+                    tls_mode TEXT NOT NULL DEFAULT 'auto',
+                    tls_ca_path TEXT,
                     FOREIGN KEY (ssh_profile_id) REFERENCES ssh_profiles(id)
                 );
 
@@ -76,6 +78,14 @@ class Storage:
             conn.execute("ALTER TABLE transfer_runs ADD COLUMN scope_mode TEXT NOT NULL DEFAULT 'table'")
         if "scope_value" not in cols:
             conn.execute("ALTER TABLE transfer_runs ADD COLUMN scope_value TEXT NOT NULL DEFAULT ''")
+
+        profile_cols = {row["name"] for row in conn.execute("PRAGMA table_info(db_profiles)").fetchall()}
+        if "tls_mode" not in profile_cols:
+            # 'auto' keeps every existing profile working as before: tunnels and
+            # localhost stay unencrypted, which is what they were.
+            conn.execute("ALTER TABLE db_profiles ADD COLUMN tls_mode TEXT NOT NULL DEFAULT 'auto'")
+        if "tls_ca_path" not in profile_cols:
+            conn.execute("ALTER TABLE db_profiles ADD COLUMN tls_ca_path TEXT")
 
     def save_ssh_profile(self, profile: SSHProfile) -> int:
         with self._connect() as conn:
@@ -151,9 +161,9 @@ class Storage:
                 """
                 INSERT INTO db_profiles(
                   name, role, db_type, host, port, database_name, username,
-                  password_secret_key, use_ssh, ssh_profile_id
+                  password_secret_key, use_ssh, ssh_profile_id, tls_mode, tls_ca_path
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(name) DO UPDATE SET
                   role=excluded.role,
                   db_type=excluded.db_type,
@@ -163,7 +173,9 @@ class Storage:
                   username=excluded.username,
                   password_secret_key=excluded.password_secret_key,
                   use_ssh=excluded.use_ssh,
-                  ssh_profile_id=excluded.ssh_profile_id
+                  ssh_profile_id=excluded.ssh_profile_id,
+                  tls_mode=excluded.tls_mode,
+                  tls_ca_path=excluded.tls_ca_path
                 """,
                 (
                     profile.name,
@@ -176,6 +188,8 @@ class Storage:
                     profile.password_secret_key,
                     1 if profile.use_ssh else 0,
                     profile.ssh_profile_id,
+                    profile.tls_mode or "auto",
+                    profile.tls_ca_path or None,
                 ),
             )
             if cur.lastrowid:
@@ -185,8 +199,8 @@ class Storage:
 
     def list_db_profiles(self, role: str | None = None) -> List[DBProfile]:
         query = (
-            "SELECT id, name, role, db_type, host, port, database_name, username, password_secret_key, use_ssh, ssh_profile_id "
-            "FROM db_profiles"
+            "SELECT id, name, role, db_type, host, port, database_name, username, password_secret_key, use_ssh, "
+            "ssh_profile_id, tls_mode, tls_ca_path FROM db_profiles"
         )
         params: Iterable[object] = ()
         if role:
@@ -210,6 +224,8 @@ class Storage:
                 password_secret_key=r["password_secret_key"],
                 use_ssh=bool(r["use_ssh"]),
                 ssh_profile_id=r["ssh_profile_id"],
+                tls_mode=r["tls_mode"] or "auto",
+                tls_ca_path=r["tls_ca_path"],
             )
             for r in rows
         ]
@@ -219,7 +235,7 @@ class Storage:
             row = conn.execute(
                 """
                 SELECT id, name, role, db_type, host, port, database_name, username,
-                       password_secret_key, use_ssh, ssh_profile_id
+                       password_secret_key, use_ssh, ssh_profile_id, tls_mode, tls_ca_path
                 FROM db_profiles
                 WHERE id = ?
                 """,
@@ -239,6 +255,8 @@ class Storage:
             password_secret_key=row["password_secret_key"],
             use_ssh=bool(row["use_ssh"]),
             ssh_profile_id=row["ssh_profile_id"],
+            tls_mode=row["tls_mode"] or "auto",
+            tls_ca_path=row["tls_ca_path"],
         )
 
     def delete_db_profile(self, profile_id: int) -> None:
