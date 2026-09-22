@@ -205,8 +205,12 @@ updates" menu item: Flet has no hook for it.
 
 ### Every release
 
-1. Raise `version` in `[project]` **and** `build_number` in `[tool.flet]` (by one), plus
-   `__version__` in `src/sqltransfer_app/__init__.py` (a test checks they agree).
+1. On a feature branch, set the new version and commit the two changed files:
+   ```zsh
+   python scripts/bump_version.py 1.0.2
+   ```
+   It writes `version` in `[project]`, raises `build_number` in `[tool.flet]` by one and sets
+   `__version__` in `src/sqltransfer_app/__init__.py`. A version that is not higher is refused.
 2. Merge to `main` as usual.
 3. On `main`:
    ```zsh
