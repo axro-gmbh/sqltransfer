@@ -241,8 +241,14 @@ async def main(page: ft.Page) -> None:
     db_dialog_title = ft.Text("New database profile", size=17, weight=ft.FontWeight.BOLD)
     db_form_state: dict[str, int | None] = {"id": None}
 
-    source_profile = ft.Dropdown(label="Source", col={"sm": 12, "md": 5})
-    destination_profile = ft.Dropdown(label="Destination", col={"sm": 12, "md": 5})
+    # editable + enable_filter: typing narrows the list, the way the table picker
+    # already works. Matters once there are more profiles than fit on screen.
+    source_profile = ft.Dropdown(
+        label="Source", editable=True, enable_filter=True, hint_text="Pick or type to filter", col={"sm": 12, "md": 5}
+    )
+    destination_profile = ft.Dropdown(
+        label="Destination", editable=True, enable_filter=True, hint_text="Pick or type to filter", col={"sm": 12, "md": 5}
+    )
     destination_hint = ft.Container(visible=False, border_radius=8, padding=10)
     source_test_button = ft.TextButton("Test source", icon=ft.Icons.NETWORK_CHECK)
     destination_test_button = ft.TextButton("Test destination", icon=ft.Icons.NETWORK_CHECK)
@@ -1493,7 +1499,9 @@ async def main(page: ft.Page) -> None:
 
     ssh_search.on_change = lambda _: on_search_change(refresh_ssh_options)
     db_search.on_change = lambda _: on_search_change(refresh_db_options)
-    destination_profile.on_change = lambda _: on_search_change(refresh_destination_hint)
+    # A Dropdown reports a pick through on_select; on_change belongs to the old
+    # DropdownM2 and is never called, which left the warning below silent.
+    destination_profile.on_select = lambda _: on_search_change(refresh_destination_hint)
     check_all_button.on_click = lambda _: set_all_checks(True)
     clear_checked_button.on_click = lambda _: set_all_checks(False)
     scope_choice.on_change = on_scope_change
