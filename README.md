@@ -14,8 +14,11 @@ A user guide (German) is in [docs/benutzerhandbuch.md](docs/benutzerhandbuch.md)
 
 ## Features
 
-- SSH and database profiles; passwords and key passphrases live in the macOS Keychain and are
-  removed with the profile
+- SSH and database profiles, edited in a dialog and searchable; passwords and key passphrases live
+  in the macOS Keychain and are removed with the profile
+- Every database profile can be source or destination; a destination that is not a loopback address
+  on this machine is marked in the list, warned about in the form, and confirmed once before the
+  transfer writes anything
 - Transfer one table, a selection of tables or a whole database; preview the plan first
 - Live progress (table x of y), a cancel button that stops after the current table, and a
   colour-coded, auto-scrolling log
@@ -112,6 +115,7 @@ described in [MACOS_BUILD.md](MACOS_BUILD.md).
 - `src/sqltransfer_app/transfer.py` - apitap orchestration and MySQL/PostgreSQL helpers
 - `src/sqltransfer_app/tunnel.py` - SSH tunnels and host key checks
 - `src/sqltransfer_app/tls.py` - encryption settings for all three database clients
+- `src/sqltransfer_app/profiles.py` - what a profile points at, how it reads, how it filters
 - `src/sqltransfer_app/scope.py` - turns the scope choice into a transfer mode
 - `src/sqltransfer_app/storage.py` - SQLite storage for profiles and run history
 - `src/sqltransfer_app/secrets.py` - Keychain access

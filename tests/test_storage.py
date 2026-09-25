@@ -25,7 +25,6 @@ def test_storage_roundtrip(tmp_path: Path) -> None:
         DBProfile(
             id=None,
             name="remote-mysql",
-            role="remote",
             db_type="mysql",
             host="db.example.com",
             port=3306,
@@ -37,7 +36,7 @@ def test_storage_roundtrip(tmp_path: Path) -> None:
     )
     assert db_id > 0
 
-    remotes = storage.list_db_profiles(role="remote")
+    remotes = storage.list_db_profiles()
     assert len(remotes) == 1
     assert remotes[0].ssh_profile_id == ssh_id
 
@@ -49,7 +48,6 @@ def test_transfer_history_and_deletes(tmp_path: Path) -> None:
         DBProfile(
             id=None,
             name="src-postgres",
-            role="remote",
             db_type="postgres",
             host="source",
             port=5432,
@@ -61,7 +59,6 @@ def test_transfer_history_and_deletes(tmp_path: Path) -> None:
         DBProfile(
             id=None,
             name="dst-postgres",
-            role="local",
             db_type="postgres",
             host="local",
             port=5432,
