@@ -37,6 +37,14 @@ SCOPE_CHOICES = {
 HISTORY_LIMIT = 20
 HISTORY_COLLAPSED = 5
 
+# The source and destination dropdowns group their entries by where the database
+# lives. The headings are entries too, disabled, and marked by this key prefix.
+GROUP_HEADING = "heading:"
+PROFILE_GROUPS: tuple[tuple[str, bool, ft.IconData], ...] = (
+    ("On this machine", True, ft.Icons.LAPTOP_MAC),
+    ("Elsewhere", False, ft.Icons.CLOUD_OUTLINED),
+)
+
 
 def _app_data_dir() -> Path:
     return Path.home() / "Library" / "Application Support" / "sqltransfer"
@@ -365,13 +373,38 @@ async def main(page: ft.Page) -> None:
             for p in shown
         ] or [ui.empty_hint("No SSH profiles yet." if not profiles else "No SSH profile matches the search.")]
 
+    def profile_options(profiles: list[DBProfile]) -> list[ft.dropdown.Option]:
+        """Grouped, local first: a remote destination is never the careless pick.
+
+        The headings are disabled entries, and every dropdown gets its own option
+        objects, since a control belongs to one parent.
+        """
+        options: list[ft.dropdown.Option] = []
+        for heading, local, icon in PROFILE_GROUPS:
+            group = [p for p in profiles if is_local(p) is local]
+            if not group:
+                continue
+            options.append(ft.dropdown.Option(key=f"{GROUP_HEADING}{heading}", text=heading, disabled=True))
+            options += [ft.dropdown.Option(str(p.id), p.name, leading_icon=icon) for p in group]
+        return options
+
+    def chosen_profile_id(dropdown: ft.Dropdown) -> int | None:
+        """The profile id behind a dropdown, or None for nothing chosen.
+
+        A group heading is an entry as well, so its key is filtered out here
+        rather than crashing an int() somewhere further down.
+        """
+        value = dropdown.value
+        if not value or value.startswith(GROUP_HEADING):
+            return None
+        return int(value)
+
     def refresh_db_options() -> None:
         profiles = storage.list_db_profiles()
-        options = [ft.dropdown.Option(str(p.id), p.name) for p in profiles]
         # Every profile can be either end now; what protects the remote ones is the
         # warning below the destination and the question before the run.
-        source_profile.options = options
-        destination_profile.options = list(options)
+        source_profile.options = profile_options(profiles)
+        destination_profile.options = profile_options(profiles)
         known = {str(p.id) for p in profiles}
         for dropdown in (source_profile, destination_profile):
             if dropdown.value not in known:
@@ -417,9 +450,10 @@ async def main(page: ft.Page) -> None:
         )
 
     def selected_destination_warning() -> DestinationWarning | None:
-        if not destination_profile.value:
+        chosen = chosen_profile_id(destination_profile)
+        if chosen is None:
             return None
-        profile = storage.get_db_profile(int(destination_profile.value))
+        profile = storage.get_db_profile(chosen)
         if profile is None:
             return None
         tunnel = storage.get_ssh_profile(profile.ssh_profile_id) if profile.ssh_profile_id else None
@@ -821,10 +855,11 @@ async def main(page: ft.Page) -> None:
             page.update()
 
     async def run_connection_test(profile_control: ft.Dropdown, label: str) -> None:
-        if not profile_control.value:
+        chosen = chosen_profile_id(profile_control)
+        if chosen is None:
             notify_error(f"Pick a {label} profile first")
             return
-        profile = storage.get_db_profile(int(profile_control.value))
+        profile = storage.get_db_profile(chosen)
         if not profile:
             notify_error(f"Selected {label} profile no longer exists")
             return
@@ -878,10 +913,11 @@ async def main(page: ft.Page) -> None:
         page.update()
 
     async def load_source_tables_task() -> None:
-        if not source_profile.value:
+        chosen = chosen_profile_id(source_profile)
+        if chosen is None:
             notify_error("Pick a source profile first")
             return
-        src = storage.get_db_profile(int(source_profile.value))
+        src = storage.get_db_profile(chosen)
         if src is None:
             notify_error("Selected source profile no longer exists")
             return
@@ -939,13 +975,14 @@ async def main(page: ft.Page) -> None:
         )
 
     def selected_endpoints() -> tuple[DBProfile, DBProfile] | None:
-        if not source_profile.value or not destination_profile.value:
+        source_id, destination_id = chosen_profile_id(source_profile), chosen_profile_id(destination_profile)
+        if source_id is None or destination_id is None:
             notify_error("Pick a source and a destination profile")
             set_status("Pick source and destination first", "error")
             page.update()
             return None
-        src = storage.get_db_profile(int(source_profile.value))
-        dst = storage.get_db_profile(int(destination_profile.value))
+        src = storage.get_db_profile(source_id)
+        dst = storage.get_db_profile(destination_id)
         if src is None or dst is None:
             notify_error("A selected profile no longer exists")
             set_status("Selected profile no longer exists", "error")
@@ -1125,8 +1162,8 @@ async def main(page: ft.Page) -> None:
         def store_run(result: TransferResult) -> None:
             storage.insert_transfer_run(
                 started_at=started,
-                source_profile_id=int(source_profile.value),
-                destination_profile_id=int(destination_profile.value),
+                source_profile_id=src.id,
+                destination_profile_id=dst.id,
                 table_name=scope,
                 scope_mode=mode,
                 scope_value=scope,

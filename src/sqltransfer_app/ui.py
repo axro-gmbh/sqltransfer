@@ -299,19 +299,23 @@ def _fact(icon: ft.IconData, text: str, expand: bool = False) -> ft.Control:
     )
 
 
+MARK_TONES: dict[str, tuple[str, str]] = {
+    # (background, text). Red for a profile that is not on this machine, green for
+    # one that is; anything else stays quiet. Green is spelled out rather than
+    # taken from the theme, whose tertiary tone is a rose next to the red.
+    "remote": (ft.Colors.ERROR_CONTAINER, ft.Colors.ON_ERROR_CONTAINER),
+    "local": (ft.Colors.with_opacity(0.18, ft.Colors.GREEN), ft.Colors.GREEN),
+}
+
+
 def profile_mark(text: str) -> ft.Control:
-    """A small marker on a profile row. 'remote' is the one that has to catch the eye."""
-    remote = text == "remote"
+    """A small marker on a profile row."""
+    bgcolor, fgcolor = MARK_TONES.get(text, (ft.Colors.SURFACE_CONTAINER_HIGH, ft.Colors.ON_SURFACE_VARIANT))
     return ft.Container(
         padding=ft.Padding.symmetric(horizontal=6, vertical=1),
         border_radius=6,
-        bgcolor=ft.Colors.ERROR_CONTAINER if remote else ft.Colors.SURFACE_CONTAINER_HIGH,
-        content=ft.Text(
-            text,
-            size=10,
-            color=ft.Colors.ON_ERROR_CONTAINER if remote else ft.Colors.ON_SURFACE_VARIANT,
-            weight=ft.FontWeight.W_600 if remote else None,
-        ),
+        bgcolor=bgcolor,
+        content=ft.Text(text, size=10, color=fgcolor, weight=ft.FontWeight.W_600 if text in MARK_TONES else None),
     )
 
 
