@@ -36,25 +36,32 @@ Alles Folgende steht im Bereich **Profiles**. Den brauchst du nur beim Einrichte
 Nötig, wenn die Datenbank nicht direkt von deinem Rechner aus erreichbar ist, was bei uns der Normalfall ist.
 
 1. **Profiles**, dann **SSH profiles** aufklappen.
-2. Ausfüllen: Profilname, Host, Port (Vorgabe 22), Benutzername, Pfad zum privaten Schlüssel.
-3. Passphrase nur eintragen, wenn dein Schlüssel eine hat. Das Feld bleibt beim späteren Laden leer, das ist Absicht: Das Geheimnis liegt im Schlüsselbund und wird nicht angezeigt. Leer lassen heißt "beibehalten".
-4. **Test SSH connection** drücken. Erst wenn das grün meldet, weiter.
-5. **Save SSH profile**.
+2. **New SSH profile** drücken. Es öffnet sich ein Fenster mit leeren Feldern.
+3. Ausfüllen: Profilname, Host, Port (Vorgabe 22), Benutzername, Pfad zum privaten Schlüssel.
+4. Passphrase nur eintragen, wenn dein Schlüssel eine hat. Beim Bearbeiten bleibt das Feld leer, das ist Absicht: Das Geheimnis liegt im Schlüsselbund und wird nicht angezeigt. Leer lassen heißt "beibehalten".
+5. **Test SSH connection** drücken. Erst wenn das grün meldet, weiter.
+6. **Save**.
 
 ### Datenbankprofile anlegen
 
-Du brauchst zwei: eine Quelle und ein Ziel.
+Du brauchst mindestens zwei: eine Quelle und ein Ziel. **Jedes Profil kann beides sein**, es gibt keine Festlegung mehr beim Anlegen.
 
 1. **Profiles**, dann **Database profiles** aufklappen.
-2. **Role** wählen:
-   - **Source (remote)** für die Datenbank, aus der gelesen wird.
-   - **Destination (local)** für die, in die geschrieben wird.
-3. **Database** wählen: MySQL oder PostgreSQL.
+2. **New database profile** drücken.
+3. Profilname vergeben und **Database** wählen: MySQL oder PostgreSQL.
 4. Host, Port, Datenbankname, Benutzername, Passwort eintragen.
 5. Wenn ein Tunnel nötig ist: **Use SSH tunnel** ankreuzen und das SSH-Profil auswählen.
 6. **Encryption** festlegen, siehe unten. Für fast alle Profile ist **Automatic** richtig.
 7. **Test connection** meldet sich wirklich an und sagt dir, ob die Verbindung verschlüsselt ist. **Test through tunnel** prüft zusätzlich den Weg über den Sprungserver. Ist das Passwortfeld leer, nimmt der Test das gespeicherte aus dem Schlüsselbund.
-8. **Save DB profile**.
+8. **Save**.
+
+### Profile finden, ändern, löschen
+
+Jede Liste hat ein Suchfeld. Es filtert nach Name, Host, Datenbank und Benutzer, auch mit mehreren Wörtern ("prod shop" zeigt nur, was beides enthält). Ab etwa fünf Profilen scrollt die Liste, statt die Seite zu verlängern.
+
+Jede Zeile trägt Marker: **local** oder **remote** (rot), dazu **SSH** und die Verschlüsselung, falls sie von **Automatic** abweicht. Das Stiftsymbol öffnet das Profil zum Bearbeiten, der Papierkorb löscht es nach einer Rückfrage.
+
+Bearbeiten und Anlegen sind bewusst getrennt: Im Fensterkopf steht entweder "New database profile" oder "Edit database profile '<name>'". Ein neues Profil mit einem schon vergebenen Namen wird abgelehnt, statt das vorhandene stillschweigend zu überschreiben. Umbenennen geht beim Bearbeiten jederzeit, das Passwort im Schlüsselbund bleibt dabei erhalten.
 
 > **Wichtig bei Tunnelbetrieb:** Host und Port sind die Adressen, unter denen die Datenbank **vom SSH-Server aus** erreichbar ist, nicht von deinem Rechner. Das ist dieselbe Logik wie in DataGrip. Häufig ist das `127.0.0.1` oder ein interner Hostname, der von außen gar nicht auflösbar wäre.
 
@@ -75,7 +82,11 @@ Passwörter und Passphrasen landen im **macOS-Schlüsselbund**, nicht in einer D
 
 ### 1. Quelle und Ziel wählen
 
-Oben im Bereich **Transfer** die beiden Auswahlfelder füllen. Links steht die Quelle, rechts das Ziel. Angeboten werden nur Profile mit der jeweils passenden Rolle.
+Oben im Bereich **Transfer** die beiden Auswahlfelder füllen. Links steht die Quelle, rechts das Ziel. Beide Felder bieten alle Profile an, dasselbe Profil auf beiden Seiten lehnt die App ab.
+
+**Ziele außerhalb deines Rechners sind rot markiert.** Sobald du ein Ziel wählst, das nicht direkt auf `127.0.0.1` oder `localhost` liegt, erscheint unter der Auswahl ein roter Hinweis mit Host und Datenbank. Ein Ziel hinter einem SSH-Tunnel gilt immer als auswärts, auch wenn dort `127.0.0.1` steht: Diese Adresse ist dann das andere Ende des Tunnels.
+
+Beim Start kommt für solche Ziele eine Rückfrage, die Host, Datenbank und den Umfang nennt. Erst der rote Knopf **Overwrite on <host>** startet die Übertragung, **Cancel** bricht ab, ohne irgendetwas zu schreiben. Für Ziele auf deinem Rechner fragt die App nicht.
 
 Mit **Test source** und **Test destination** prüfst du beide Verbindungen, bevor es losgeht. Das kostet ein paar Sekunden und erspart abgebrochene Übertragungen.
 
