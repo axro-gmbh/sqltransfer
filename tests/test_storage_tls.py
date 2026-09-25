@@ -11,7 +11,6 @@ def _profile(**overrides) -> DBProfile:
     values = dict(
         id=None,
         name="pg-direct",
-        role="remote",
         db_type="postgres",
         host="db.example.com",
         port=5432,
@@ -41,8 +40,8 @@ def test_new_profiles_default_to_automatic(tmp_path: Path):
 
 def test_updating_a_profile_changes_its_encryption(tmp_path: Path):
     storage = Storage(tmp_path / "profiles.db")
-    storage.save_db_profile(_profile(tls_mode="required"))
-    storage.save_db_profile(_profile(tls_mode="off"))
+    pid = storage.save_db_profile(_profile(tls_mode="required"))
+    storage.save_db_profile(_profile(id=pid, tls_mode="off"))
     assert storage.list_db_profiles()[0].tls_mode == "off"
 
 
