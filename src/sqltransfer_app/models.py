@@ -19,7 +19,6 @@ class SSHProfile:
 class DBProfile:
     id: Optional[int]
     name: str
-    role: str  # "remote" or "local"
     db_type: str  # "mysql" or "postgres"
     host: str
     port: int

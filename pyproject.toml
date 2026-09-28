@@ -1,6 +1,6 @@
 [project]
 name = "sqltransfer"
-version = "1.0.1"
+version = "1.1.0"
 description = "Flet desktop app for transferring SQL data with optional SSH tunneling"
 readme = "README.md"
 license = {text = "Apache-2.0"}
@@ -27,7 +27,7 @@ org = "de.axro"
 bundle_id = "de.axro.sqltransfer"
 # CFBundleVersion. Sparkle compares this, not the version string: raise it with
 # every release, never reuse one.
-build_number = 2
+build_number = 3
 
 # Sparkle auto-updates. The plugin starts Sparkle's standard updater on launch,
 # which reads the feed and the public key below; see MACOS_BUILD.md, "Releases".

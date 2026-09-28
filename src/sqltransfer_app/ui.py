@@ -7,7 +7,7 @@ below can be unit tested without a database or a running window.
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import Callable, Iterable
+from typing import Callable, Iterable, Sequence
 
 import flet as ft
 
@@ -299,7 +299,34 @@ def _fact(icon: ft.IconData, text: str, expand: bool = False) -> ft.Control:
     )
 
 
-def profile_row(title: str, subtitle: str, icon: ft.IconData, on_edit: Callable[[], None], on_delete: Callable[[], None]) -> ft.Control:
+MARK_TONES: dict[str, tuple[str, str]] = {
+    # (background, text). Red for a profile that is not on this machine, green for
+    # one that is; anything else stays quiet. Green is spelled out rather than
+    # taken from the theme, whose tertiary tone is a rose next to the red.
+    "remote": (ft.Colors.ERROR_CONTAINER, ft.Colors.ON_ERROR_CONTAINER),
+    "local": (ft.Colors.with_opacity(0.18, ft.Colors.GREEN), ft.Colors.GREEN),
+}
+
+
+def profile_mark(text: str) -> ft.Control:
+    """A small marker on a profile row."""
+    bgcolor, fgcolor = MARK_TONES.get(text, (ft.Colors.SURFACE_CONTAINER_HIGH, ft.Colors.ON_SURFACE_VARIANT))
+    return ft.Container(
+        padding=ft.Padding.symmetric(horizontal=6, vertical=1),
+        border_radius=6,
+        bgcolor=bgcolor,
+        content=ft.Text(text, size=10, color=fgcolor, weight=ft.FontWeight.W_600 if text in MARK_TONES else None),
+    )
+
+
+def profile_row(
+    title: str,
+    subtitle: str,
+    icon: ft.IconData,
+    on_edit: Callable[[], None],
+    on_delete: Callable[[], None],
+    marks: Sequence[str] = (),
+) -> ft.Control:
     return ft.Container(
         border_radius=8,
         bgcolor=ft.Colors.SURFACE_CONTAINER_HIGHEST,
@@ -309,8 +336,21 @@ def profile_row(title: str, subtitle: str, icon: ft.IconData, on_edit: Callable[
                 ft.Icon(icon, size=16, color=ft.Colors.ON_SURFACE_VARIANT),
                 ft.Column(
                     [
-                        ft.Text(title, size=13, weight=ft.FontWeight.W_600),
-                        ft.Text(subtitle, size=11, color=ft.Colors.ON_SURFACE_VARIANT, font_family=MONO),
+                        ft.Row(
+                            [ft.Text(title, size=13, weight=ft.FontWeight.W_600), *(profile_mark(m) for m in marks)],
+                            spacing=6,
+                            wrap=True,
+                            vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                        ),
+                        ft.Text(
+                            subtitle,
+                            size=11,
+                            color=ft.Colors.ON_SURFACE_VARIANT,
+                            font_family=MONO,
+                            max_lines=1,
+                            overflow=ft.TextOverflow.ELLIPSIS,
+                            tooltip=subtitle,
+                        ),
                     ],
                     spacing=0,
                     tight=True,

@@ -66,7 +66,6 @@ def _profile(role: str, database: str) -> DBProfile:
     return DBProfile(
         id=None,
         name=f"test-{role}",
-        role=role,
         db_type="mysql",
         host=args["host"],
         port=args["port"],

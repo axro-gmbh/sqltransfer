@@ -25,7 +25,7 @@ def test_every_database_connection_goes_through_the_tls_helpers():
 
 
 def _profile(db_type: str) -> DBProfile:
-    return DBProfile(id=None, name="p", role="remote", db_type=db_type, host="db.example.com",
+    return DBProfile(id=None, name="p", db_type=db_type, host="db.example.com",
                      port=3306, database="shop", username="reader")
 
 

@@ -2,9 +2,26 @@ from __future__ import annotations
 
 import sqlite3
 from pathlib import Path
-from typing import Iterable, List
+from typing import List
 
 from .models import DBProfile, SSHProfile
+
+DB_PROFILE_COLUMNS = (
+    "name, db_type, host, port, database_name, username, "
+    "password_secret_key, use_ssh, ssh_profile_id, tls_mode, tls_ca_path"
+)
+
+
+class DuplicateProfileName(ValueError):
+    """Another profile already carries this name."""
+
+    def __init__(self, name: str) -> None:
+        super().__init__(f"A profile named '{name}' already exists")
+        self.name = name
+
+
+class ProfileGone(LookupError):
+    """The profile being edited is no longer in the database."""
 
 
 class Storage:
@@ -35,7 +52,6 @@ class Storage:
                 CREATE TABLE IF NOT EXISTS db_profiles (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     name TEXT NOT NULL UNIQUE,
-                    role TEXT NOT NULL CHECK (role IN ('remote', 'local')),
                     db_type TEXT NOT NULL CHECK (db_type IN ('mysql', 'postgres')),
                     host TEXT NOT NULL,
                     port INTEGER NOT NULL,
@@ -86,33 +102,76 @@ class Storage:
             conn.execute("ALTER TABLE db_profiles ADD COLUMN tls_mode TEXT NOT NULL DEFAULT 'auto'")
         if "tls_ca_path" not in profile_cols:
             conn.execute("ALTER TABLE db_profiles ADD COLUMN tls_ca_path TEXT")
+        if "role" in profile_cols:
+            self._drop_role_column(conn)
+
+    def _drop_role_column(self, conn: sqlite3.Connection) -> None:
+        """Every profile can be source and destination now, so the role is gone.
+
+        Rebuilt rather than dropped in place, because the old column carries a
+        CHECK constraint and the ids have to survive: transfer_runs points at them.
+        """
+        conn.executescript(
+            f"""
+            CREATE TABLE db_profiles_rebuilt (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL UNIQUE,
+                db_type TEXT NOT NULL CHECK (db_type IN ('mysql', 'postgres')),
+                host TEXT NOT NULL,
+                port INTEGER NOT NULL,
+                database_name TEXT NOT NULL,
+                username TEXT NOT NULL,
+                password_secret_key TEXT,
+                use_ssh INTEGER NOT NULL DEFAULT 0,
+                ssh_profile_id INTEGER,
+                tls_mode TEXT NOT NULL DEFAULT 'auto',
+                tls_ca_path TEXT,
+                FOREIGN KEY (ssh_profile_id) REFERENCES ssh_profiles(id)
+            );
+            INSERT INTO db_profiles_rebuilt (id, {DB_PROFILE_COLUMNS})
+                SELECT id, {DB_PROFILE_COLUMNS} FROM db_profiles;
+            DROP TABLE db_profiles;
+            ALTER TABLE db_profiles_rebuilt RENAME TO db_profiles;
+            """
+        )
 
     def save_ssh_profile(self, profile: SSHProfile) -> int:
+        """Insert when the profile has no id, otherwise edit exactly that row.
+
+        Saving used to key on the name, which silently overwrote a profile when a
+        form still held an old name. An id now means "edit this one" and no id
+        means "add one", and a name collision is refused either way.
+        """
+        values = (
+            profile.name,
+            profile.host,
+            profile.port,
+            profile.username,
+            profile.private_key_path,
+            profile.passphrase_secret_key,
+        )
         with self._connect() as conn:
-            cur = conn.execute(
-                """
-                INSERT INTO ssh_profiles(name, host, port, username, private_key_path, passphrase_secret_key)
-                VALUES (?, ?, ?, ?, ?, ?)
-                ON CONFLICT(name) DO UPDATE SET
-                  host=excluded.host,
-                  port=excluded.port,
-                  username=excluded.username,
-                  private_key_path=excluded.private_key_path,
-                  passphrase_secret_key=excluded.passphrase_secret_key
-                """,
-                (
-                    profile.name,
-                    profile.host,
-                    profile.port,
-                    profile.username,
-                    profile.private_key_path,
-                    profile.passphrase_secret_key,
-                ),
-            )
-            if cur.lastrowid:
+            if profile.id is None:
+                try:
+                    cur = conn.execute(
+                        "INSERT INTO ssh_profiles(name, host, port, username, private_key_path, passphrase_secret_key)"
+                        " VALUES (?, ?, ?, ?, ?, ?)",
+                        values,
+                    )
+                except sqlite3.IntegrityError as exc:
+                    raise DuplicateProfileName(profile.name) from exc
                 return int(cur.lastrowid)
-            row = conn.execute("SELECT id FROM ssh_profiles WHERE name = ?", (profile.name,)).fetchone()
-            return int(row["id"])
+            try:
+                cur = conn.execute(
+                    "UPDATE ssh_profiles SET name=?, host=?, port=?, username=?, private_key_path=?,"
+                    " passphrase_secret_key=? WHERE id=?",
+                    (*values, profile.id),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise DuplicateProfileName(profile.name) from exc
+            if cur.rowcount == 0:
+                raise ProfileGone(f"SSH profile {profile.id} no longer exists")
+            return int(profile.id)
 
     def list_ssh_profiles(self) -> List[SSHProfile]:
         with self._connect() as conn:
@@ -156,66 +215,50 @@ class Storage:
             conn.execute("DELETE FROM ssh_profiles WHERE id = ?", (profile_id,))
 
     def save_db_profile(self, profile: DBProfile) -> int:
-        with self._connect() as conn:
-            cur = conn.execute(
-                """
-                INSERT INTO db_profiles(
-                  name, role, db_type, host, port, database_name, username,
-                  password_secret_key, use_ssh, ssh_profile_id, tls_mode, tls_ca_path
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(name) DO UPDATE SET
-                  role=excluded.role,
-                  db_type=excluded.db_type,
-                  host=excluded.host,
-                  port=excluded.port,
-                  database_name=excluded.database_name,
-                  username=excluded.username,
-                  password_secret_key=excluded.password_secret_key,
-                  use_ssh=excluded.use_ssh,
-                  ssh_profile_id=excluded.ssh_profile_id,
-                  tls_mode=excluded.tls_mode,
-                  tls_ca_path=excluded.tls_ca_path
-                """,
-                (
-                    profile.name,
-                    profile.role,
-                    profile.db_type,
-                    profile.host,
-                    profile.port,
-                    profile.database,
-                    profile.username,
-                    profile.password_secret_key,
-                    1 if profile.use_ssh else 0,
-                    profile.ssh_profile_id,
-                    profile.tls_mode or "auto",
-                    profile.tls_ca_path or None,
-                ),
-            )
-            if cur.lastrowid:
-                return int(cur.lastrowid)
-            row = conn.execute("SELECT id FROM db_profiles WHERE name = ?", (profile.name,)).fetchone()
-            return int(row["id"])
+        """Insert when the profile has no id, otherwise edit exactly that row.
 
-    def list_db_profiles(self, role: str | None = None) -> List[DBProfile]:
-        query = (
-            "SELECT id, name, role, db_type, host, port, database_name, username, password_secret_key, use_ssh, "
-            "ssh_profile_id, tls_mode, tls_ca_path FROM db_profiles"
+        See save_ssh_profile: an id means "edit this one", no id means "add one".
+        """
+        values = (
+            profile.name,
+            profile.db_type,
+            profile.host,
+            profile.port,
+            profile.database,
+            profile.username,
+            profile.password_secret_key,
+            1 if profile.use_ssh else 0,
+            profile.ssh_profile_id,
+            profile.tls_mode or "auto",
+            profile.tls_ca_path or None,
         )
-        params: Iterable[object] = ()
-        if role:
-            query += " WHERE role = ?"
-            params = (role,)
-        query += " ORDER BY name"
-
         with self._connect() as conn:
-            rows = conn.execute(query, params).fetchall()
+            if profile.id is None:
+                try:
+                    cur = conn.execute(
+                        f"INSERT INTO db_profiles({DB_PROFILE_COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        values,
+                    )
+                except sqlite3.IntegrityError as exc:
+                    raise DuplicateProfileName(profile.name) from exc
+                return int(cur.lastrowid)
+            assignments = ", ".join(f"{column.strip()}=?" for column in DB_PROFILE_COLUMNS.split(","))
+            try:
+                cur = conn.execute(f"UPDATE db_profiles SET {assignments} WHERE id=?", (*values, profile.id))
+            except sqlite3.IntegrityError as exc:
+                raise DuplicateProfileName(profile.name) from exc
+            if cur.rowcount == 0:
+                raise ProfileGone(f"Database profile {profile.id} no longer exists")
+            return int(profile.id)
+
+    def list_db_profiles(self) -> List[DBProfile]:
+        with self._connect() as conn:
+            rows = conn.execute(f"SELECT id, {DB_PROFILE_COLUMNS} FROM db_profiles ORDER BY name").fetchall()
 
         return [
             DBProfile(
                 id=int(r["id"]),
                 name=str(r["name"]),
-                role=str(r["role"]),
                 db_type=str(r["db_type"]),
                 host=str(r["host"]),
                 port=int(r["port"]),
@@ -234,7 +277,7 @@ class Storage:
         with self._connect() as conn:
             row = conn.execute(
                 """
-                SELECT id, name, role, db_type, host, port, database_name, username,
+                SELECT id, name, db_type, host, port, database_name, username,
                        password_secret_key, use_ssh, ssh_profile_id, tls_mode, tls_ca_path
                 FROM db_profiles
                 WHERE id = ?
@@ -246,7 +289,6 @@ class Storage:
         return DBProfile(
             id=int(row["id"]),
             name=str(row["name"]),
-            role=str(row["role"]),
             db_type=str(row["db_type"]),
             host=str(row["host"]),
             port=int(row["port"]),

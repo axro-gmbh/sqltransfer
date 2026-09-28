@@ -46,7 +46,7 @@ def _service() -> TransferService:
 def _profile(role: str, database: str, mode: str, ca: str | None = None) -> DBProfile:
     s = _spec()
     return DBProfile(
-        id=None, name=f"pg-{role}", role=role, db_type="postgres", host=s["host"], port=s["port"],
+        id=None, name=f"pg-{role}", db_type="postgres", host=s["host"], port=s["port"],
         database=database, username=s["user"], password_secret_key="unused", tls_mode=mode, tls_ca_path=ca,
     )
 
