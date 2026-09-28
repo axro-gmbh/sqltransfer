@@ -108,20 +108,26 @@ automated malware scan, nothing is published or reviewed. Apple returns a ticket
 staples to the bundle. Flet signs every nested binary (86 of them in this app, including the
 Python extensions) and refuses to start without notary credentials.
 
-**Deployment target (this bites every time Xcode is updated).** The distribution build goes
-through `xcodebuild archive`, which is stricter than a plain build: Xcode 26 only accepts
-deployment targets from 12.0 upwards, while the Flutter template still writes 11.0 and the pods
-10.15. The fix goes into the generated project under `build/flutter/macos` (`Podfile` and
-`Runner.xcodeproj/project.pbxproj`):
+**The generated macOS project needs patching before every build.** Flet writes
+`build/flutter/macos` from a template and rewrites it whenever its inputs change (`flet clean`, a
+new dependency, a flet upgrade). Three edits have to be put back each time, which is what
+`scripts/patch_macos_runner.py` does:
 
 ```zsh
-python scripts/patch_macos_target.py
+python scripts/patch_macos_runner.py
 ```
 
-Flet regenerates that project whenever its inputs change (`flet clean`, a new Flutter dependency),
-which drops the fix: the build then fails with `The macOS deployment target
-'MACOSX_DEPLOYMENT_TARGET' is set to 11.0`. Run the script and build again; `scripts/release.sh`
-does both on its own. Consequence: **the app requires macOS 12 or newer.**
+- **Deployment target 12.0** in `Podfile` and `Runner.xcodeproj/project.pbxproj`. The distribution
+  build goes through `xcodebuild archive`, which is stricter than a plain build: Xcode 26 accepts
+  nothing below 12.0, while the template still writes 11.0 and the pods 10.15. Without it the build
+  fails with `The macOS deployment target 'MACOSX_DEPLOYMENT_TARGET' is set to 11.0`. Consequence:
+  **the app requires macOS 12 or newer.**
+- **The Sparkle pod** for the Runner target.
+- **The updater in `Runner/AppDelegate.swift`**, which starts Sparkle and puts
+  "Check for Updates…" into the app menu below "About".
+
+The script is idempotent and fails loudly when one of its anchors has moved, so a build never
+quietly produces an app without the update menu. `scripts/release.sh` runs it before every build.
 
 **Close Finder windows on `build/macos` while building.** Flet deletes that folder before copying the
 new bundle; a Finder window showing it writes a fresh `.DS_Store` in the middle of that, the delete
@@ -166,18 +172,23 @@ Recipients open it normally. No right-click, no trip through System Settings, no
 
 ## Releases and updates
 
-Installed apps update themselves through [Sparkle](https://sparkle-project.org). The Flutter
-plugin `auto_updater` (see `[tool.flet.flutter.pubspec.dependencies]`) starts Sparkle's standard
-updater on launch, which reads two keys from `[tool.flet.macos.info]`:
+Installed apps update themselves through [Sparkle](https://sparkle-project.org). Sparkle's standard
+updater is created in `Runner/AppDelegate.swift` by `scripts/patch_macos_runner.py`, which also adds
+**"Check for Updates…"** to the app menu below "About". It reads three keys from
+`[tool.flet.macos.info]`:
 
 - `SUFeedURL`: `https://github.com/axro-gmbh/sqltransfer/releases/latest/download/appcast.xml`,
   the appcast attached to the newest GitHub release
 - `SUPublicEDKey`: the public half of the EdDSA key every release is signed with
+- `SUScheduledCheckInterval`: 14400, so a release surfaces within four hours instead of Sparkle's
+  default day
 
-Sparkle checks once a day, shows its update dialog and swaps the app in place. It only installs
-archives signed with the matching private key, and compares **build numbers**
-(`[tool.flet].build_number`, `CFBundleVersion`), not version strings. There is no "Check for
-updates" menu item: Flet has no hook for it.
+Sparkle shows its update dialog and swaps the app in place. It only installs archives signed with
+the matching private key, and compares **build numbers** (`[tool.flet].build_number`,
+`CFBundleVersion`), not version strings.
+
+Earlier versions used the Flutter plugin `auto_updater` for this. It cannot reach the native menu
+from Python, so the plugin is gone and the twenty lines of Swift do the whole job.
 
 ### One-time setup
 

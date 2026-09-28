@@ -25,7 +25,9 @@ Der erste Start dauert etwa 15 bis 20 Sekunden, danach geht es zügig.
 
 ### Updates
 
-Die App sucht einmal am Tag selbst nach einer neuen Version. Gibt es eine, erscheint ein Fenster (auf Englisch, wie die App) mit "Install Update", "Remind Me Later" und "Skip This Version". Nach "Install Update" lädt die App die neue Version, startet neu und ist aktuell. Mit dem Häkchen "Automatically download and install updates in the future" kommen künftige Updates ohne Nachfrage.
+Die App sucht alle vier Stunden selbst nach einer neuen Version. Gibt es eine, erscheint ein Fenster (auf Englisch, wie die App) mit "Install Update", "Remind Me Later" und "Skip This Version". Nach "Install Update" lädt die App die neue Version, startet neu und ist aktuell. Mit dem Häkchen "Automatically download and install updates in the future" kommen künftige Updates ohne Nachfrage.
+
+Sofort nachsehen kannst du jederzeit: im Menü **SQL Transfer** der Eintrag **Check for Updates…**, direkt unter "About SQL Transfer". Gibt es nichts Neues, sagt die App das auch.
 
 Jedes Update ist signiert: Die App installiert nur Versionen, die nachweislich von uns stammen. Ohne Internetverbindung passiert einfach nichts, die Suche wird später wiederholt.
 

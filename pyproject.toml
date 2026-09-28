@@ -1,6 +1,6 @@
 [project]
 name = "sqltransfer"
-version = "1.1.0"
+version = "1.2.0"
 description = "Flet desktop app for transferring SQL data with optional SSH tunneling"
 readme = "README.md"
 license = {text = "Apache-2.0"}
@@ -27,17 +27,18 @@ org = "de.axro"
 bundle_id = "de.axro.sqltransfer"
 # CFBundleVersion. Sparkle compares this, not the version string: raise it with
 # every release, never reuse one.
-build_number = 3
+build_number = 4
 
-# Sparkle auto-updates. The plugin starts Sparkle's standard updater on launch,
-# which reads the feed and the public key below; see MACOS_BUILD.md, "Releases".
-[tool.flet.flutter.pubspec.dependencies]
-auto_updater = "1.0.0"
-
+# Sparkle auto-updates. The updater itself is set up in Swift by
+# scripts/patch_macos_runner.py, which also puts "Check for Updates…" into the
+# app menu; it reads these keys. See MACOS_BUILD.md, "Releases and updates".
 [tool.flet.macos.info]
 SUFeedURL = "https://github.com/axro-gmbh/sqltransfer/releases/latest/download/appcast.xml"
 SUPublicEDKey = "plOoFrteTxIp3kCx2Tr3pG4qS/cXdFUXppcr4XuVZxc="
 SUEnableAutomaticChecks = true
+# Four hours instead of Sparkle's default day: a release should not sit unnoticed
+# until the next morning.
+SUScheduledCheckInterval = 14400
 # About window. Set here rather than in tool.flet.copyright, whose template
 # appends "All rights reserved.", which does not fit an Apache-2.0 app.
 NSHumanReadableCopyright = "Copyright © 2026 Axro GmbH"

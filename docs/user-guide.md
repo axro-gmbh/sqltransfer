@@ -25,7 +25,9 @@ The first start takes about 15 to 20 seconds, after that it is quick.
 
 ### Updates
 
-The app checks for a new version once a day. If there is one, a window offers "Install Update", "Remind Me Later" and "Skip This Version". After "Install Update" the app downloads the new version, restarts and is up to date. Tick "Automatically download and install updates in the future" and later updates arrive without asking.
+The app checks for a new version every four hours. If there is one, a window offers "Install Update", "Remind Me Later" and "Skip This Version". After "Install Update" the app downloads the new version, restarts and is up to date. Tick "Automatically download and install updates in the future" and later updates arrive without asking.
+
+You can look right away at any time: the **SQL Transfer** menu has **Check for Updates…** directly below "About SQL Transfer". If there is nothing new, the app says so too.
 
 Every update is signed: the app only installs versions that provably come from us. Without an internet connection nothing happens at all, and the check is repeated later.
 
