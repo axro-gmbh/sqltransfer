@@ -1,5 +1,7 @@
 # SQL Transfer: Benutzerhandbuch
 
+*Also available in English: [user-guide.md](user-guide.md)*
+
 SQL Transfer kopiert Tabellen aus einer entfernten Datenbank in eine lokale, wahlweise durch einen SSH-Tunnel. Gedacht ist es für den Alltagsfall "ich brauche produktionsnahe Daten auf meiner Maschine", ohne Dumps, ohne Zwischendateien.
 
 ## Voraussetzungen
