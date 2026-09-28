@@ -1,5 +1,7 @@
 # SQL Transfer: Benutzerhandbuch
 
+*Also available in English: [user-guide.md](user-guide.md)*
+
 SQL Transfer kopiert Tabellen aus einer entfernten Datenbank in eine lokale, wahlweise durch einen SSH-Tunnel. Gedacht ist es für den Alltagsfall "ich brauche produktionsnahe Daten auf meiner Maschine", ohne Dumps, ohne Zwischendateien.
 
 ## Voraussetzungen
@@ -59,7 +61,7 @@ Du brauchst mindestens zwei: eine Quelle und ein Ziel. **Jedes Profil kann beide
 
 Jede Liste hat ein Suchfeld. Es filtert nach Name, Host, Datenbank und Benutzer, auch mit mehreren Wörtern ("prod shop" zeigt nur, was beides enthält). Ab etwa fünf Profilen scrollt die Liste, statt die Seite zu verlängern.
 
-Jede Zeile trägt Marker: **local** oder **remote** (rot), dazu **SSH** und die Verschlüsselung, falls sie von **Automatic** abweicht. Das Stiftsymbol öffnet das Profil zum Bearbeiten, der Papierkorb löscht es nach einer Rückfrage.
+Jede Zeile trägt Marker: **local** in Grün für Datenbanken auf deinem Rechner, **remote** in Rot für alle anderen, dazu **SSH** und die Verschlüsselung, falls sie von **Automatic** abweicht. Das Stiftsymbol öffnet das Profil zum Bearbeiten, der Papierkorb löscht es nach einer Rückfrage.
 
 Bearbeiten und Anlegen sind bewusst getrennt: Im Fensterkopf steht entweder "New database profile" oder "Edit database profile '<name>'". Ein neues Profil mit einem schon vergebenen Namen wird abgelehnt, statt das vorhandene stillschweigend zu überschreiben. Umbenennen geht beim Bearbeiten jederzeit, das Passwort im Schlüsselbund bleibt dabei erhalten.
 
@@ -83,6 +85,8 @@ Passwörter und Passphrasen landen im **macOS-Schlüsselbund**, nicht in einer D
 ### 1. Quelle und Ziel wählen
 
 Oben im Bereich **Transfer** die beiden Auswahlfelder füllen. Links steht die Quelle, rechts das Ziel. Beide Felder bieten alle Profile an, dasselbe Profil auf beiden Seiten lehnt die App ab.
+
+Die Einträge sind gruppiert: erst **On this machine** mit Laptop-Symbol, darunter **Elsewhere** mit Wolkensymbol. Die Überschriften lassen sich nicht auswählen. In beide Felder kannst du tippen, die Liste filtert dann mit, was bei vielen Profilen schneller ist als scrollen. Tippst du etwas, das auf kein Profil passt, und wählst nichts aus, bleibt die vorherige Auswahl aktiv.
 
 **Ziele außerhalb deines Rechners sind rot markiert.** Sobald du ein Ziel wählst, das nicht direkt auf `127.0.0.1` oder `localhost` liegt, erscheint unter der Auswahl ein roter Hinweis mit Host und Datenbank. Ein Ziel hinter einem SSH-Tunnel gilt immer als auswärts, auch wenn dort `127.0.0.1` steht: Diese Adresse ist dann das andere Ende des Tunnels.
 

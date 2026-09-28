@@ -10,7 +10,8 @@ Signed and notarized builds for Apple Silicon (macOS 12 or newer) are on the
 [Releases](https://github.com/axro-gmbh/sqltransfer/releases) page. Unzip, move the app to
 Applications, open it.
 
-A user guide (German) is in [docs/benutzerhandbuch.md](docs/benutzerhandbuch.md).
+A user guide is in [docs/user-guide.md](docs/user-guide.md), and in German in
+[docs/benutzerhandbuch.md](docs/benutzerhandbuch.md).
 
 ## Features
 
@@ -121,7 +122,7 @@ described in [MACOS_BUILD.md](MACOS_BUILD.md).
 - `src/sqltransfer_app/secrets.py` - Keychain access
 - `patches/` - local patches to dependencies
 - `scripts/` - release script, third-party notices, deployment target fix for the Xcode project
-- `docs/` - user guide
+- `docs/` - user guide, English and German
 - `tests/` - unit tests, plus integration tests that need a disposable server
 
 ## License
