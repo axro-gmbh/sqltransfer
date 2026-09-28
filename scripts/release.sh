@@ -84,12 +84,13 @@ build() {
 }
 
 step "Build, sign, notarize"
+# flet regenerates build/flutter whenever its inputs change, which drops the
+# deployment target, the Sparkle pod and the update menu item. Patch what is
+# there, build, and patch again in case this build regenerated the project.
+"$PY" scripts/patch_macos_runner.py || die "could not patch the macOS project"
 if ! build; then
-  # flet regenerates build/flutter when its inputs change, which drops the deployment target fix.
-  PATCHED="$("$PY" scripts/patch_macos_target.py)" || die "build failed, see above"
-  echo "$PATCHED"
-  case "$PATCHED" in *patched*) ;; *) die "build failed, see above" ;; esac
-  echo "deployment target patched, building again"
+  "$PY" scripts/patch_macos_runner.py || die "build failed, see above"
+  echo "macOS project patched, building again"
   build
 fi
 

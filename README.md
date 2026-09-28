@@ -32,7 +32,7 @@ A user guide is in [docs/user-guide.md](docs/user-guide.md), and in German in
 - The connection test logs in for real and reports whether the session is encrypted
 - Run history with the last 20 transfers, reusable with one click
 - Automatic updates through [Sparkle](https://sparkle-project.org), signed and served from GitHub
-  Releases
+  Releases, with a "Check for Updates…" item in the app menu
 
 ## How it works
 
