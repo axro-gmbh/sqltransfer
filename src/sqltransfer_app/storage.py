@@ -4,6 +4,7 @@ import sqlite3
 from pathlib import Path
 from typing import List
 
+from .anonymize import DEFAULT_RULES, Rule
 from .models import DBProfile, SSHProfile
 
 DB_PROFILE_COLUMNS = (
@@ -65,6 +66,17 @@ class Storage:
                     FOREIGN KEY (ssh_profile_id) REFERENCES ssh_profiles(id)
                 );
 
+                CREATE TABLE IF NOT EXISTS anonymization_rules (
+                    id      INTEGER PRIMARY KEY AUTOINCREMENT,
+                    pattern TEXT    NOT NULL UNIQUE,
+                    kind    TEXT    NOT NULL,
+                    enabled INTEGER NOT NULL DEFAULT 1
+                );
+
+                CREATE TABLE IF NOT EXISTS schema_marks (
+                    mark TEXT PRIMARY KEY
+                );
+
                 CREATE TABLE IF NOT EXISTS transfer_runs (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     started_at TEXT NOT NULL,
@@ -104,6 +116,15 @@ class Storage:
             conn.execute("ALTER TABLE db_profiles ADD COLUMN tls_ca_path TEXT")
         if "role" in profile_cols:
             self._drop_role_column(conn)
+
+        # Seed the rules once. A mark rather than "is the table empty", so a user
+        # who deletes every rule does not get them all back on the next start.
+        seeded = conn.execute("SELECT COUNT(*) AS n FROM schema_marks WHERE mark = 'rules_seeded'").fetchone()
+        if not seeded["n"]:
+            conn.executemany(
+                "INSERT OR IGNORE INTO anonymization_rules(pattern, kind) VALUES (?, ?)", list(DEFAULT_RULES)
+            )
+            conn.execute("INSERT INTO schema_marks(mark) VALUES ('rules_seeded')")
 
     def _drop_role_column(self, conn: sqlite3.Connection) -> None:
         """Every profile can be source and destination now, so the role is gone.
@@ -359,3 +380,39 @@ class Storage:
                 (limit,),
             ).fetchall()
 
+    def list_anonymization_rules(self) -> List[Rule]:
+        with self._connect() as conn:
+            rows = conn.execute("SELECT id, pattern, kind, enabled FROM anonymization_rules ORDER BY id").fetchall()
+        return [
+            Rule(id=int(r["id"]), pattern=str(r["pattern"]), kind=str(r["kind"]), enabled=bool(r["enabled"]))
+            for r in rows
+        ]
+
+    def save_anonymization_rule(self, rule: Rule) -> int:
+        """Insert when the rule has no id, otherwise edit exactly that row.
+
+        Same contract as the profiles: a name, here a pattern, belongs to one row.
+        """
+        values = (rule.pattern, rule.kind, 1 if rule.enabled else 0)
+        with self._connect() as conn:
+            if rule.id is None:
+                try:
+                    cur = conn.execute(
+                        "INSERT INTO anonymization_rules(pattern, kind, enabled) VALUES (?, ?, ?)", values
+                    )
+                except sqlite3.IntegrityError as exc:
+                    raise DuplicateProfileName(rule.pattern) from exc
+                return int(cur.lastrowid)
+            try:
+                cur = conn.execute(
+                    "UPDATE anonymization_rules SET pattern=?, kind=?, enabled=? WHERE id=?", (*values, rule.id)
+                )
+            except sqlite3.IntegrityError as exc:
+                raise DuplicateProfileName(rule.pattern) from exc
+            if cur.rowcount == 0:
+                raise ProfileGone(f"Anonymization rule {rule.id} no longer exists")
+            return int(rule.id)
+
+    def delete_anonymization_rule(self, rule_id: int) -> None:
+        with self._connect() as conn:
+            conn.execute("DELETE FROM anonymization_rules WHERE id = ?", (rule_id,))
