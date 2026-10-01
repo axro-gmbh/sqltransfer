@@ -17,9 +17,11 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 
 import pytest
 
+from sqltransfer_app.anonymize import Column, Rule, plan_table
 from sqltransfer_app.models import DBProfile
 from sqltransfer_app.transfer import TransferService
 from sqltransfer_app.tunnel import TunnelManager
@@ -56,6 +58,10 @@ def _conn_args() -> dict:
 
 class _Secrets:
     """Stands in for the keychain so the test never touches it."""
+
+    def anonymization_salt(self):
+        # Fixed, so the expected replacements stay the same between runs.
+        return "test-salt"
 
     def get_secret(self, _key):
         return _conn_args()["password"]
@@ -341,3 +347,114 @@ def test_apitap_transfer_follows_the_setting(databases):
     result = asyncio.run(service.transfer_single_table(src, dst, "items", dest_table="items_verified"))
     assert result.status == "failed"
     assert "certificate" in result.message.lower()  # refused for the right reason
+
+
+def _rows(database: str, sql: str) -> list[tuple]:
+    import pymysql
+
+    args = _conn_args()
+    conn = pymysql.connect(host=args["host"], port=args["port"], user=args["user"],
+                           password=args["password"], database=database, autocommit=True)
+    try:
+        with conn.cursor() as cur:
+            cur.execute(sql)
+            return list(cur.fetchall())
+    finally:
+        conn.close()
+
+
+def _anonymize(dst, table: str, rules: list[Rule]) -> tuple[bool, int, str]:
+    service = _service()
+    ok, columns, message = asyncio.run(service.table_columns(dst, table))
+    assert ok, message
+    return asyncio.run(service.anonymize_table(dst, plan_table(table, columns, rules)))
+
+
+def test_anonymizing_replaces_only_the_matched_columns(databases):
+    dst = _profile("local", DST_DB)
+    _exec(DST_DB, "DROP TABLE IF EXISTS kunde",
+          "CREATE TABLE kunde (id INT PRIMARY KEY, email VARCHAR(190) UNIQUE, ort VARCHAR(80), plz VARCHAR(5), umsatz INT)",
+          "INSERT INTO kunde VALUES (1,'a@axro.de','Hamburg','20095',10),"
+          " (2,'b@axro.de',NULL,'10115',20), (3,'','Köln','',30)")
+
+    ok, affected, message = _anonymize(dst, "kunde", [Rule(id=1, pattern="*mail*", kind="email"),
+                                                      Rule(id=2, pattern="ort", kind="city"),
+                                                      Rule(id=3, pattern="plz", kind="postcode")])
+    assert ok, message
+    assert affected == 3
+
+    rows = _rows(DST_DB, "SELECT id, email, ort, plz, umsatz FROM kunde ORDER BY id")
+    assert [r[4] for r in rows] == [10, 20, 30]                      # untouched column
+    assert all(r[1].endswith("@example.invalid") or r[1] == "" for r in rows)
+    assert "axro.de" not in str(rows)                                # nothing real left
+    assert rows[1][2] is None                                        # NULL stays NULL
+    assert rows[2][1] == ""                                          # empty stays empty
+    assert all(re.fullmatch(r"\d{5}", r[3]) for r in rows if r[3])   # Review Focus 6: no minus
+
+
+def test_the_same_value_yields_the_same_replacement(databases):
+    dst = _profile("local", DST_DB)
+    _exec(DST_DB, "DROP TABLE IF EXISTS a", "DROP TABLE IF EXISTS b",
+          "CREATE TABLE a (id INT PRIMARY KEY, email VARCHAR(190))",
+          "CREATE TABLE b (id INT PRIMARY KEY, email VARCHAR(190))",
+          "INSERT INTO a VALUES (1,'same@axro.de')", "INSERT INTO b VALUES (1,'same@axro.de')")
+    rules = [Rule(id=1, pattern="email", kind="email")]
+    for table in ("a", "b"):
+        assert _anonymize(dst, table, rules)[0]
+    assert _rows(DST_DB, "SELECT email FROM a")[0][0] == _rows(DST_DB, "SELECT email FROM b")[0][0]
+
+
+def test_a_unique_column_stays_unique(databases):
+    dst = _profile("local", DST_DB)
+    values = ",".join(f"({i},'kunde{i}@axro.de')" for i in range(1, 201))
+    _exec(DST_DB, "DROP TABLE IF EXISTS viele",
+          "CREATE TABLE viele (id INT PRIMARY KEY, email VARCHAR(190) UNIQUE)",
+          f"INSERT INTO viele VALUES {values}")
+
+    ok, _affected, message = _anonymize(dst, "viele", [Rule(id=1, pattern="email", kind="email")])
+    assert ok, message  # a collision would surface here as a duplicate key error
+    assert _rows(DST_DB, "SELECT COUNT(DISTINCT email) FROM viele")[0][0] == 200
+
+
+def test_a_matching_column_of_the_wrong_type_is_left_alone(databases):
+    dst = _profile("local", DST_DB)
+    _exec(DST_DB, "DROP TABLE IF EXISTS numerisch",
+          "CREATE TABLE numerisch (id INT PRIMARY KEY, telefon BIGINT)",
+          "INSERT INTO numerisch VALUES (1, 491234567)")
+    ok, affected, message = _anonymize(dst, "numerisch", [Rule(id=1, pattern="telefon", kind="phone")])
+    assert ok and affected == 0, message
+    assert _rows(DST_DB, "SELECT telefon FROM numerisch")[0][0] == 491234567
+
+
+def test_a_table_the_destination_cannot_see_is_an_error_not_an_empty_plan(databases):
+    # Returning (True, []) made the app report success while nothing was anonymized.
+    service = _service()
+    dst = _profile("local", DST_DB)
+    ok, columns, message = asyncio.run(service.table_columns(dst, "gibt_es_nicht"))
+    assert not ok and not columns
+    assert "gibt_es_nicht" in message
+
+
+def test_a_replacement_is_cut_to_the_column_length(databases):
+    dst = _profile("local", DST_DB)
+    _exec(DST_DB, "DROP TABLE IF EXISTS eng",
+          "CREATE TABLE eng (id INT PRIMARY KEY, email VARCHAR(12), ort VARCHAR(6))",
+          "INSERT INTO eng VALUES (1,'a@axro.de','Kiel')")
+    ok, affected, message = _anonymize(dst, "eng", [Rule(id=1, pattern="email", kind="email"),
+                                                    Rule(id=2, pattern="ort", kind="city")])
+    assert ok, message  # a too-long replacement used to abort the whole transfer
+    row = _rows(DST_DB, "SELECT email, ort FROM eng")[0]
+    assert len(row[0]) <= 12 and len(row[1]) <= 6
+    assert "axro.de" not in row[0]
+
+
+def test_names_do_not_collapse_onto_a_handful_of_values(databases):
+    dst = _profile("local", DST_DB)
+    values = ",".join(f"({i},'Person {i}')" for i in range(1, 201))
+    _exec(DST_DB, "DROP TABLE IF EXISTS namen",
+          "CREATE TABLE namen (id INT PRIMARY KEY, name VARCHAR(190))",
+          f"INSERT INTO namen VALUES {values}")
+    ok, _affected, message = _anonymize(dst, "namen", [Rule(id=1, pattern="name", kind="fullname")])
+    assert ok, message
+    distinct = _rows(DST_DB, "SELECT COUNT(DISTINCT name) FROM namen")[0][0]
+    assert distinct >= 40, f"only {distinct} distinct names over 200 rows"
