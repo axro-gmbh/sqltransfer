@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 import socket
@@ -9,6 +10,7 @@ from uuid import uuid4
 import flet as ft
 
 from . import __version__, ui
+from .anonymize import KINDS, Rule, plan_table
 from .models import DBProfile, SSHProfile, TransferResult
 from .profiles import (
     DestinationWarning,
@@ -243,6 +245,31 @@ async def main(page: ft.Page) -> None:
 
     # editable + enable_filter: typing narrows the list, the way the table picker
     # already works. Matters once there are more profiles than fit on screen.
+    rule_pattern = ft.TextField(label="Column pattern", helper="Wildcards allowed, e.g. *mail*", col={"sm": 12, "md": 6})
+    rule_kind = ft.Dropdown(
+        label="Replace with",
+        value=KINDS[0][0],
+        options=[ft.dropdown.Option(key, label) for key, label in KINDS],
+        col={"sm": 12, "md": 6},
+    )
+    rule_enabled = ft.Checkbox(label="Enabled", value=True)
+    rule_save_button = ft.FilledButton("Save", icon=ft.Icons.SAVE_OUTLINED)
+    rule_dialog_title = ft.Text("New rule", size=17, weight=ft.FontWeight.BOLD)
+    rule_form_state: dict[str, int | None] = {"id": None}
+    rules_rows = ft.Column(spacing=6, scroll=ft.ScrollMode.AUTO)
+    rules_search = ft.TextField(
+        label="Search",
+        prefix_icon=ft.Icons.SEARCH,
+        hint_text="pattern or kind",
+        expand=True,
+        height=44,
+        content_padding=ft.Padding.symmetric(horizontal=12, vertical=6),
+    )
+    rules_new_button = ft.FilledTonalButton("New rule", icon=ft.Icons.ADD)
+    # On by default: forgetting to anonymize is the expensive mistake, anonymizing
+    # a development copy by accident is not.
+    anonymize_switch = ft.Switch(label="Anonymize personal data", value=True)
+
     source_profile = ft.Dropdown(
         label="Source", editable=True, enable_filter=True, hint_text="Pick or type to filter", col={"sm": 12, "md": 5}
     )
@@ -313,6 +340,7 @@ async def main(page: ft.Page) -> None:
         scope_choice,
         source_profile,
         destination_profile,
+        anonymize_switch,
     ]
 
     # ------------------------------------------------------------------ status
@@ -429,6 +457,84 @@ async def main(page: ft.Page) -> None:
             for p in shown
         ] or [ui.empty_hint("No database profiles yet." if not profiles else "No profile matches the search.")]
         refresh_destination_hint()
+
+    def refresh_rules() -> None:
+        rules = storage.list_anonymization_rules()
+        query = (rules_search.value or "").lower().split()
+        shown = [r for r in rules if all(word in f"{r.pattern} {r.kind}".lower() for word in query)]
+        rules_rows.height = _list_height(len(shown), 5, 56)
+        labels = dict(KINDS)
+        rules_rows.controls = [
+            ui.profile_row(
+                r.pattern,
+                labels.get(r.kind, r.kind),
+                ft.Icons.PRIVACY_TIP_OUTLINED,
+                on_edit=lambda rid=r.id: open_rule_dialog(rid),
+                on_delete=lambda rid=r.id, pattern=r.pattern: ask_delete_rule(rid, pattern),
+                marks=() if r.enabled else ("off",),
+            )
+            for r in shown
+        ] or [ui.empty_hint("No rules yet." if not rules else "No rule matches the search.")]
+        # Nothing to anonymize with means the switch would promise something it
+        # cannot keep. Turning it off is therefore automatic, and so is turning it
+        # back on once a rule exists again: anything else leaves it enabled-but-off
+        # without the user ever having touched it.
+        enabled_rules = [r for r in rules if r.enabled]
+        anonymize_switch.disabled = not enabled_rules
+        anonymize_switch.value = bool(enabled_rules)
+
+    def open_rule_dialog(rule_id: int | None = None) -> None:
+        rule = next((r for r in storage.list_anonymization_rules() if r.id == rule_id), None) if rule_id else None
+        if rule_id and rule is None:
+            notify_error("Rule no longer exists")
+            refresh_rules()
+            page.update()
+            return
+        clear_errors(rule_pattern)
+        rule_form_state["id"] = rule.id if rule else None
+        rule_dialog_title.value = f"Edit rule '{rule.pattern}'" if rule else "New rule"
+        rule_pattern.value = rule.pattern if rule else ""
+        rule_kind.value = rule.kind if rule else KINDS[0][0]
+        rule_enabled.value = rule.enabled if rule else True
+        page.show_dialog(build_rule_dialog())
+        page.update()
+
+    def save_rule(_: object) -> None:
+        if not require((rule_pattern, "column pattern")):
+            return
+        try:
+            storage.save_anonymization_rule(
+                Rule(
+                    id=rule_form_state["id"],
+                    pattern=rule_pattern.value.strip(),
+                    kind=rule_kind.value,
+                    enabled=bool(rule_enabled.value),
+                )
+            )
+            page.pop_dialog()
+            refresh_rules()
+            notify_ok(f"Saved rule '{rule_pattern.value.strip()}'")
+            page.update()
+        except DuplicateProfileName as exc:
+            rule_pattern.error = str(exc)
+            notify_error(str(exc))
+            page.update()
+        except ProfileGone:
+            notify_error("That rule was deleted meanwhile")
+            page.pop_dialog()
+            refresh_rules()
+            page.update()
+        except Exception as exc:  # noqa: BLE001
+            notify_error(f"Rule save failed: {exc}")
+
+    def ask_delete_rule(rule_id: int, pattern: str) -> None:
+        def do_delete() -> None:
+            storage.delete_anonymization_rule(rule_id)
+            refresh_rules()
+            notify_ok(f"Deleted rule '{pattern}'")
+            page.update()
+
+        confirm("Delete rule?", f"Columns matching '{pattern}' will no longer be anonymized.", "Delete", do_delete)
 
     def refresh_destination_hint() -> None:
         """Say it before the run starts: this destination is not on this machine."""
@@ -1002,6 +1108,37 @@ async def main(page: ft.Page) -> None:
             return None
         return src, dst
 
+    async def anonymize_step(profile: DBProfile, table: str, label: str) -> bool:
+        """Rewrite the personal columns of one table. False means the run must stop.
+
+        Reports what it replaced, and why it left a suspicious column alone, so a
+        forgotten column is visible instead of silent.
+        """
+        if not anonymize_switch.value:
+            log.append(f"Anonymization is off: {label} keeps its personal data as it is", "WARN")
+            return True
+        rules = storage.list_anonymization_rules()
+        ok, columns, message = await transfer_service.table_columns(profile, table)
+        if not ok:
+            log.append(f"Could not read columns of {label}: {message}", "ERROR")
+            return False
+        plan = plan_table(table, columns, rules)
+        for column, reason in plan.skipped:
+            log.append(f"{label}.{column} looks personal but was not anonymized: {reason}", "WARN")
+        if not plan.targets:
+            return True
+        started = time.monotonic()
+        ok, affected, message = await transfer_service.anonymize_table(profile, plan)
+        if not ok:
+            log.append(f"Anonymizing {label} failed: {message}", "ERROR")
+            return False
+        names = ", ".join(column for column, _kind, _length in plan.targets)
+        log.append(
+            f"Anonymized {label}: {names} ({len(plan.targets)} columns, {ui.format_rows(affected)} rows, "
+            f"{ui.format_duration(int((time.monotonic() - started) * 1000))})"
+        )
+        return True
+
     async def ask_confirmation(title: str, lines: list[str], confirm_label: str) -> bool:
         """A modal question inside a running task: the answer is awaited, not guessed."""
         answer: asyncio.Future[bool] = asyncio.get_running_loop().create_future()
@@ -1121,6 +1258,27 @@ async def main(page: ft.Page) -> None:
         else:
             log.append(f"Scope: single table '{parsed_value}'")
         log.append(f"Parallel pipes: {parallel if parallel is not None else 'auto'}")
+
+        if not anonymize_switch.value:
+            log.append("Anonymization is off: personal data will be copied as it is", "WARN")
+        else:
+            rules = storage.list_anonymization_rules()
+            scope_ok, scoped_tables, scoped_msg = await _scope_tables_for_check(src, parsed_mode, parsed_value)
+            if not scope_ok:
+                log.append(f"Could not list the tables to check: {scoped_msg}", "WARN")
+            for table in scoped_tables[:20]:
+                ok, columns, message = await transfer_service.table_columns(src, table)
+                if not ok:
+                    log.append(f"Could not read columns of {table}: {message}", "WARN")
+                    continue
+                table_plan = plan_table(table, columns, rules)
+                if table_plan.targets:
+                    log.append(f"Would anonymize {table}: " + ", ".join(c for c, _k, _l in table_plan.targets))
+                for column, reason in table_plan.skipped:
+                    log.append(f"{table}.{column} looks personal but has no rule: {reason}", "WARN")
+            if len(scoped_tables) > 20:
+                log.append(f"({len(scoped_tables) - 20} further tables not checked in the preview)")
+
         set_status("Preview ready", "ok")
         set_running(False)
         page.update()
@@ -1293,6 +1451,11 @@ async def main(page: ft.Page) -> None:
                                 f"Inbound FK detected for {final_name}; replacing data in place from {temp_name}",
                                 "WARN",
                             )
+                            # Rewrite the temp table first: the final table is the one
+                            # other tables point at, and it must never hold real data.
+                            if not await anonymize_step(dst, temp_name, final_name):
+                                fail(f"Anonymization failed for {final_name}; its data was not replaced")
+                                return
                             replaced, replace_msg = await transfer_service.mysql_replace_final_from_temp(
                                 dst, temp_table=temp_name, final_table=final_name
                             )
@@ -1304,6 +1467,12 @@ async def main(page: ft.Page) -> None:
                             # The table stays in place; this repairs indexes an earlier swap removed.
                             await apply_source_indexes(final_name, final_name)
                         else:
+                            # Anonymize before indexing and before the swap: the final
+                            # table then never holds a single real value, and a unique
+                            # index is built over the replacements.
+                            if not await anonymize_step(dst, temp_name, final_name):
+                                fail(f"Anonymization failed for {final_name}; nothing was swapped")
+                                return
                             # Index the temp table before the swap, so the table that gets
                             # published is complete from its first moment.
                             await apply_source_indexes(temp_name, final_name)
@@ -1447,6 +1616,26 @@ async def main(page: ft.Page) -> None:
                 page.update()
                 result = await transfer_service.transfer_scope(src, dst, mode, scope, parallel=parallel)
 
+                # No temp table on this path: the rows are already in the destination,
+                # so anonymizing happens right after the copy.
+                if result.status != "success" and anonymize_switch.value:
+                    log.append(
+                        f"Transfer did not succeed ({result.message}); {ui.format_rows(result.rows)} rows may "
+                        "already be in the destination and are NOT anonymized",
+                        "ERROR",
+                    )
+                if result.status == "success" and anonymize_switch.value:
+                    scope_ok, scoped_tables, scoped_msg = await _scope_tables_for_check(src, mode, scope)
+                    if not scope_ok:
+                        fail(f"Transfer done, but the tables to anonymize could not be listed: {scoped_msg}")
+                        return
+                    set_progress(label="Anonymizing")
+                    page.update()
+                    for table in scoped_tables:
+                        if not await anonymize_step(dst, table, table):
+                            fail(f"Anonymization failed for {table}; its data in the destination is still real")
+                            return
+
             store_run(result)
             log.append(f"Summary: {result.message}", "INFO" if result.status != "failed" else "ERROR")
             log.append(
@@ -1491,6 +1680,8 @@ async def main(page: ft.Page) -> None:
     ssh_save_button.on_click = save_ssh_profile
     db_save_button.on_click = save_db_profile
     ssh_new_button.on_click = lambda _: open_ssh_dialog(None)
+    rules_new_button.on_click = lambda _: open_rule_dialog(None)
+    rule_save_button.on_click = save_rule
     db_new_button.on_click = lambda _: open_db_dialog(None)
 
     def on_search_change(refresh) -> None:
@@ -1498,6 +1689,7 @@ async def main(page: ft.Page) -> None:
         page.update()
 
     ssh_search.on_change = lambda _: on_search_change(refresh_ssh_options)
+    rules_search.on_change = lambda _: on_search_change(refresh_rules)
     db_search.on_change = lambda _: on_search_change(refresh_db_options)
     # A Dropdown reports a pick through on_select; on_change belongs to the old
     # DropdownM2 and is never called, which left the warning below silent.
@@ -1546,7 +1738,13 @@ async def main(page: ft.Page) -> None:
                 destination_hint,
                 ft.Row([source_test_button, destination_test_button, load_tables_button], spacing=8, wrap=True),
                 ft.Divider(height=1, color=ft.Colors.OUTLINE_VARIANT),
-                ft.Text("What should be transferred?", size=12, color=ft.Colors.ON_SURFACE_VARIANT),
+                ft.Row(
+                    [
+                        ft.Text("What should be transferred?", size=12, color=ft.Colors.ON_SURFACE_VARIANT, expand=True),
+                        anonymize_switch,
+                    ],
+                    vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                ),
                 scope_choice,
                 single_row,
                 multi_column,
@@ -1628,6 +1826,22 @@ async def main(page: ft.Page) -> None:
             db_save_button,
         )
 
+    def build_rule_dialog() -> ft.AlertDialog:
+        return dialog(
+            rule_dialog_title,
+            [
+                ui.field_row(rule_pattern, rule_kind),
+                ft.Text(
+                    "The pattern is matched against column names, ignoring case. Only text columns are "
+                    "rewritten; the log reports anything that looks personal and was left alone.",
+                    size=11,
+                    color=ft.Colors.ON_SURFACE_VARIANT,
+                ),
+                ft.Row([rule_enabled], spacing=8),
+            ],
+            rule_save_button,
+        )
+
     def profile_tile(title: str, subtitle: str, icon: ft.IconData, search: ft.Control, new_button: ft.Control, rows: ft.Control) -> ft.ExpansionTile:
         return ft.ExpansionTile(
             title=ft.Text(title),
@@ -1648,9 +1862,18 @@ async def main(page: ft.Page) -> None:
         "Database profiles", "Every profile can be source or destination", ft.Icons.STORAGE, db_search, db_new_button, db_rows
     )
 
+    rules_tile = profile_tile(
+        "Anonymization rules",
+        "Which columns are replaced with fake values",
+        ft.Icons.PRIVACY_TIP,
+        rules_search,
+        rules_new_button,
+        rules_rows,
+    )
+
     profiles_section = ui.section_card(
         "Profiles",
-        ft.Column([ssh_tile, db_tile], spacing=6),
+        ft.Column([ssh_tile, db_tile, rules_tile], spacing=6),
         "Open only when you need to add or change a connection.",
         ft.Icons.SETTINGS,
     )
@@ -1664,6 +1887,7 @@ async def main(page: ft.Page) -> None:
 
     refresh_ssh_options()
     refresh_db_options()
+    refresh_rules()
     refresh_run_history()
     refresh_scope_ui()
     set_status("Idle")

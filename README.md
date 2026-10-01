@@ -30,6 +30,8 @@ A user guide is in [docs/user-guide.md](docs/user-guide.md), and in German in
   verified; a custom CA for PostgreSQL
 - SSH host keys are checked against `~/.ssh/known_hosts`; a changed key stops the connection
 - The connection test logs in for real and reports whether the session is encrypted
+- Personal columns can be anonymized on the way in: rules on column names, deterministic fake
+  values, salted per installation, with the replaced and the suspicious columns reported
 - Run history with the last 20 transfers, reusable with one click
 - Automatic updates through [Sparkle](https://sparkle-project.org), signed and served from GitHub
   Releases, with a "Check for Updates…" item in the app menu
@@ -122,7 +124,7 @@ described in [MACOS_BUILD.md](MACOS_BUILD.md).
 - `src/sqltransfer_app/secrets.py` - Keychain access
 - `patches/` - local patches to dependencies
 - `scripts/` - release script, third-party notices, deployment target fix for the Xcode project
-- `docs/` - user guide, English and German
+- `docs/` - user guide (English and German), and design notes under `docs/design/`
 - `tests/` - unit tests, plus integration tests that need a disposable server
 
 ## License

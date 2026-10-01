@@ -128,6 +128,24 @@ Unter **Advanced** liegen zwei Einstellungen, die man selten braucht:
 
 Am Ende steht in der Statuszeile, wie viele Zeilen in welcher Zeit übertragen wurden, und der Lauf erscheint im Verlauf rechts.
 
+## Personendaten anonymisieren
+
+Im Bereich **Transfer** steht der Schalter **Anonymize personal data**. Er ist an, solange es aktive Regeln gibt. Beim Übertragen ersetzt die App dann in Spalten mit Personendaten die echten Werte durch erfundene.
+
+**Was ersetzt wird, entscheiden Regeln über Spaltennamen.** Sie stehen unter **Profiles → Anonymization rules**, mit Vorgaben für Deutsch und Englisch (E-Mail, Vor- und Nachname, Telefon, Straße, Ort, PLZ). Ein Muster wie `*mail*` trifft `email`, `Email` und `kunde_email`. Über **New rule** legst du eigene an, der Stift ändert, der Papierkorb löscht, und eine Regel lässt sich abschalten, ohne sie zu verlieren.
+
+**Gleicher Wert ergibt immer denselben Ersatz.** Eine Adresse, die in zwei Tabellen steht, wird in beiden gleich ersetzt, Verknüpfungen bleiben also heil. Eindeutig bleiben allerdings nur die Arten, deren Ersatz den Hash enthält: **E-Mail** und **Generic text**. Namen, Orte und Straßen stammen aus einer Liste und wiederholen sich; auf einer UNIQUE-Spalte nimm deshalb E-Mail oder Generic text. Dafür sorgt ein Zufallswert im Schlüsselbund, der deinen Rechner nie verlässt. `NULL` bleibt `NULL`, Leeres bleibt leer.
+
+**Vorher sehen, was passiert:** **Preview plan** listet die betroffenen Spalten, bevor eine Zeile kopiert wird. Nach dem Lauf steht im Protokoll, was ersetzt wurde. Spalten, die nach Personendaten aussehen, aber keine Regel haben, erscheinen als WARN mit Begründung.
+
+**Grenzen, die du kennen solltest:**
+
+- Nur Textspalten. Eine Spalte `telefon` vom Typ `BIGINT` wird gemeldet, nicht geändert.
+- Ist die Spalte zu kurz für den Ersatzwert, wird er abgeschnitten, statt die Übertragung abzubrechen.
+- Freitext bleibt, wie er ist. Steht eine Adresse in einem Feld `kommentar`, erkennt das kein Namensabgleich.
+- Die echten Daten liegen kurz auf deiner Platte: bei MySQL nur in der Zwischentabelle (die fertige Tabelle sieht sie nie), bei PostgreSQL in der Zieltabelle selbst, bis der Schritt durchgelaufen ist.
+- Scheitert das Ersetzen, bricht der Lauf ab. Bei MySQL wird dann **nicht** getauscht, die Zieltabelle behält ihren alten Inhalt.
+
 ## Das Protokoll lesen
 
 Jede Zeile trägt eine Uhrzeit und eine Einstufung, farblich unterschieden:
