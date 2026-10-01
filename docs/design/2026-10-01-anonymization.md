@@ -1,6 +1,7 @@
 # Design: anonymizing personal data on the way in
 
-Status: draft, not implemented. Written 01.10.2026.
+Status: implemented in 1.3.0. Written 01.10.2026.
+Implementation plan: [2026-10-01-anonymization-plan.md](2026-10-01-anonymization-plan.md).
 
 Copying production-like data pulls real names, e-mail addresses and phone numbers onto a developer
 machine. This describes how SQL Transfer replaces those values with fake ones that keep the data

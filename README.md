@@ -30,6 +30,8 @@ A user guide is in [docs/user-guide.md](docs/user-guide.md), and in German in
   verified; a custom CA for PostgreSQL
 - SSH host keys are checked against `~/.ssh/known_hosts`; a changed key stops the connection
 - The connection test logs in for real and reports whether the session is encrypted
+- Personal columns can be anonymized on the way in: rules on column names, deterministic fake
+  values, salted per installation, with the replaced and the suspicious columns reported
 - Run history with the last 20 transfers, reusable with one click
 - Automatic updates through [Sparkle](https://sparkle-project.org), signed and served from GitHub
   Releases, with a "Check for Updates…" item in the app menu
