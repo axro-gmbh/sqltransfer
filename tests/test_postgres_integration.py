@@ -12,9 +12,11 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 
 import pytest
 
+from sqltransfer_app.anonymize import Rule, plan_table
 from sqltransfer_app.models import DBProfile
 from sqltransfer_app.transfer import TransferService
 from sqltransfer_app.tunnel import TunnelManager
@@ -35,6 +37,10 @@ def _spec() -> dict:
 
 
 class _Secrets:
+    def anonymization_salt(self):
+        # Fixed, so the expected replacements stay the same between runs.
+        return "test-salt"
+
     def get_secret(self, _key):
         return _spec()["password"]
 
@@ -130,3 +136,64 @@ def test_apitap_transfer_follows_the_setting(databases):
     result = asyncio.run(service.transfer_single_table(src, dst, "public.items", dest_table="items_refused"))
     assert result.status == "failed"
     assert "certificate" in result.message.lower(), result.message  # refused for the right reason
+
+
+def _rows(database: str, sql: str) -> list[tuple]:
+    s = _spec()
+    with psycopg.connect(host=s["host"], port=s["port"], user=s["user"], password=s["password"],
+                         dbname=database, autocommit=True, sslmode="disable") as conn:
+        return list(conn.execute(sql).fetchall())
+
+
+def _anonymize(dst: DBProfile, table: str, rules: list[Rule]) -> tuple[bool, int, str]:
+    service = _service()
+    ok, columns, message = asyncio.run(service.table_columns(dst, table))
+    assert ok, message
+    return asyncio.run(service.anonymize_table(dst, plan_table(table, columns, rules)))
+
+
+def test_anonymizing_replaces_only_the_matched_columns(databases):
+    dst = _profile("local", DST_DB, "off")
+    _admin(DST_DB, "DROP TABLE IF EXISTS kunde",
+           "CREATE TABLE kunde (id INT PRIMARY KEY, email TEXT UNIQUE, ort TEXT, plz TEXT, telefon TEXT, umsatz INT)",
+           "INSERT INTO kunde VALUES (1,'a@axro.de','Hamburg','20095','040 123',10),"
+           " (2,'b@axro.de',NULL,'10115',NULL,20), (3,'','Köln','','',30)")
+
+    ok, affected, message = _anonymize(dst, "public.kunde",
+                                       [Rule(id=1, pattern="*mail*", kind="email"),
+                                        Rule(id=2, pattern="ort", kind="city"),
+                                        Rule(id=3, pattern="plz", kind="postcode"),
+                                        Rule(id=4, pattern="telefon", kind="phone")])
+    assert ok, message
+    assert affected == 3
+
+    rows = _rows(DST_DB, "SELECT id, email, ort, plz, telefon, umsatz FROM kunde ORDER BY id")
+    assert [r[5] for r in rows] == [10, 20, 30]
+    assert "axro.de" not in str(rows)
+    assert rows[1][2] is None
+    assert rows[2][1] == ""
+    assert all(re.fullmatch(r"\d{5}", r[3]) for r in rows if r[3])
+    assert all(re.fullmatch(r"\+49 30 \d{7}", r[4]) for r in rows if r[4])
+
+
+def test_the_same_value_yields_the_same_replacement(databases):
+    dst = _profile("local", DST_DB, "off")
+    _admin(DST_DB, "DROP TABLE IF EXISTS a", "DROP TABLE IF EXISTS b",
+           "CREATE TABLE a (id INT PRIMARY KEY, email TEXT)",
+           "CREATE TABLE b (id INT PRIMARY KEY, email TEXT)",
+           "INSERT INTO a VALUES (1,'same@axro.de')", "INSERT INTO b VALUES (1,'same@axro.de')")
+    rules = [Rule(id=1, pattern="email", kind="email")]
+    for table in ("public.a", "public.b"):
+        assert _anonymize(dst, table, rules)[0]
+    assert _rows(DST_DB, "SELECT email FROM a")[0][0] == _rows(DST_DB, "SELECT email FROM b")[0][0]
+
+
+def test_a_unique_column_stays_unique(databases):
+    dst = _profile("local", DST_DB, "off")
+    values = ",".join(f"({i},'kunde{i}@axro.de')" for i in range(1, 201))
+    _admin(DST_DB, "DROP TABLE IF EXISTS viele",
+           "CREATE TABLE viele (id INT PRIMARY KEY, email TEXT UNIQUE)",
+           f"INSERT INTO viele VALUES {values}")
+    ok, _affected, message = _anonymize(dst, "public.viele", [Rule(id=1, pattern="email", kind="email")])
+    assert ok, message
+    assert _rows(DST_DB, "SELECT COUNT(DISTINCT email) FROM viele")[0][0] == 200

@@ -144,12 +144,15 @@ def _number(digest: str, db_type: str, hex_digits: int, modulo: int) -> str:
     At most seven hex digits: PostgreSQL's bit(32)::int is signed, so eight digits
     turn into a negative number and a postcode would come out as '-12345'. abs()
     is the belt to that suspenders.
+
+    MOD() rather than the % operator: both drivers read a literal percent sign in
+    a parameterised statement as a placeholder and refuse the query.
     """
     hex_digits = min(hex_digits, 7)
     if db_type == "mysql":
-        return f"(CONV(SUBSTRING({digest}, 1, {hex_digits}), 16, 10) % {modulo})"
+        return f"MOD(CONV(SUBSTRING({digest}, 1, {hex_digits}), 16, 10), {modulo})"
     bits = hex_digits * 4
-    return f"(abs(('x' || substr({digest}, 1, {hex_digits}))::bit({bits})::int) % {modulo})"
+    return f"mod(abs(('x' || substr({digest}, 1, {hex_digits}))::bit({bits})::int), {modulo})"
 
 
 def _pick(values: tuple[str, ...], digest: str, db_type: str) -> str:
@@ -216,4 +219,6 @@ def update_statement(plan: TablePlan, db_type: str, salt: str) -> tuple[str, lis
             f"ELSE {_replacement(kind, quoted, db_type)} END"
         )
     sql = f"UPDATE {_quote_table(plan.table, db_type)} SET " + ", ".join(assignments)
-    return sql, [salt] * len(plan.targets)
+    # One salt per placeholder, not per column: a kind like street or fullname
+    # embeds the digest twice and therefore carries two.
+    return sql, [salt] * sql.count("%s")

@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from typing import Any, Literal
 from urllib.parse import quote_plus, urlencode
 
+from .anonymize import Column, TablePlan, update_statement
 from .models import DBProfile, SSHProfile, TransferResult
 from .secrets import SecretStore
 from .storage import Storage
@@ -140,6 +141,56 @@ def _report_failure_text(report: object) -> str | None:
     if ok_value is False:
         return "apitap reported failure"
     return None
+
+
+_COLUMNS_SQL = (
+    "SELECT column_name, data_type FROM information_schema.columns "
+    "WHERE table_schema = %s AND table_name = %s ORDER BY ordinal_position"
+)
+
+
+def _split_table(table: str, default_schema: str) -> tuple[str, str]:
+    """'public.kunde' -> ('public', 'kunde'); a bare name uses the connected database."""
+    parts = [part.strip('`"') for part in table.split(".")]
+    return (parts[0], parts[1]) if len(parts) == 2 else (default_schema, parts[0])
+
+
+def _table_columns_sync(
+    host: str, port: int, database: str, username: str, password: str,
+    db_type: str, table: str, *, tls: TlsSettings,
+) -> list[Column]:
+    schema, name = _split_table(table, "public" if db_type == "postgres" else database)
+    if db_type == "mysql":
+        conn = _mysql_connect(tls, host=host, port=port, user=username, password=password,
+                              database=database, connect_timeout=5, autocommit=True)
+    else:
+        conn = _pg_connect(tls, host=host, port=port, user=username, password=password,
+                           dbname=database, connect_timeout=5, autocommit=True)
+    try:
+        with conn.cursor() as cur:
+            cur.execute(_COLUMNS_SQL, (schema, name))
+            return [Column(str(row[0]), str(row[1])) for row in cur.fetchall()]
+    finally:
+        conn.close()
+
+
+def _anonymize_table_sync(
+    host: str, port: int, database: str, username: str, password: str,
+    db_type: str, sql: str, params: list[str], *, tls: TlsSettings,
+) -> int:
+    if db_type == "mysql":
+        conn = _mysql_connect(tls, host=host, port=port, user=username, password=password,
+                              database=database, connect_timeout=5, read_timeout=600,
+                              write_timeout=600, autocommit=True)
+    else:
+        conn = _pg_connect(tls, host=host, port=port, user=username, password=password,
+                           dbname=database, connect_timeout=5, autocommit=True)
+    try:
+        with conn.cursor() as cur:
+            cur.execute(sql, params)
+            return int(cur.rowcount)
+    finally:
+        conn.close()
 
 
 class TransferService:
@@ -805,6 +856,51 @@ class TransferService:
             if endpoint and endpoint.tunnel:
                 self.tunnel_manager.close_tunnel(endpoint.tunnel)
 
+
+    async def table_columns(self, profile: DBProfile, table: str) -> tuple[bool, list[Column], str]:
+        """Column names and types of one destination table: (ok, columns, error)."""
+        endpoint: ResolvedEndpoint | None = None
+        try:
+            endpoint = self._resolve_profile(profile)
+            host = endpoint.tunnel.local_host if endpoint.tunnel else profile.host
+            port = endpoint.tunnel.local_port if endpoint.tunnel else profile.port
+            password = self.secret_store.get_secret(profile.password_secret_key) or ""
+            columns = await asyncio.to_thread(
+                _table_columns_sync, host, port, profile.database, profile.username, password,
+                profile.db_type, table, tls=endpoint.tls,
+            )
+            return True, columns, ""
+        except Exception as exc:  # noqa: BLE001
+            return False, [], str(exc)
+        finally:
+            if endpoint and endpoint.tunnel:
+                self.tunnel_manager.close_tunnel(endpoint.tunnel)
+
+    async def anonymize_table(self, profile: DBProfile, plan: TablePlan) -> tuple[bool, int, str]:
+        """Rewrite the planned columns in place: (ok, rows affected, error).
+
+        An empty plan is a success with nothing done, so callers need no special case.
+        """
+        statement = update_statement(plan, profile.db_type, self.secret_store.anonymization_salt())
+        if statement is None:
+            return True, 0, ""
+        sql, params = statement
+        endpoint: ResolvedEndpoint | None = None
+        try:
+            endpoint = self._resolve_profile(profile)
+            host = endpoint.tunnel.local_host if endpoint.tunnel else profile.host
+            port = endpoint.tunnel.local_port if endpoint.tunnel else profile.port
+            password = self.secret_store.get_secret(profile.password_secret_key) or ""
+            affected = await asyncio.to_thread(
+                _anonymize_table_sync, host, port, profile.database, profile.username, password,
+                profile.db_type, sql, params, tls=endpoint.tls,
+            )
+            return True, affected, ""
+        except Exception as exc:  # noqa: BLE001
+            return False, 0, str(exc)
+        finally:
+            if endpoint and endpoint.tunnel:
+                self.tunnel_manager.close_tunnel(endpoint.tunnel)
 
 def _list_tables_sync(
     db_type: str,
@@ -1910,20 +2006,3 @@ def _create_empty_table_from_source_columns_sync(
         dst_conn.close()
 
     return "column-only schema copy"
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-

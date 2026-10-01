@@ -15,9 +15,10 @@ def test_nothing_to_do_yields_no_statement():
 
 
 @pytest.mark.parametrize("db_type", ["mysql", "postgres"])
-def test_the_salt_travels_as_a_parameter_once_per_column(db_type):
+def test_the_salt_travels_as_a_parameter_for_every_placeholder(db_type):
     sql, params = update_statement(_plan(("email", "email"), ("ort", "city")), db_type, "pepper")
-    assert params == ["pepper", "pepper"]
+    assert params == ["pepper"] * sql.count("%s")
+    assert len(params) >= 2
     assert "pepper" not in sql
 
 
@@ -60,3 +61,14 @@ def test_every_kind_keeps_null_and_empty(db_type, kind):
 def test_an_unknown_kind_is_refused_loudly():
     with pytest.raises(ValueError, match="unknown kind"):
         update_statement(_plan(("spalte", "nonsense")), "mysql", "s")
+
+
+@pytest.mark.parametrize("db_type", ["mysql", "postgres"])
+def test_the_only_percent_signs_are_placeholders(db_type):
+    # A literal % (from a modulo) makes pymysql and psycopg read the statement as
+    # a format string and refuse it: "unsupported format character".
+    sql, params = update_statement(
+        _plan(("a", "postcode"), ("b", "phone"), ("c", "city"), ("d", "street")), db_type, "s"
+    )
+    assert sql.count("%") == len(params)
+    assert "%s" in sql
