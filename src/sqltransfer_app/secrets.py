@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import secrets as _secrets
+
 try:
     import keyring
     from keyring.errors import PasswordDeleteError
@@ -8,6 +10,9 @@ except ImportError:  # pragma: no cover
 
     class PasswordDeleteError(Exception):
         pass
+
+
+SALT_KEY = "anonymization:salt"
 
 
 class SecretStore:
@@ -36,4 +41,15 @@ class SecretStore:
         except PasswordDeleteError:
             return
 
+    def anonymization_salt(self) -> str:
+        """The per-installation salt for anonymization, created on first use.
 
+        Without it, anyone holding a list of real values could hash them and check
+        which ones occur in the copied data. It never leaves the Keychain.
+        """
+        existing = self.get_secret(SALT_KEY)
+        if existing:
+            return existing
+        salt = _secrets.token_hex(16)
+        self.set_secret(SALT_KEY, salt)
+        return salt
