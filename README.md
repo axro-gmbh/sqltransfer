@@ -122,7 +122,7 @@ described in [MACOS_BUILD.md](MACOS_BUILD.md).
 - `src/sqltransfer_app/secrets.py` - Keychain access
 - `patches/` - local patches to dependencies
 - `scripts/` - release script, third-party notices, deployment target fix for the Xcode project
-- `docs/` - user guide, English and German
+- `docs/` - user guide (English and German), and design notes under `docs/design/`
 - `tests/` - unit tests, plus integration tests that need a disposable server
 
 ## License
