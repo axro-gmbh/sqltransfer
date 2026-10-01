@@ -424,3 +424,37 @@ def test_a_matching_column_of_the_wrong_type_is_left_alone(databases):
     ok, affected, message = _anonymize(dst, "numerisch", [Rule(id=1, pattern="telefon", kind="phone")])
     assert ok and affected == 0, message
     assert _rows(DST_DB, "SELECT telefon FROM numerisch")[0][0] == 491234567
+
+
+def test_a_table_the_destination_cannot_see_is_an_error_not_an_empty_plan(databases):
+    # Returning (True, []) made the app report success while nothing was anonymized.
+    service = _service()
+    dst = _profile("local", DST_DB)
+    ok, columns, message = asyncio.run(service.table_columns(dst, "gibt_es_nicht"))
+    assert not ok and not columns
+    assert "gibt_es_nicht" in message
+
+
+def test_a_replacement_is_cut_to_the_column_length(databases):
+    dst = _profile("local", DST_DB)
+    _exec(DST_DB, "DROP TABLE IF EXISTS eng",
+          "CREATE TABLE eng (id INT PRIMARY KEY, email VARCHAR(12), ort VARCHAR(6))",
+          "INSERT INTO eng VALUES (1,'a@axro.de','Kiel')")
+    ok, affected, message = _anonymize(dst, "eng", [Rule(id=1, pattern="email", kind="email"),
+                                                    Rule(id=2, pattern="ort", kind="city")])
+    assert ok, message  # a too-long replacement used to abort the whole transfer
+    row = _rows(DST_DB, "SELECT email, ort FROM eng")[0]
+    assert len(row[0]) <= 12 and len(row[1]) <= 6
+    assert "axro.de" not in row[0]
+
+
+def test_names_do_not_collapse_onto_a_handful_of_values(databases):
+    dst = _profile("local", DST_DB)
+    values = ",".join(f"({i},'Person {i}')" for i in range(1, 201))
+    _exec(DST_DB, "DROP TABLE IF EXISTS namen",
+          "CREATE TABLE namen (id INT PRIMARY KEY, name VARCHAR(190))",
+          f"INSERT INTO namen VALUES {values}")
+    ok, _affected, message = _anonymize(dst, "namen", [Rule(id=1, pattern="name", kind="fullname")])
+    assert ok, message
+    distinct = _rows(DST_DB, "SELECT COUNT(DISTINCT name) FROM namen")[0][0]
+    assert distinct >= 40, f"only {distinct} distinct names over 200 rows"

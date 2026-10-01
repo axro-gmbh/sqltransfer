@@ -8,6 +8,7 @@ so the rules can be tested without either.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import re
 from fnmatch import fnmatchcase
 from typing import Sequence
 
@@ -32,7 +33,8 @@ DEFAULT_RULES: tuple[tuple[str, str], ...] = (
     ("first_name", "firstname"),
     ("nachname", "lastname"),
     ("last_name", "lastname"),
-    ("name", "fullname"),
+    ("*vorname*", "firstname"),
+    ("*nachname*", "lastname"),
     ("*telefon*", "phone"),
     ("phone*", "phone"),
     ("mobil*", "phone"),
@@ -51,10 +53,17 @@ TEXT_TYPES: frozenset[str] = frozenset(
     {"char", "varchar", "text", "tinytext", "mediumtext", "longtext", "character varying", "character", "citext"}
 )
 
-# Fragments that make a column suspicious even when no rule matches it.
-_PERSONAL_FRAGMENTS: tuple[str, ...] = (
-    "mail", "name", "phone", "telefon", "mobil", "strasse", "street", "address", "adresse",
-    "plz", "zip", "city", "ort", "iban", "geburt", "birth", "ssn",
+# Words that make a column suspicious even when no rule matches it. Matched against
+# the column's words, not as substrings: "ort" must not fire on sort_order or
+# transport, and "name" must not fire on filename or username, or the one column
+# that really was forgotten drowns in the noise.
+_PERSONAL_WORDS: frozenset[str] = frozenset(
+    {
+        "mail", "email", "e", "name", "vorname", "nachname", "firstname", "lastname",
+        "phone", "telefon", "tel", "mobil", "mobile", "strasse", "street", "address",
+        "adresse", "plz", "zip", "postcode", "city", "ort", "iban", "geburt", "geburtstag",
+        "birth", "birthday", "birthdate", "ssn",
+    }
 )
 
 
@@ -70,6 +79,7 @@ class Rule:
 class Column:
     name: str
     data_type: str
+    max_length: int | None = None  # characters, as information_schema reports it
 
 
 @dataclass(frozen=True, slots=True)
@@ -77,16 +87,30 @@ class TablePlan:
     """What happens to one table: what gets rewritten, and what was left alone and why."""
 
     table: str
-    targets: tuple[tuple[str, str], ...]  # (column, kind)
+    targets: tuple[tuple[str, str, int | None], ...]  # (column, kind, max length)
     skipped: tuple[tuple[str, str], ...]  # (column, reason)
 
     def __bool__(self) -> bool:
         return bool(self.targets)
 
 
+def _words(column_name: str) -> list[str]:
+    """Split a column name into words: snake_case, camelCase and plain runs."""
+    spaced = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", column_name)
+    return [word for word in re.split(r"[^A-Za-z0-9]+", spaced.lower()) if word]
+
+
+# Stems that stay unambiguous inside a German compound, so "Geburtsdatum" and
+# "lieferadresse" are caught. Deliberately not "name", "ort" or "zip": those would
+# bring back filename, sort_order and gzip.
+_PERSONAL_STEMS: tuple[str, ...] = ("geburt", "telefon", "mobil", "strasse", "adresse", "mail", "iban")
+
+
 def looks_personal(column_name: str) -> bool:
-    name = column_name.lower()
-    return any(fragment in name for fragment in _PERSONAL_FRAGMENTS)
+    words = _words(column_name)
+    if any(word in _PERSONAL_WORDS for word in words):
+        return True
+    return any(word.startswith(stem) or word.endswith(stem) for word in words for stem in _PERSONAL_STEMS)
 
 
 def match_rule(column_name: str, rules: Sequence[Rule]) -> Rule | None:
@@ -100,13 +124,13 @@ def match_rule(column_name: str, rules: Sequence[Rule]) -> Rule | None:
 
 def plan_table(table: str, columns: Sequence[Column], rules: Sequence[Rule]) -> TablePlan:
     """Split a table's columns into what gets rewritten and what is reported."""
-    targets: list[tuple[str, str]] = []
+    targets: list[tuple[str, str, int | None]] = []
     skipped: list[tuple[str, str]] = []
     for column in columns:
         rule = match_rule(column.name, rules)
         data_type = column.data_type.lower()
         if rule and data_type in TEXT_TYPES:
-            targets.append((column.name, rule.kind))
+            targets.append((column.name, rule.kind, column.max_length))
         elif rule:
             skipped.append((column.name, f"not a text column ({data_type})"))
         elif looks_personal(column.name):
@@ -138,7 +162,7 @@ def _hash(column: str, db_type: str) -> str:
     return f"encode(sha256(convert_to(%s || {column}, 'UTF8')), 'hex')"
 
 
-def _number(digest: str, db_type: str, hex_digits: int, modulo: int) -> str:
+def _number(digest: str, db_type: str, hex_digits: int, modulo: int, offset: int = 1) -> str:
     """A non-negative integer derived from the first hex digits of the digest.
 
     At most seven hex digits: PostgreSQL's bit(32)::int is signed, so eight digits
@@ -150,14 +174,16 @@ def _number(digest: str, db_type: str, hex_digits: int, modulo: int) -> str:
     """
     hex_digits = min(hex_digits, 7)
     if db_type == "mysql":
-        return f"MOD(CONV(SUBSTRING({digest}, 1, {hex_digits}), 16, 10), {modulo})"
+        return f"MOD(CONV(SUBSTRING({digest}, {offset}, {hex_digits}), 16, 10), {modulo})"
     bits = hex_digits * 4
-    return f"mod(abs(('x' || substr({digest}, 1, {hex_digits}))::bit({bits})::int), {modulo})"
+    return f"mod(abs(('x' || substr({digest}, {offset}, {hex_digits}))::bit({bits})::int), {modulo})"
 
 
-def _pick(values: tuple[str, ...], digest: str, db_type: str) -> str:
+def _pick(values: tuple[str, ...], digest: str, db_type: str, offset: int = 1) -> str:
+    """Pick from a list by hash. `offset` picks a different slice of the digest, so
+    two lists in one value (first and last name) vary independently."""
     quoted = ", ".join("'" + value.replace("'", "''") + "'" for value in values)
-    index = _number(digest, db_type, 4, len(values))
+    index = _number(digest, db_type, 4, len(values), offset)
     if db_type == "mysql":
         return f"ELT(1 + {index}, {quoted})"
     return f"(ARRAY[{quoted}])[1 + {index}]"
@@ -183,9 +209,11 @@ def _replacement(kind: str, column: str, db_type: str) -> str:
     if kind == "firstname":
         return _pick(_FIRST_NAMES, digest, db_type)
     if kind == "lastname":
-        return _pick(_LAST_NAMES, digest, db_type)
+        return _pick(_LAST_NAMES, digest, db_type, offset=9)
     if kind == "fullname":
-        return _concat([_pick(_FIRST_NAMES, digest, db_type), "' '", _pick(_LAST_NAMES, digest, db_type)], db_type)
+        return _concat(
+            [_pick(_FIRST_NAMES, digest, db_type), "' '", _pick(_LAST_NAMES, digest, db_type, offset=9)], db_type
+        )
     if kind == "phone":
         return _concat(["'+49 30 '", _digits(digest, db_type, 7)], db_type)
     if kind == "street":
@@ -212,11 +240,16 @@ def update_statement(plan: TablePlan, db_type: str, salt: str) -> tuple[str, lis
     if not plan.targets:
         return None
     assignments = []
-    for column, kind in plan.targets:
+    for column, kind, max_length in plan.targets:
         quoted = _quote(column, db_type)
+        replacement = _replacement(kind, quoted, db_type)
+        if max_length:
+            # A fake e-mail address needs 31 characters; a real ort VARCHAR(10)
+            # would otherwise abort the whole transfer with "data too long".
+            replacement = f"LEFT({replacement}, {int(max_length)})"
         assignments.append(
             f"{quoted} = CASE WHEN {quoted} IS NULL THEN NULL WHEN {quoted} = '' THEN '' "
-            f"ELSE {_replacement(kind, quoted, db_type)} END"
+            f"ELSE {replacement} END"
         )
     sql = f"UPDATE {_quote_table(plan.table, db_type)} SET " + ", ".join(assignments)
     # One salt per placeholder, not per column: a kind like street or fullname

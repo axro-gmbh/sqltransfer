@@ -340,6 +340,7 @@ async def main(page: ft.Page) -> None:
         scope_choice,
         source_profile,
         destination_profile,
+        anonymize_switch,
     ]
 
     # ------------------------------------------------------------------ status
@@ -474,11 +475,13 @@ async def main(page: ft.Page) -> None:
             )
             for r in shown
         ] or [ui.empty_hint("No rules yet." if not rules else "No rule matches the search.")]
-        # Nothing to anonymize with means the switch would promise something it cannot keep.
+        # Nothing to anonymize with means the switch would promise something it
+        # cannot keep. Turning it off is therefore automatic, and so is turning it
+        # back on once a rule exists again: anything else leaves it enabled-but-off
+        # without the user ever having touched it.
         enabled_rules = [r for r in rules if r.enabled]
         anonymize_switch.disabled = not enabled_rules
-        if not enabled_rules:
-            anonymize_switch.value = False
+        anonymize_switch.value = bool(enabled_rules)
 
     def open_rule_dialog(rule_id: int | None = None) -> None:
         rule = next((r for r in storage.list_anonymization_rules() if r.id == rule_id), None) if rule_id else None
@@ -1112,6 +1115,7 @@ async def main(page: ft.Page) -> None:
         forgotten column is visible instead of silent.
         """
         if not anonymize_switch.value:
+            log.append(f"Anonymization is off: {label} keeps its personal data as it is", "WARN")
             return True
         rules = storage.list_anonymization_rules()
         ok, columns, message = await transfer_service.table_columns(profile, table)
@@ -1128,7 +1132,7 @@ async def main(page: ft.Page) -> None:
         if not ok:
             log.append(f"Anonymizing {label} failed: {message}", "ERROR")
             return False
-        names = ", ".join(column for column, _kind in plan.targets)
+        names = ", ".join(column for column, _kind, _length in plan.targets)
         log.append(
             f"Anonymized {label}: {names} ({len(plan.targets)} columns, {ui.format_rows(affected)} rows, "
             f"{ui.format_duration(int((time.monotonic() - started) * 1000))})"
@@ -1269,7 +1273,7 @@ async def main(page: ft.Page) -> None:
                     continue
                 table_plan = plan_table(table, columns, rules)
                 if table_plan.targets:
-                    log.append(f"Would anonymize {table}: " + ", ".join(c for c, _k in table_plan.targets))
+                    log.append(f"Would anonymize {table}: " + ", ".join(c for c, _k, _l in table_plan.targets))
                 for column, reason in table_plan.skipped:
                     log.append(f"{table}.{column} looks personal but has no rule: {reason}", "WARN")
             if len(scoped_tables) > 20:
@@ -1447,6 +1451,11 @@ async def main(page: ft.Page) -> None:
                                 f"Inbound FK detected for {final_name}; replacing data in place from {temp_name}",
                                 "WARN",
                             )
+                            # Rewrite the temp table first: the final table is the one
+                            # other tables point at, and it must never hold real data.
+                            if not await anonymize_step(dst, temp_name, final_name):
+                                fail(f"Anonymization failed for {final_name}; its data was not replaced")
+                                return
                             replaced, replace_msg = await transfer_service.mysql_replace_final_from_temp(
                                 dst, temp_table=temp_name, final_table=final_name
                             )
@@ -1455,9 +1464,6 @@ async def main(page: ft.Page) -> None:
                                 return
                             log.append(f"In-place replace done for {final_name}: {replace_msg}")
                             notes.append(f"inplace={final_name}")
-                            if not await anonymize_step(dst, final_name, final_name):
-                                fail(f"Anonymization failed for {final_name}; its data is still real")
-                                return
                             # The table stays in place; this repairs indexes an earlier swap removed.
                             await apply_source_indexes(final_name, final_name)
                         else:
@@ -1612,6 +1618,12 @@ async def main(page: ft.Page) -> None:
 
                 # No temp table on this path: the rows are already in the destination,
                 # so anonymizing happens right after the copy.
+                if result.status != "success" and anonymize_switch.value:
+                    log.append(
+                        f"Transfer did not succeed ({result.message}); {ui.format_rows(result.rows)} rows may "
+                        "already be in the destination and are NOT anonymized",
+                        "ERROR",
+                    )
                 if result.status == "success" and anonymize_switch.value:
                     scope_ok, scoped_tables, scoped_msg = await _scope_tables_for_check(src, mode, scope)
                     if not scope_ok:

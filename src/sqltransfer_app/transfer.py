@@ -144,7 +144,7 @@ def _report_failure_text(report: object) -> str | None:
 
 
 _COLUMNS_SQL = (
-    "SELECT column_name, data_type FROM information_schema.columns "
+    "SELECT column_name, data_type, character_maximum_length FROM information_schema.columns "
     "WHERE table_schema = %s AND table_name = %s ORDER BY ordinal_position"
 )
 
@@ -169,7 +169,14 @@ def _table_columns_sync(
     try:
         with conn.cursor() as cur:
             cur.execute(_COLUMNS_SQL, (schema, name))
-            return [Column(str(row[0]), str(row[1])) for row in cur.fetchall()]
+            columns = [Column(str(row[0]), str(row[1]), int(row[2]) if row[2] is not None else None)
+                       for row in cur.fetchall()]
+        if not columns:
+            # Empty means "this table is not visible from here", never "it has no
+            # columns". Treating it as nothing to do let a run report success while
+            # the real data sat untouched in the destination.
+            raise LookupError(f"Table {schema}.{name} does not exist or is not visible to {username}")
+        return columns
     finally:
         conn.close()
 

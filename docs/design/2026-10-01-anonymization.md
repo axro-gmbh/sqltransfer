@@ -31,6 +31,15 @@ the same output**: a person's address in `kunde` and in `bestellung` becomes the
 joins over those columns keep working, `UNIQUE` columns stay unique, and a second run produces the
 same database.
 
+**Uniqueness holds where the fake value carries the hash**, which is the case for `email` and `text`.
+The kinds that pick from a list of invented values (`firstname`, `lastname`, `fullname`, `city`,
+`street`) have a limited supply and will repeat: first and last name are drawn from different parts
+of the digest, which gives 64 combinations, not thousands. On a `UNIQUE` column use `email` or
+`text`, or expect the index rebuild to fail.
+
+**A replacement is cut to the column's length.** A fake address needs 31 characters, so a real
+`ort VARCHAR(10)` would otherwise abort the whole transfer with "data too long".
+
 The hash is salted with a random value created once per installation and kept in the macOS Keychain
 (`anonymization:salt`). Without a salt, anyone holding a list of real addresses could hash them and
 check which ones occur in the data, which would defeat the whole exercise. A consequence worth
@@ -134,10 +143,10 @@ destination. Three things work against that.
    because the destination table may not exist yet; the run itself asks the destination, which is
    what actually gets rewritten.
 2. **The log names what happened**, per table: `anonymized kunde: email, vorname, telefon (3 columns)`.
-3. **Suspicious columns without a rule are reported as WARN.** A built-in list of fragments (mail,
-   name, phone, tel, strasse, street, address, adresse, plz, zip, city, ort, iban, geburt, birth)
-   flags any column that looks personal but was not rewritten, including the reason: no rule, rule
-   disabled, or not a text column.
+3. **Suspicious columns without a rule are reported as WARN.** A built-in word list flags any column
+   that looks personal but was not rewritten, with the reason: no rule, rule disabled, or not a text
+   column. Matching is on words, not substrings, so `sort_order`, `username` and `filename` stay
+   quiet; the one column that really was forgotten would otherwise drown in false positives.
 
 ## Using it
 

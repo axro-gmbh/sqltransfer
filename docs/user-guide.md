@@ -134,13 +134,14 @@ The **Transfer** section has a switch, **Anonymize personal data**. It is on as 
 
 **Rules on column names decide what is replaced.** They live under **Profiles → Anonymization rules**, seeded with German and English defaults (e-mail, first and last name, phone, street, city, postcode). A pattern like `*mail*` covers `email`, `Email` and `kunde_email`. **New rule** adds one, the pencil edits, the bin deletes, and a rule can be disabled without losing it.
 
-**The same value always yields the same replacement.** An address appearing in two tables is replaced identically in both, so joins keep working and unique columns stay unique. A random value in the Keychain, which never leaves your machine, makes those replacements unguessable. `NULL` stays `NULL`, empty stays empty.
+**The same value always yields the same replacement.** An address appearing in two tables is replaced identically in both, so joins keep working. Uniqueness, however, only holds for the kinds whose replacement carries the hash: **e-mail** and **generic text**. Names, cities and streets come from a list and repeat, so on a `UNIQUE` column pick e-mail or generic text. A random value in the Keychain, which never leaves your machine, makes those replacements unguessable. `NULL` stays `NULL`, empty stays empty.
 
 **See it before it happens:** **Preview plan** lists the affected columns before a single row is copied. After the run the log says what was replaced. Columns that look personal but have no rule appear as WARN, with the reason.
 
 **Limits worth knowing:**
 
 - Text columns only. A `telefon` column of type `BIGINT` is reported, not changed.
+- When a column is too short for the replacement, the value is cut rather than aborting the transfer.
 - Free text stays as it is. An address inside a `kommentar` column is not something name matching can find.
 - Real data exists briefly on your disk: with MySQL only in the temp table (the finished table never sees it), with PostgreSQL in the destination table itself until the step has run.
 - If the replacement fails, the run stops. With MySQL nothing is swapped, so the destination table keeps its previous content.

@@ -1,13 +1,17 @@
 # tests/test_anonymize_sql.py
 from __future__ import annotations
 
+import re
+
 import pytest
 
 from sqltransfer_app.anonymize import TablePlan, update_statement
 
 
-def _plan(*targets: tuple[str, str], table: str = "kunde") -> TablePlan:
-    return TablePlan(table=table, targets=targets, skipped=())
+def _plan(*targets: tuple, table: str = "kunde") -> TablePlan:
+    """Targets may be given as (column, kind) or (column, kind, max length)."""
+    full = tuple(t if len(t) == 3 else (*t, None) for t in targets)
+    return TablePlan(table=table, targets=full, skipped=())
 
 
 def test_nothing_to_do_yields_no_statement():
@@ -72,3 +76,26 @@ def test_the_only_percent_signs_are_placeholders(db_type):
     )
     assert sql.count("%") == len(params)
     assert "%s" in sql
+
+
+@pytest.mark.parametrize("db_type", ["mysql", "postgres"])
+def test_first_and_last_name_come_from_different_parts_of_the_digest(db_type):
+    # Same slice for both lists means first and last name always move together:
+    # 8 names instead of 64, and a UNIQUE name column collides within a few rows.
+    sql, _ = update_statement(_plan(("name", "fullname")), db_type, "s")
+    offsets = sorted(set(re.findall(r", (\d+), 4\)", sql)))
+    assert len(offsets) >= 2, sql
+
+
+@pytest.mark.parametrize("db_type", ["mysql", "postgres"])
+def test_a_short_column_cuts_the_replacement_instead_of_overflowing(db_type):
+    # "data too long for column" aborted the whole transfer; on PostgreSQL after
+    # the real rows had already landed.
+    sql, _ = update_statement(_plan(("ort", "city", 6)), db_type, "s")
+    assert "LEFT(" in sql and ", 6)" in sql
+
+
+@pytest.mark.parametrize("db_type", ["mysql", "postgres"])
+def test_a_column_without_a_length_is_not_cut(db_type):
+    sql, _ = update_statement(_plan(("beschreibung", "text")), db_type, "s")
+    assert "LEFT(" not in sql

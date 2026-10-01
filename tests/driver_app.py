@@ -151,6 +151,12 @@ def fire(control, event) -> None:
     handler(None)
 
 
+def log_text(root) -> str:
+    """Everything the transfer log shows: the auto-scrolling column is only there."""
+    panel = [c for c in walk(root) if isinstance(c, ft.Column) and c.auto_scroll][0]
+    return " ".join(c.value for c in walk(panel) if isinstance(c, ft.Text) and c.value)
+
+
 def rows_of(column) -> list[str]:
     return [text_of(row) for row in column.controls]
 
@@ -326,6 +332,67 @@ async def main() -> int:
     check("anonymize" in calls and "swap" not in calls, f"no swap after a failed rewrite: {calls}")
     status = find(root, ft.Text, size=13, expand=True)
     check("failed" in status.value.lower(), f"the run reports failure: {status.value!r}")
+
+    print("\n9b. A run with the switch off says so, and the switch follows the rules")
+    app_module.TransferService.anonymize_table = _async((True, 0, ""))
+    switch.value = False
+    click(button(root, "Run transfer"))
+    await asyncio.sleep(0.2)
+    check("anonymization is off" in log_text(root).lower(), "the log records that nothing was anonymized")
+
+    rules = [r for r in rows_of(rules_rows)]
+    rule_edit = [c for c in walk(rules_rows) if isinstance(c, ft.IconButton) and c.tooltip == "Edit"]
+    for item in rule_edit:
+        click(item)
+        dialog = page.dialog
+        find(dialog, ft.Checkbox, label="Enabled").value = False
+        click(button(dialog, "Save"))
+    check(switch.disabled and switch.value is False, "no enabled rule leaves the switch off and disabled")
+    click(rule_edit[0])
+    dialog = page.dialog
+    find(dialog, ft.Checkbox, label="Enabled").value = True
+    click(button(dialog, "Save"))
+    check(switch.disabled is False and switch.value is True, f"a rule again: switch back on ({switch.value})")
+
+    print("\n9c. The in-place branch anonymizes before the data reaches the final table")
+    order: list[str] = []
+
+    async def record_anonymize(_self, _profile, plan):
+        order.append(f"anonymize:{plan.table}")
+        return True, 1, ""
+
+    async def record_replace(_self, _dst, temp_table, final_table):
+        order.append(f"replace:{temp_table}->{final_table}")
+        return True, "1 row"
+
+    app_module.TransferService.anonymize_table = record_anonymize
+    app_module.TransferService.mysql_replace_final_from_temp = record_replace
+    app_module.TransferService.mysql_table_has_inbound_fk = _async((True, True, ""))
+    switch.value = True
+    click(button(root, "Run transfer"))
+    await asyncio.sleep(0.2)
+    status_now = find(root, ft.Text, size=13, expand=True).value
+    check(len(order) >= 2 and order[0].startswith("anonymize:") and order[1].startswith("replace:"),
+          f"anonymize runs before the in-place replace: {order} (status: {status_now!r}, log tail: {log_text(root)[-160:]!r})")
+    check("kunde" not in order[0].split(":")[1] or "tmp" in order[0], f"it rewrites the temp table: {order[0]}")
+
+    print("\n9d. A PostgreSQL transfer that failed halfway says the data is real")
+    new_db_profile(page, root, "pg-local", "127.0.0.1", "shop", "postgres")
+    pg_edit = [c for c in walk(db_rows) if isinstance(c, ft.IconButton) and c.tooltip == "Edit"]
+    click(pg_edit[[r.split()[0] for r in rows_of(db_rows)].index("pg-local")])
+    find(page.dialog, ft.Dropdown, label="Database").value = "postgres"
+    click(button(page.dialog, "Save"))
+
+    async def half_failed(*_a, **_k):
+        return TransferResult(status="failed", rows=7, elapsed_ms=5, parallel=1, message="table 2 of 3 failed")
+
+    app_module.TransferService.transfer_scope = half_failed
+    destination.value = next(o.key for o in destination.options if o.text == "pg-local")
+    fire(destination, "on_select")
+    click(button(root, "Run transfer"))
+    await asyncio.sleep(0.2)
+    log = log_text(root).lower()
+    check("not anonymized" in log or "still real" in log, f"the log warns about the real data: {log[-200:]}")
 
     print("\n10. Every wired handler is an event its control really has")
     dead = []
