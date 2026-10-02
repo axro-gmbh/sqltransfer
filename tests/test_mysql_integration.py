@@ -18,10 +18,11 @@ from __future__ import annotations
 import asyncio
 import os
 import re
+import time
 
 import pytest
 
-from sqltransfer_app.anonymize import Column, Rule, plan_table
+from sqltransfer_app.anonymize import Column, JsonNode, Rule, plan_table
 from sqltransfer_app.models import DBProfile
 from sqltransfer_app.transfer import TransferService
 from sqltransfer_app.tunnel import TunnelManager
@@ -512,3 +513,51 @@ def test_generated_columns_of_the_source_are_read_in_one_go(databases):
     assert ok, message
     assert generated.get("gen_a") == ["tag", "kennung"]
     assert "gen_b" not in generated  # a table without generated columns is simply absent
+
+
+def test_json_paths_are_discovered_level_by_level(databases):
+    service = _service()
+    dst = _profile("local", DST_DB)
+    _exec(DST_DB, "DROP TABLE IF EXISTS mitjson",
+          "CREATE TABLE mitjson (id INT PRIMARY KEY, custom_fields JSON)",
+          """INSERT INTO mitjson VALUES
+             (1, '{"email":"a@axro.de","adresse":{"ort":"Hamburg","nummer":7},"positionen":[{"email":"x@y.de"}]}'),
+             (2, '{"email":"b@axro.de","notiz":"ohne"}'),
+             (3, NULL)""")
+
+    ok, nodes, message = asyncio.run(service.json_paths(dst, "mitjson", "custom_fields"))
+    assert ok, message
+    found = {node.path: node.types for node in nodes}
+    assert found[("email",)] == frozenset({"STRING"})
+    assert found[("adresse",)] == frozenset({"OBJECT"})
+    assert found[("adresse", "ort")] == frozenset({"STRING"})
+    assert found[("adresse", "nummer")] == frozenset({"INTEGER"})
+    assert found[("positionen",)] == frozenset({"ARRAY"})
+    assert ("positionen", "email") not in found   # arrays are not followed
+
+
+def test_json_discovery_costs_one_query_per_level(databases):
+    # 2000 rows must not mean 2000 queries: the guard is the runtime, measured
+    # against a table that would take minutes row by row.
+    service = _service()
+    dst = _profile("local", DST_DB)
+    rows = ",".join(f"({i}, '{{\"email\":\"k{i}@axro.de\"}}')" for i in range(1, 2001))
+    _exec(DST_DB, "DROP TABLE IF EXISTS vieljson",
+          "CREATE TABLE vieljson (id INT PRIMARY KEY, custom_fields JSON)",
+          f"INSERT INTO vieljson VALUES {rows}")
+    started = time.monotonic()
+    ok, nodes, message = asyncio.run(service.json_paths(dst, "vieljson", "custom_fields"))
+    assert ok, message
+    assert [n.path for n in nodes] == [("email",)]
+    assert time.monotonic() - started < 5
+
+
+def test_a_text_column_that_is_not_json_is_refused_cleanly(databases):
+    service = _service()
+    dst = _profile("local", DST_DB)
+    _exec(DST_DB, "DROP TABLE IF EXISTS keinjson",
+          "CREATE TABLE keinjson (id INT PRIMARY KEY, notiz LONGTEXT)",
+          "INSERT INTO keinjson VALUES (1, 'das ist kein json')")
+    ok, nodes, message = asyncio.run(service.json_paths(dst, "keinjson", "notiz"))
+    assert not ok and not nodes
+    assert "json" in message.lower()

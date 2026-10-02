@@ -197,3 +197,35 @@ def test_a_unique_column_stays_unique(databases):
     ok, _affected, message = _anonymize(dst, "public.viele", [Rule(id=1, pattern="email", kind="email")])
     assert ok, message
     assert _rows(DST_DB, "SELECT COUNT(DISTINCT email) FROM viele")[0][0] == 200
+
+
+def test_json_paths_are_discovered_level_by_level(databases):
+    service = _service()
+    dst = _profile("local", DST_DB, "off")
+    _admin(DST_DB, "DROP TABLE IF EXISTS mitjson",
+           "CREATE TABLE mitjson (id INT PRIMARY KEY, custom_fields JSONB)",
+           """INSERT INTO mitjson VALUES
+              (1, '{"email":"a@axro.de","adresse":{"ort":"Hamburg","nummer":7},"positionen":[{"email":"x@y.de"}]}'),
+              (2, '{"email":"b@axro.de","notiz":"ohne"}'),
+              (3, NULL)""")
+
+    ok, nodes, message = asyncio.run(service.json_paths(dst, "public.mitjson", "custom_fields"))
+    assert ok, message
+    found = {node.path: node.types for node in nodes}
+    assert found[("email",)] == frozenset({"STRING"})
+    assert found[("adresse",)] == frozenset({"OBJECT"})
+    assert found[("adresse", "ort")] == frozenset({"STRING"})
+    assert found[("adresse", "nummer")] == frozenset({"NUMBER"})
+    assert found[("positionen",)] == frozenset({"ARRAY"})
+    assert ("positionen", "email") not in found
+
+
+def test_a_text_column_that_is_not_json_is_refused_cleanly(databases):
+    service = _service()
+    dst = _profile("local", DST_DB, "off")
+    _admin(DST_DB, "DROP TABLE IF EXISTS keinjson",
+           "CREATE TABLE keinjson (id INT PRIMARY KEY, notiz TEXT)",
+           "INSERT INTO keinjson VALUES (1, 'das ist kein json')")
+    ok, nodes, message = asyncio.run(service.json_paths(dst, "public.keinjson", "notiz"))
+    assert not ok and not nodes
+    assert "json" in message.lower()

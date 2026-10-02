@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from typing import Any, Literal
 from urllib.parse import quote_plus, urlencode
 
-from .anonymize import Column, TablePlan, update_statement
+from .anonymize import Column, JsonNode, TablePlan, update_statement
 from .models import DBProfile, SSHProfile, TransferResult
 from .secrets import SecretStore
 from .storage import Storage
@@ -190,6 +190,92 @@ def _generated_columns_sync(
     finally:
         conn.close()
     return group_generated_columns_by_table(rows)
+
+
+def _mysql_json_path_sql(path: tuple[str, ...]) -> str:
+    """A MySQL JSON path with every key quoted, so dots and spaces in keys are safe."""
+    return "$" + "".join('."' + key.replace('"', '""') + '"' for key in path)
+
+
+def _json_paths_sync(
+    host: str,
+    port: int,
+    database: str,
+    username: str,
+    password: str,
+    db_type: str,
+    table: str,
+    column: str,
+    max_depth: int,
+    *,
+    tls: TlsSettings,
+) -> list[Column]:
+    """Discover the key paths of a JSON column, one query per level over all rows.
+
+    Returns JsonNode-shaped data: every path seen, with every JSON type observed for
+    it. Row-by-row inspection would mean a query per row; this is a query per level.
+    """
+    if db_type == "mysql":
+        conn = _mysql_connect(tls, host=host, port=port, user=username, password=password,
+                              database=database, connect_timeout=5, read_timeout=600, autocommit=True)
+    else:
+        conn = _pg_connect(tls, host=host, port=port, user=username, password=password,
+                           dbname=database, connect_timeout=5, autocommit=True)
+    quote = _quote_mysql_ident if db_type == "mysql" else _quote_pg_ident
+    quoted_table = ".".join(quote(part.strip('`"')) for part in table.split("."))
+    quoted_column = quote(column)
+    nodes: list[JsonNode] = []
+    try:
+        with conn.cursor() as cur:
+            if db_type == "mysql":
+                cur.execute(
+                    f"SELECT COUNT(*) FROM {quoted_table} WHERE {quoted_column} IS NOT NULL "
+                    f"AND NOT JSON_VALID({quoted_column})"
+                )
+                if int(cur.fetchone()[0]):
+                    raise ValueError(f"{table}.{column} does not hold valid JSON in every row")
+            else:
+                cur.execute(
+                    f"SELECT COUNT(*) FROM {quoted_table} WHERE {quoted_column} IS NOT NULL "
+                    f"AND pg_input_is_valid({quoted_column}::text, 'jsonb') IS NOT TRUE"
+                )
+                if int(cur.fetchone()[0]):
+                    raise ValueError(f"{table}.{column} does not hold valid JSON in every row")
+
+            parents: list[tuple[str, ...]] = [()]
+            for _depth in range(max_depth):
+                next_parents: list[tuple[str, ...]] = []
+                for parent in parents:
+                    if db_type == "mysql":
+                        parent_sql = _mysql_json_path_sql(parent).replace("'", "''")
+                        cur.execute(
+                            f"SELECT DISTINCT jt.k, JSON_TYPE(JSON_EXTRACT(t.{quoted_column}, "
+                            f"CONCAT('{parent_sql}', '.\"', REPLACE(jt.k, '\"', '\"\"'), '\"'))) "
+                            f"FROM {quoted_table} t, JSON_TABLE(JSON_KEYS(t.{quoted_column}, '{parent_sql}'), "
+                            f"'$[*]' COLUMNS (k VARCHAR(190) PATH '$')) jt WHERE t.{quoted_column} IS NOT NULL"
+                        )
+                    else:
+                        keys = "{" + ",".join(parent) + "}"
+                        at_parent = f"t.{quoted_column}::jsonb" + (f" #> '{keys}'" if parent else "")
+                        cur.execute(
+                            f"SELECT DISTINCT k, jsonb_typeof(({at_parent}) -> k) FROM {quoted_table} t, "
+                            f"LATERAL jsonb_object_keys({at_parent}) k WHERE t.{quoted_column} IS NOT NULL "
+                            f"AND jsonb_typeof({at_parent}) = 'object'"
+                        )
+                    seen: dict[tuple[str, ...], set[str]] = {}
+                    for key, json_type in cur.fetchall():
+                        path = (*parent, str(key))
+                        seen.setdefault(path, set()).add(str(json_type or "NULL").upper())
+                    for path, types in seen.items():
+                        nodes.append(JsonNode(path=path, types=frozenset(types)))
+                        if "OBJECT" in types:
+                            next_parents.append(path)
+                parents = next_parents
+                if not parents:
+                    break
+    finally:
+        conn.close()
+    return nodes
 
 
 def build_mysql_insert_columns(
@@ -968,6 +1054,31 @@ class TransferService:
             return True, grouped, ""
         except Exception as exc:  # noqa: BLE001
             return False, {}, str(exc)
+        finally:
+            if endpoint and endpoint.tunnel:
+                self.tunnel_manager.close_tunnel(endpoint.tunnel)
+
+    async def json_paths(
+        self, profile: DBProfile, table: str, column: str, max_depth: int = 4
+    ) -> tuple[bool, list[JsonNode], str]:
+        """Key paths inside a JSON column: (ok, nodes, error).
+
+        A column that does not hold valid JSON is an error for that column, not for
+        the run: the caller reports it and leaves the column alone.
+        """
+        endpoint: ResolvedEndpoint | None = None
+        try:
+            endpoint = self._resolve_profile(profile)
+            host = endpoint.tunnel.local_host if endpoint.tunnel else profile.host
+            port = endpoint.tunnel.local_port if endpoint.tunnel else profile.port
+            password = self.secret_store.get_secret(profile.password_secret_key) or ""
+            nodes = await asyncio.to_thread(
+                _json_paths_sync, host, port, profile.database, profile.username, password,
+                profile.db_type, table, column, max_depth, tls=endpoint.tls,
+            )
+            return True, nodes, ""
+        except Exception as exc:  # noqa: BLE001
+            return False, [], str(exc)
         finally:
             if endpoint and endpoint.tunnel:
                 self.tunnel_manager.close_tunnel(endpoint.tunnel)
