@@ -501,6 +501,12 @@ async def main() -> int:
     check('custom_fields$."email"' in log, f"the log names the path: {log[-200:]}")
     check("array, not followed" in log, "and reports the array it left alone")
 
+    click(button(root, "Preview plan"))
+    await asyncio.sleep(0.2)
+    preview = log_text(root)
+    check('custom_fields$."email"' in preview and "Would anonymize" in preview,
+          f"the preview names the JSON path too: {preview[-200:]}")
+
     print("\n10. Every wired handler is an event its control really has")
     dead = []
     for control in walk([root, page.seen_dialogs]):

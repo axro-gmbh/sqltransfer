@@ -21,6 +21,7 @@ import os
 import re
 import time
 
+import pymysql
 import pytest
 
 from sqltransfer_app.anonymize import Column, JsonNode, Rule, plan_table
@@ -550,20 +551,32 @@ def test_json_paths_are_discovered_level_by_level(databases):
     assert ("positionen", "email") not in found   # arrays are not followed
 
 
-def test_json_discovery_costs_one_query_per_level(databases):
-    # 2000 rows must not mean 2000 queries: the guard is the runtime, measured
-    # against a table that would take minutes row by row.
+def _questions(database: str) -> int:
+    return int(_rows(database, "SHOW SESSION STATUS LIKE 'Questions'")[0][1])
+
+
+def test_json_discovery_costs_a_handful_of_queries_not_one_per_key(databases):
+    # The old shape ran one query per parent path: a document with 30 objects, each
+    # with 6 keys, cost over 200 round trips, every one of them a full column scan.
     service = _service()
     dst = _profile("local", DST_DB)
-    rows = ",".join(f"({i}, '{{\"email\":\"k{i}@axro.de\"}}')" for i in range(1, 2001))
-    _exec(DST_DB, "DROP TABLE IF EXISTS vieljson",
-          "CREATE TABLE vieljson (id INT PRIMARY KEY, custom_fields JSON)",
-          f"INSERT INTO vieljson VALUES {rows}")
-    started = time.monotonic()
-    ok, nodes, message = asyncio.run(service.json_paths(dst, "vieljson", "custom_fields"))
+    document = {f"gruppe{i}": {f"feld{j}": "x" for j in range(6)} for i in range(30)}
+    _exec(DST_DB, "DROP TABLE IF EXISTS breit",
+          "CREATE TABLE breit (id INT PRIMARY KEY, daten JSON)")
+    conn = pymysql.connect(**_conn_args(), database=DST_DB, autocommit=True)
+    try:
+        with conn.cursor() as cur:
+            cur.execute("INSERT INTO breit VALUES (1, %s)", (json.dumps(document),))
+    finally:
+        conn.close()
+
+    before = _questions(DST_DB)
+    ok, nodes, message = asyncio.run(service.json_paths(dst, "breit", "daten"))
+    after = _questions(DST_DB)
     assert ok, message
-    assert [n.path for n in nodes] == [("email",)]
-    assert time.monotonic() - started < 5
+    assert len([n for n in nodes if len(n.path) == 2]) == 180
+    # one validity check, one root type, one for level 1, two batches for level 2
+    assert after - before <= 8, f"{after - before} queries for 30 objects"
 
 
 def test_a_text_column_that_is_not_json_is_refused_cleanly(databases):
@@ -617,3 +630,26 @@ def test_a_text_column_marked_as_json_but_holding_prose_is_reported(databases):
     assert plan.json_columns == (("daten", "longtext"),)
     ok, nodes, message = asyncio.run(service.json_paths(dst, "prosa", "daten"))
     assert not ok and "json" in message.lower()
+
+
+def test_a_column_that_is_one_big_array_is_reported(databases):
+    service = _service()
+    dst = _profile("local", DST_DB)
+    _exec(DST_DB, "DROP TABLE IF EXISTS nurliste",
+          "CREATE TABLE nurliste (id INT PRIMARY KEY, daten JSON)",
+          """INSERT INTO nurliste VALUES (1, '[{"email":"x@axro.de"}]')""")
+    ok, nodes, message = asyncio.run(service.json_paths(dst, "nurliste", "daten"))
+    assert ok, message
+    assert [(n.path, sorted(n.types)) for n in nodes] == [((), ["ARRAY"])]
+
+
+def test_nesting_past_the_limit_is_reported(databases):
+    service = _service()
+    dst = _profile("local", DST_DB)
+    _exec(DST_DB, "DROP TABLE IF EXISTS tief",
+          "CREATE TABLE tief (id INT PRIMARY KEY, daten JSON)",
+          """INSERT INTO tief VALUES (1, '{"a":{"b":{"c":{"d":{"email":"x@axro.de"}}}}}')""")
+    ok, nodes, message = asyncio.run(service.json_paths(dst, "tief", "daten"))
+    assert ok, message
+    deep = [n for n in nodes if "TOO_DEEP" in n.types]
+    assert [n.path for n in deep] == [("a", "b", "c", "d")]

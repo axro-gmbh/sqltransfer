@@ -176,11 +176,17 @@ def _quote_table(table: str, db_type: str) -> str:
     return ".".join(_quote(part.strip('`"'), db_type) for part in table.split("."))
 
 
+# Values never reach the statement text. Both are marked while it is assembled and
+# turned into placeholders, in order, at the end.
+SALT_TOKEN = "{{SALT}}"
+PATH_TOKEN = "{{PATH}}"
+
+
 def _hash(column: str, db_type: str) -> str:
     """A hex digest of salt plus value; the salt arrives as a parameter."""
     if db_type == "mysql":
-        return f"SHA2(CONCAT(%s, {column}), 256)"
-    return f"encode(sha256(convert_to(%s || {column}, 'UTF8')), 'hex')"
+        return f"SHA2(CONCAT({SALT_TOKEN}, {column}), 256)"
+    return f"encode(sha256(convert_to({SALT_TOKEN} || {column}, 'UTF8')), 'hex')"
 
 
 def _number(digest: str, db_type: str, hex_digits: int, modulo: int, offset: int = 1) -> str:
@@ -253,43 +259,71 @@ def _replacement(kind: str, column: str, db_type: str) -> str:
     raise ValueError(f"unknown kind: {kind}")
 
 
-def _mysql_json_path(path: tuple[str, ...]) -> str:
-    return "$" + "".join('."' + key.replace('"', '""') + '"' for key in path)
+def mysql_json_path(path: tuple[str, ...]) -> str:
+    """MySQL takes the path as a string. A quoted path leg is JSON string syntax, so a
+    backslash and a quote are escaped with a backslash, not doubled."""
+    return "$" + "".join('."' + key.replace("\\", "\\\\").replace('"', '\\"') + '"' for key in path)
 
 
-def _json_assignment(column: str, targets: list[JsonTarget], db_type: str) -> str:
-    """One assignment that rewrites every planned path of one column.
+def _json_assignment(column: str, targets: list["JsonTarget"], db_type: str) -> tuple[str, list]:
+    """One assignment rewriting every planned path of one column, plus its parameters.
+
+    Paths are parameters, never text in the statement: they are key names out of
+    customer data, and a quote, a brace or a comma in one of them would otherwise
+    decide how the statement parses.
 
     PostgreSQL only edits jsonb, so a json or text column is cast on the way in and
-    back on the way out; MySQL takes the JSON value straight into a JSON or text
-    column. A path that a row does not have is left alone by both.
+    back on the way out. MySQL takes the JSON value straight into its column.
     """
     quoted = _quote(column, db_type)
+    path_values: list = []
     if db_type == "mysql":
         expression = quoted
         for target in targets:
-            path = _mysql_json_path(target.path).replace("'", "''")
-            current = f"JSON_UNQUOTE(JSON_EXTRACT({quoted}, '{path}'))"
-            expression = f"JSON_REPLACE({expression}, '{path}', {_replacement(target.kind, current, db_type)})"
-        return f"{quoted} = {expression}"
+            path = mysql_json_path(target.path)
+            current = f"JSON_UNQUOTE(JSON_EXTRACT({quoted}, {PATH_TOKEN}))"
+            replacement = _replacement(target.kind, current, db_type)
+            # JSON_REPLACE touches only paths that exist: a row without the key keeps its value.
+            expression = f"JSON_REPLACE({expression}, {PATH_TOKEN}, {replacement})"
+            path_values += [path, path]
+        return f"{quoted} = {expression}", path_values
 
-    # Read through ::jsonb in every case (a no-op for a jsonb column), and cast the
-    # result back to whatever the column is declared as.
     column_type = (targets[0].column_type or "jsonb").lower()
     expression = f"{quoted}::jsonb"
     for target in targets:
-        keys = "{" + ",".join(key.replace("\\", "\\\\").replace(",", "\\,") for key in target.path) + "}"
-        current = f"({quoted}::jsonb #>> '{keys}')"
+        keys = list(target.path)
+        current = f"({quoted}::jsonb #>> {PATH_TOKEN})"
         replacement = _replacement(target.kind, current, db_type)
-        expression = (
-            f"CASE WHEN {quoted}::jsonb #> '{keys}' IS NULL THEN {expression} "
-            f"ELSE jsonb_set({expression}, '{keys}', to_jsonb({replacement})) END"
-        )
+        # create_missing = false does what JSON_REPLACE does on the other side.
+        expression = f"jsonb_set({expression}, {PATH_TOKEN}, to_jsonb({replacement}), false)"
+        path_values += [keys, keys]
     if column_type == "json":
         expression = f"({expression})::json"
     elif column_type != "jsonb":
         expression = f"({expression})::text"
-    return f"{quoted} = {expression}"
+    return f"{quoted} = {expression}", path_values
+
+
+def _bind(sql: str, salt: str, path_values: list) -> tuple[str, list]:
+    """Turn the markers into placeholders, collecting the parameters in their order."""
+    params: list = []
+    paths = iter(path_values)
+    out: list[str] = []
+    rest = sql
+    while rest:
+        salt_at, path_at = rest.find(SALT_TOKEN), rest.find(PATH_TOKEN)
+        if salt_at < 0 and path_at < 0:
+            out.append(rest)
+            break
+        if path_at < 0 or (0 <= salt_at < path_at):
+            out.append(rest[:salt_at] + "%s")
+            params.append(salt)
+            rest = rest[salt_at + len(SALT_TOKEN):]
+        else:
+            out.append(rest[:path_at] + "%s")
+            params.append(next(paths))
+            rest = rest[path_at + len(PATH_TOKEN):]
+    return "".join(out), params
 
 
 def update_statement(plan: TablePlan, db_type: str, salt: str) -> tuple[str, list[str]] | None:
@@ -314,12 +348,14 @@ def update_statement(plan: TablePlan, db_type: str, salt: str) -> tuple[str, lis
     by_column: dict[str, list[JsonTarget]] = {}
     for target in plan.json_targets:
         by_column.setdefault(target.column, []).append(target)
-    assignments += [_json_assignment(column, targets, db_type) for column, targets in by_column.items()]
+    path_values: list = []
+    for column, column_targets in by_column.items():
+        assignment, values = _json_assignment(column, column_targets, db_type)
+        assignments.append(assignment)
+        path_values += values
 
     sql = f"UPDATE {_quote_table(plan.table, db_type)} SET " + ", ".join(assignments)
-    # One salt per placeholder, not per column: a kind like street or fullname
-    # embeds the digest twice and therefore carries two.
-    return sql, [salt] * sql.count("%s")
+    return _bind(sql, salt, path_values)
 
 
 @dataclass(frozen=True, slots=True)
@@ -344,21 +380,39 @@ def json_path_text(column: str, path: tuple[str, ...]) -> str:
 
 
 def plan_json_column(column: str, nodes, rules):
+    """Decide per discovered path: rewrite it, descend into it, or report it.
+
+    Reporting matters as much as rewriting: a path this cannot handle has to show up
+    in the log, or personal data stays behind while the run claims success.
+    """
     targets: list[JsonTarget] = []
     skipped: list[tuple[str, str]] = []
     descend: list[tuple[str, ...]] = []
     for node in nodes:
-        text = json_path_text(column, node.path)
+        text_path = json_path_text(column, node.path)
+        if not node.path:
+            # Discovery reports the root when the value is not an object at all.
+            if "OBJECT" not in node.types:
+                kind = "array" if "ARRAY" in node.types else "value"
+                skipped.append((column, f"the whole value is an {kind}, not searched"))
+            continue
+        if "TOO_DEEP" in node.types:
+            skipped.append((text_path, "nested deeper than four levels, not searched"))
+            continue
+        if "UNREADABLE" in node.types:
+            skipped.append((text_path, "key could not be read"))
+            continue
         if "OBJECT" in node.types:
             descend.append(node.path)
         if "ARRAY" in node.types:
-            skipped.append((text, "array, not followed"))
+            skipped.append((text_path, "array, not followed"))
         rule = match_rule(node.path[-1], rules)
-        if not rule:
+        # "json" marks a column as worth looking into; it is not a replacement.
+        if not rule or rule.kind == "json":
             continue
         if "STRING" in node.types:
             targets.append(JsonTarget(column, node.path, rule.kind))
         elif not ({"OBJECT", "ARRAY"} & node.types):
             other = sorted(t for t in node.types if t != "NULL") or ["NULL"]
-            skipped.append((text, f"not a string value ({other[0]})"))
+            skipped.append((text_path, f"not a string value ({other[0]})"))
     return tuple(targets), tuple(skipped), tuple(descend)

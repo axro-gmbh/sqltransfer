@@ -1192,7 +1192,7 @@ async def main(page: ft.Page) -> None:
         plan = replace(plan, json_targets=tuple(json_targets), skipped=plan.skipped + tuple(json_skipped))
 
         for column, reason in plan.skipped:
-            log.append(f"{label}.{column} looks personal but was not anonymized: {reason}", "WARN")
+            log.append(f"{label}.{column} was not anonymized: {reason}", "WARN")
         if not plan.targets and not plan.json_targets:
             return True
         started = time.monotonic()
@@ -1343,10 +1343,22 @@ async def main(page: ft.Page) -> None:
                     log.append(f"Could not read columns of {table}: {message}", "WARN")
                     continue
                 table_plan = plan_table(table, columns, rules)
-                if table_plan.targets:
-                    log.append(f"Would anonymize {table}: " + ", ".join(c for c, _k, _l in table_plan.targets))
-                for column, reason in table_plan.skipped:
-                    log.append(f"{table}.{column} looks personal but has no rule: {reason}", "WARN")
+                would = [c for c, _k, _l in table_plan.targets]
+                reported = list(table_plan.skipped)
+                # The same look into the JSON columns the run will take, so the
+                # preview does not stay silent about the paths it would rewrite.
+                for column, _column_type in table_plan.json_columns:
+                    ok, nodes, message = await transfer_service.json_paths(src, table, column)
+                    if not ok:
+                        log.append(f"{table}.{column} could not be searched: {message}", "WARN")
+                        continue
+                    found, skipped_paths, _descend = plan_json_column(column, nodes, rules)
+                    would += [json_path_text(t.column, t.path) for t in found]
+                    reported += list(skipped_paths)
+                if would:
+                    log.append(f"Would anonymize {table}: " + ", ".join(would))
+                for column, reason in reported:
+                    log.append(f"{table}.{column} was not anonymized: {reason}", "WARN")
             if len(scoped_tables) > 20:
                 log.append(f"({len(scoped_tables) - 20} further tables not checked in the preview)")
 

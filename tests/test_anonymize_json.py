@@ -54,3 +54,31 @@ def test_nested_paths_keep_their_parents():
     targets, skipped, _d = plan_json_column("custom_fields", nodes, RULES)
     assert targets == (JsonTarget("custom_fields", ("adresse", "ort"), "city"),)
     assert skipped == ()  # "nummer" matches no rule, so its type is nobody's business
+
+
+# --- findings from the branch review ----------------------------------------
+
+
+def test_a_json_rule_never_applies_to_a_key():
+    # The kind that marks a column must not be used as a replacement for a key:
+    # it has no replacement expression and crashed the run.
+    rules = [Rule(id=1, pattern="*fields*", kind="json")]
+    targets, skipped, _descend = plan_json_column("daten", [_node(("extra_fields",), "STRING")], rules)
+    assert targets == ()
+    assert skipped == ()
+
+
+def test_a_root_that_is_not_an_object_is_reported():
+    targets, skipped, _d = plan_json_column("daten", [_node((), "ARRAY")], RULES)
+    assert targets == ()
+    assert skipped == (("daten", "the whole value is an array, not searched"),)
+
+
+def test_a_node_the_discovery_stopped_at_is_reported():
+    _t, skipped, _d = plan_json_column("daten", [_node(("a", "b", "c", "d"), "TOO_DEEP")], RULES)
+    assert skipped == (('daten$."a"."b"."c"."d"', "nested deeper than four levels, not searched"),)
+
+
+def test_a_key_the_database_could_not_return_is_reported():
+    _t, skipped, _d = plan_json_column("daten", [_node(("x", "?"), "UNREADABLE")], RULES)
+    assert skipped == (('daten$."x"."?"', "key could not be read"),)

@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from typing import Any, Literal
 from urllib.parse import quote_plus, urlencode
 
-from .anonymize import Column, JsonNode, TablePlan, update_statement
+from .anonymize import Column, JsonNode, TablePlan, mysql_json_path, update_statement
 from .models import DBProfile, SSHProfile, TransferResult
 from .secrets import SecretStore
 from .storage import Storage
@@ -192,9 +192,11 @@ def _generated_columns_sync(
     return group_generated_columns_by_table(rows)
 
 
-def _mysql_json_path_sql(path: tuple[str, ...]) -> str:
-    """A MySQL JSON path with every key quoted, so dots and spaces in keys are safe."""
-    return "$" + "".join('."' + key.replace('"', '""') + '"' for key in path)
+# Escaping a key for a MySQL JSON path, done by the server so the key never travels
+# through the statement text: backslash first, then the quote, both with a backslash.
+_JSON_LEVEL_BATCH = 25  # parents per discovery statement
+
+_MYSQL_KEY_ESCAPE = r"""REPLACE(REPLACE(jt.k, '\\', '\\\\'), '"', '\\"')"""
 
 
 def _json_paths_sync(
@@ -242,37 +244,71 @@ def _json_paths_sync(
                 if int(cur.fetchone()[0]):
                     raise ValueError(f"{table}.{column} does not hold valid JSON in every row")
 
+            # What the whole value is: an array or a scalar is reported rather than
+            # quietly yielding no keys at all.
+            if db_type == "mysql":
+                cur.execute(
+                    f"SELECT DISTINCT JSON_TYPE({quoted_column}) FROM {quoted_table} "
+                    f"WHERE {quoted_column} IS NOT NULL"
+                )
+            else:
+                cur.execute(
+                    f"SELECT DISTINCT jsonb_typeof({quoted_column}::jsonb) FROM {quoted_table} "
+                    f"WHERE {quoted_column} IS NOT NULL"
+                )
+            root_types = {str(row[0] or "NULL").upper() for row in cur.fetchall()}
+            if root_types and "OBJECT" not in root_types:
+                return [JsonNode(path=(), types=frozenset(root_types))]
+
             parents: list[tuple[str, ...]] = [()]
             for _depth in range(max_depth):
                 next_parents: list[tuple[str, ...]] = []
-                for parent in parents:
-                    if db_type == "mysql":
-                        parent_sql = _mysql_json_path_sql(parent).replace("'", "''")
-                        cur.execute(
-                            f"SELECT DISTINCT jt.k, JSON_TYPE(JSON_EXTRACT(t.{quoted_column}, "
-                            f"CONCAT('{parent_sql}', '.\"', REPLACE(jt.k, '\"', '\"\"'), '\"'))) "
-                            f"FROM {quoted_table} t, JSON_TABLE(JSON_KEYS(t.{quoted_column}, '{parent_sql}'), "
-                            f"'$[*]' COLUMNS (k VARCHAR(190) PATH '$')) jt WHERE t.{quoted_column} IS NOT NULL"
-                        )
-                    else:
-                        keys = "{" + ",".join(parent) + "}"
-                        at_parent = f"t.{quoted_column}::jsonb" + (f" #> '{keys}'" if parent else "")
-                        cur.execute(
-                            f"SELECT DISTINCT k, jsonb_typeof(({at_parent}) -> k) FROM {quoted_table} t, "
-                            f"LATERAL jsonb_object_keys({at_parent}) k WHERE t.{quoted_column} IS NOT NULL "
-                            f"AND jsonb_typeof({at_parent}) = 'object'"
-                        )
-                    seen: dict[tuple[str, ...], set[str]] = {}
-                    for key, json_type in cur.fetchall():
-                        path = (*parent, str(key))
-                        seen.setdefault(path, set()).add(str(json_type or "NULL").upper())
-                    for path, types in seen.items():
-                        nodes.append(JsonNode(path=path, types=frozenset(types)))
-                        if "OBJECT" in types:
-                            next_parents.append(path)
+                seen: dict[tuple[str, ...], set[str]] = {}
+                # One statement per batch of parents rather than per parent: a
+                # document with 40 objects on one level used to cost 40 round trips.
+                for chunk_start in range(0, len(parents), _JSON_LEVEL_BATCH):
+                    chunk = parents[chunk_start:chunk_start + _JSON_LEVEL_BATCH]
+                    branches, args = [], []
+                    for index, parent in enumerate(chunk):
+                        if db_type == "mysql":
+                            branches.append(
+                                f"SELECT DISTINCT {index} AS parent_index, "
+                                f"CAST(jt.k AS CHAR CHARACTER SET utf8mb4) COLLATE utf8mb4_bin AS k, "
+                                f"JSON_TYPE(JSON_EXTRACT(t.{quoted_column}, CONCAT(%s, '.\"', "
+                                f"{_MYSQL_KEY_ESCAPE}, '\"'))) AS t "
+                                f"FROM {quoted_table} t, JSON_TABLE(JSON_KEYS(t.{quoted_column}, %s), "
+                                f"'$[*]' COLUMNS (k VARCHAR(1024) CHARACTER SET utf8mb4 "
+                                f"COLLATE utf8mb4_bin PATH '$')) jt WHERE t.{quoted_column} IS NOT NULL"
+                            )
+                            args += [mysql_json_path(parent), mysql_json_path(parent)]
+                        else:
+                            at_parent = f"t.{quoted_column}::jsonb" + (" #> %s" if parent else "")
+                            branches.append(
+                                f"SELECT DISTINCT {index} AS parent_index, k, "
+                                f"jsonb_typeof(({at_parent}) -> k) AS t "
+                                f"FROM {quoted_table} t, LATERAL jsonb_object_keys({at_parent}) k "
+                                f"WHERE t.{quoted_column} IS NOT NULL "
+                                f"AND jsonb_typeof({at_parent}) = 'object'"
+                            )
+                            args += [list(parent)] * (3 if parent else 0)
+                    cur.execute(" UNION ALL ".join(branches), args)
+                    for parent_index, key, json_type in cur.fetchall():
+                        parent = chunk[int(parent_index)]
+                        if key is None:
+                            seen.setdefault((*parent, "?"), set()).add("UNREADABLE")
+                            continue
+                        seen.setdefault((*parent, str(key)), set()).add(str(json_type or "NULL").upper())
+
+                for path, types in seen.items():
+                    nodes.append(JsonNode(path=path, types=frozenset(types)))
+                    if "OBJECT" in types:
+                        next_parents.append(path)
                 parents = next_parents
                 if not parents:
                     break
+            # Whatever is still waiting here sits deeper than max_depth.
+            for parent in parents:
+                nodes.append(JsonNode(path=parent, types=frozenset({"TOO_DEEP"})))
     finally:
         conn.close()
     return nodes
