@@ -161,6 +161,12 @@ def _run_table_like_the_app(table: str) -> None:
             dst, target_table=temp, clauses=source_indexes.get(table, {})
         )
         assert ok and not failed, message or failed
+        # The definition comes after the indexes and before the swap, as in the app.
+        ok, definitions, message = await service.source_table_definitions(src, [table])
+        assert ok, message
+        if definitions.get(table):
+            ok, message = await service.apply_definition_clauses(dst, temp, definitions[table])
+            assert ok, message
         swapped, message = await service.mysql_swap_temp_to_final(dst, temp_table=temp, final_table=table)
         assert swapped, message
         # Foreign keys come last, once the outgoing table and its key names are gone.
@@ -678,3 +684,35 @@ def test_table_definitions_are_read_for_every_table_in_scope(databases):
     assert "GENERATED ALWAYS AS" in joined and "SET DEFAULT" in joined
     assert "AUTO_INCREMENT" in joined and "CHECK" in joined
     assert joined.index("GENERATED") < joined.index("AUTO_INCREMENT") < joined.index("CHECK")
+
+
+def _normalised_ddl(database: str, table: str) -> str:
+    ddl = _rows(database, f"SHOW CREATE TABLE {table}")[0][1]
+    ddl = re.sub(r"AUTO_INCREMENT=\d+", "AUTO_INCREMENT=N", ddl)
+    return re.sub(r"CONSTRAINT `[^`]+` CHECK", "CONSTRAINT `chk` CHECK", ddl)
+
+
+def test_the_copy_carries_the_source_definition(databases):
+    _exec(SRC_DB, "DROP TABLE IF EXISTS voll",
+          """CREATE TABLE voll (
+               id INT PRIMARY KEY,
+               lauf BIGINT UNSIGNED NOT NULL AUTO_INCREMENT UNIQUE,
+               zeit DATETIME NOT NULL,
+               tag DATE AS (CAST(zeit AS DATE)) STORED,
+               betrag DECIMAL(10,2) DEFAULT 1.00,
+               geprueft INT CHECK (geprueft > 0),
+               KEY idx_tag (tag, betrag))""",
+          "INSERT INTO voll (id, zeit, geprueft) VALUES (1,'2026-01-01 10:00:00',3)")
+    _exec(DST_DB, "DROP TABLE IF EXISTS voll")
+
+    _run_table_like_the_app("voll")
+
+    assert _normalised_ddl(DST_DB, "voll") == _normalised_ddl(SRC_DB, "voll")
+
+    # and it behaves like the original
+    _exec(DST_DB, "INSERT INTO voll (id, zeit, geprueft) VALUES (2,'2026-02-02 11:00:00',5)")
+    row = _rows(DST_DB, "SELECT tag, betrag FROM voll WHERE id = 2")[0]
+    assert str(row[0]) == "2026-02-02", "the generated column must recompute"
+    assert float(row[1]) == 1.00, "the default must apply"
+    with pytest.raises(Exception):
+        _exec(DST_DB, "INSERT INTO voll (id, zeit, geprueft) VALUES (3,'2026-03-03 12:00:00',0)")
