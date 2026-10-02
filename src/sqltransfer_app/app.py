@@ -123,24 +123,37 @@ async def main(page: ft.Page) -> None:
 
     def confirm(title: str, message: str, confirm_label: str, on_confirm) -> None:
         def close(_: object = None) -> None:
-            page.pop_dialog()
+            dismiss(question)
 
         def accept(_: object = None) -> None:
-            page.pop_dialog()
+            dismiss(question)
             on_confirm()
 
-        page.show_dialog(
-            ft.AlertDialog(
-                modal=True,
-                title=ft.Text(title),
-                content=ft.Text(message),
-                actions=[
-                    ft.TextButton("Cancel", on_click=close),
-                    ft.FilledButton(confirm_label, on_click=accept),
-                ],
-                actions_alignment=ft.MainAxisAlignment.END,
-            )
+        question = ft.AlertDialog(
+            modal=True,
+            title=ft.Row(
+                [ft.Icon(ft.Icons.WARNING_AMBER_ROUNDED, color=ft.Colors.ERROR), ft.Text(title)],
+                spacing=8,
+            ),
+            content=ft.Column(
+                [ft.Text(line, size=13) for line in lines],
+                spacing=6,
+                tight=True,
+                width=460,
+            ),
+            actions=[
+                ft.TextButton("Cancel", on_click=lambda _: settle(False)),
+                ft.FilledButton(
+                    confirm_label,
+                    icon=ft.Icons.WARNING_AMBER_ROUNDED,
+                    style=ft.ButtonStyle(bgcolor=ft.Colors.ERROR, color=ft.Colors.ON_ERROR),
+                    on_click=lambda _: settle(True),
+                ),
+            ],
+            actions_alignment=ft.MainAxisAlignment.END,
+            on_dismiss=lambda _: settle(False),
         )
+        page.show_dialog(question)
 
     async def copy_text_task(text: str) -> None:
         # Clipboard().set is a coroutine; without await nothing reaches the clipboard.
@@ -158,6 +171,24 @@ async def main(page: ft.Page) -> None:
         page.run_task(copy_text_task, text)
 
     log = ui.LogPanel(on_copy=copy_to_clipboard, height=280)
+
+    # The dialog this session opened last. Flet keeps snack bars and alert dialogs
+    # on one stack and pop_dialog() closes the topmost open one, so a message that
+    # appeared over the dialog (a connection test, say) would swallow the close and
+    # leave the form standing.
+    open_dialogs: dict[str, ft.AlertDialog | None] = {"current": None}
+
+    def show_form_dialog(dialog: ft.AlertDialog) -> None:
+        open_dialogs["current"] = dialog
+        page.show_dialog(dialog)
+
+    def dismiss(dialog: ft.AlertDialog | None) -> None:
+        if dialog is None or not getattr(dialog, "open", False):
+            return
+        dialog.open = False
+        page.update()  # the dialog itself may not be mounted yet in a test harness
+        if open_dialogs.get("current") is dialog:
+            open_dialogs["current"] = None
 
     # ------------------------------------------------------------------ controls
 
@@ -393,7 +424,11 @@ async def main(page: ft.Page) -> None:
 
     def refresh_ssh_options() -> None:
         profiles = storage.list_ssh_profiles()
-        db_ssh_profile.options = [ft.dropdown.Option(str(p.id), p.name) for p in profiles]
+        # The empty entry is what makes a pick undoable: a Flet dropdown has no
+        # other way back to "nothing selected".
+        db_ssh_profile.options = [ft.dropdown.Option("", "No tunnel")] + [
+            ft.dropdown.Option(str(p.id), p.name) for p in profiles
+        ]
         shown = filter_ssh_profiles(profiles, ssh_search.value)
         ssh_rows.height = _list_height(len(shown), 4, 56)
         ssh_rows.controls = [
@@ -496,13 +531,14 @@ async def main(page: ft.Page) -> None:
         rule_pattern.value = rule.pattern if rule else ""
         rule_kind.value = rule.kind if rule else KINDS[0][0]
         rule_enabled.value = rule.enabled if rule else True
-        page.show_dialog(build_rule_dialog())
+        show_form_dialog(build_rule_dialog())
         page.update()
 
     def save_rule(_: object) -> None:
         if not require((rule_pattern, "column pattern")):
             return
         try:
+            saved_dialog = open_dialogs.get("current")
             storage.save_anonymization_rule(
                 Rule(
                     id=rule_form_state["id"],
@@ -511,7 +547,7 @@ async def main(page: ft.Page) -> None:
                     enabled=bool(rule_enabled.value),
                 )
             )
-            page.pop_dialog()
+            dismiss(saved_dialog)
             refresh_rules()
             notify_ok(f"Saved rule '{rule_pattern.value.strip()}'")
             page.update()
@@ -521,7 +557,7 @@ async def main(page: ft.Page) -> None:
             page.update()
         except ProfileGone:
             notify_error("That rule was deleted meanwhile")
-            page.pop_dialog()
+            dismiss(open_dialogs.get("current"))
             refresh_rules()
             page.update()
         except Exception as exc:  # noqa: BLE001
@@ -635,6 +671,17 @@ async def main(page: ft.Page) -> None:
             return False
         return True
 
+    def sync_tunnel_fields() -> None:
+        """The SSH pick follows the checkbox: no tunnel, no profile, and no leftover."""
+        if not db_use_ssh.value:
+            db_ssh_profile.value = ""
+            db_ssh_profile.error_text = None
+        db_ssh_profile.disabled = not db_use_ssh.value
+
+    def on_tunnel_toggle(_: object) -> None:
+        sync_tunnel_fields()
+        page.update()
+
     def open_ssh_dialog(profile_id: int | None = None) -> None:
         profile = storage.get_ssh_profile(profile_id) if profile_id else None
         if profile_id and profile is None:
@@ -652,7 +699,7 @@ async def main(page: ft.Page) -> None:
         ssh_key.value = profile.private_key_path if profile else ""
         ssh_passphrase.value = ""
         ssh_passphrase.helper = "Leave empty to keep the stored one" if profile else "Only for an encrypted key"
-        page.show_dialog(build_ssh_dialog())
+        show_form_dialog(build_ssh_dialog())
         page.update()
 
     def ask_delete_ssh(profile_id: int, name: str) -> None:
@@ -693,11 +740,12 @@ async def main(page: ft.Page) -> None:
         db_password.value = ""
         db_password.helper = "Leave empty to keep the stored one" if profile else "Stored in the macOS Keychain"
         db_use_ssh.value = bool(profile.use_ssh) if profile else False
-        db_ssh_profile.value = str(profile.ssh_profile_id) if (profile and profile.ssh_profile_id) else None
+        db_ssh_profile.value = str(profile.ssh_profile_id) if (profile and profile.ssh_profile_id) else ""
+        sync_tunnel_fields()
         db_tls_mode.value = (profile.tls_mode or "auto") if profile else "auto"
         db_tls_ca.value = (profile.tls_ca_path or "") if profile else ""
         db_tls_ca.error = None
-        page.show_dialog(build_db_dialog())
+        show_form_dialog(build_db_dialog())
         page.update()
 
     def ask_delete_db(profile_id: int, name: str) -> None:
@@ -728,6 +776,7 @@ async def main(page: ft.Page) -> None:
                 passphrase_key = passphrase_key or _new_secret_key("ssh", profile_name, "passphrase")
                 secrets.set_secret(passphrase_key, ssh_passphrase.value)
 
+            saved_dialog = open_dialogs.get("current")
             storage.save_ssh_profile(
                 SSHProfile(
                     id=ssh_form_state["id"],
@@ -739,7 +788,7 @@ async def main(page: ft.Page) -> None:
                     passphrase_secret_key=passphrase_key,
                 )
             )
-            page.pop_dialog()
+            dismiss(saved_dialog)
             refresh_ssh_options()
             refresh_db_options()
             notify_ok(f"Saved SSH profile '{profile_name}'")
@@ -750,7 +799,7 @@ async def main(page: ft.Page) -> None:
             page.update()
         except ProfileGone:
             notify_error("That SSH profile was deleted meanwhile")
-            page.pop_dialog()
+            dismiss(open_dialogs.get("current"))
             refresh_ssh_options()
             page.update()
         except Exception as exc:  # noqa: BLE001
@@ -775,6 +824,7 @@ async def main(page: ft.Page) -> None:
                 password_secret_key = password_secret_key or _new_secret_key("db", profile_name, "password")
                 secrets.set_secret(password_secret_key, db_password.value)
 
+            saved_dialog = open_dialogs.get("current")
             storage.save_db_profile(
                 DBProfile(
                     id=db_form_state["id"],
@@ -791,7 +841,7 @@ async def main(page: ft.Page) -> None:
                     tls_ca_path=form_ca_path(),
                 )
             )
-            page.pop_dialog()
+            dismiss(saved_dialog)
             refresh_db_options()
             notify_ok(f"Saved database profile '{profile_name}'")
             page.update()
@@ -801,7 +851,7 @@ async def main(page: ft.Page) -> None:
             page.update()
         except ProfileGone:
             notify_error("That database profile was deleted meanwhile")
-            page.pop_dialog()
+            dismiss(open_dialogs.get("current"))
             refresh_db_options()
             page.update()
         except Exception as exc:  # noqa: BLE001
@@ -1144,12 +1194,11 @@ async def main(page: ft.Page) -> None:
         answer: asyncio.Future[bool] = asyncio.get_running_loop().create_future()
 
         def settle(value: bool) -> None:
-            page.pop_dialog()
+            dismiss(question)
             if not answer.done():
                 answer.set_result(value)
 
-        page.show_dialog(
-            ft.AlertDialog(
+        question = ft.AlertDialog(
                 modal=True,
                 title=ft.Row(
                     [ft.Icon(ft.Icons.WARNING_AMBER_ROUNDED, color=ft.Colors.ERROR), ft.Text(title)],
@@ -1170,10 +1219,10 @@ async def main(page: ft.Page) -> None:
                         on_click=lambda _: settle(True),
                     ),
                 ],
-                actions_alignment=ft.MainAxisAlignment.END,
-                on_dismiss=lambda _: settle(False),
-            )
+            actions_alignment=ft.MainAxisAlignment.END,
+            on_dismiss=lambda _: settle(False),
         )
+        page.show_dialog(question)
         page.update()
         return await answer
 
@@ -1356,6 +1405,24 @@ async def main(page: ft.Page) -> None:
 
                 # apitap creates tables with columns and primary key only; the other
                 # indexes come from the source, read once for the whole run.
+                # A created or swapped table keeps the values of a generated column
+                # but loses the expression behind them, so it never recomputes.
+                gen_ok, source_generated, gen_msg = await transfer_service.source_generated_columns(
+                    src, scoped_tables
+                )
+                if not gen_ok:
+                    log.append(f"Could not read the generated columns of the source: {gen_msg}", "WARN")
+                    source_generated = {}
+
+                def warn_generated(table: str) -> None:
+                    columns = source_generated.get(table, [])
+                    if columns:
+                        log.append(
+                            f"{table}: {', '.join(columns)} are generated in the source. The copy keeps the "
+                            "values from this transfer and will not recompute them.",
+                            "WARN",
+                        )
+
                 source_indexes: dict[str, dict[str, str]] = {}
                 if src.db_type == "mysql":
                     idx_ok, source_indexes, idx_msg = await transfer_service.mysql_source_index_clauses(
@@ -1484,6 +1551,7 @@ async def main(page: ft.Page) -> None:
                                 return
                             log.append(f"Swapped {temp_name} into {final_name}")
                             notes.append(f"swapped={final_name}")
+                            warn_generated(final_name)
                     else:
                         final_exists, final_err = await transfer_service.mysql_table_exists(dst, final_name)
                         if final_err:
@@ -1624,17 +1692,35 @@ async def main(page: ft.Page) -> None:
                         "already be in the destination and are NOT anonymized",
                         "ERROR",
                     )
-                if result.status == "success" and anonymize_switch.value:
+                if result.status == "success":
                     scope_ok, scoped_tables, scoped_msg = await _scope_tables_for_check(src, mode, scope)
                     if not scope_ok:
-                        fail(f"Transfer done, but the tables to anonymize could not be listed: {scoped_msg}")
+                        fail(f"Transfer done, but the tables could not be listed: {scoped_msg}")
                         return
-                    set_progress(label="Anonymizing")
-                    page.update()
+
+                    # apitap writes the destination table itself here, so a generated
+                    # column arrives as a plain one: right now, but never recomputed.
+                    gen_ok, source_generated, gen_msg = await transfer_service.source_generated_columns(
+                        src, scoped_tables
+                    )
+                    if not gen_ok:
+                        log.append(f"Could not read the generated columns of the source: {gen_msg}", "WARN")
                     for table in scoped_tables:
-                        if not await anonymize_step(dst, table, table):
-                            fail(f"Anonymization failed for {table}; its data in the destination is still real")
-                            return
+                        columns = source_generated.get(table) or source_generated.get(table.rpartition(".")[2])
+                        if columns:
+                            log.append(
+                                f"{table}: {', '.join(columns)} are generated in the source. The copy keeps "
+                                "the values from this transfer and will not recompute them.",
+                                "WARN",
+                            )
+
+                    if anonymize_switch.value:
+                        set_progress(label="Anonymizing")
+                        page.update()
+                        for table in scoped_tables:
+                            if not await anonymize_step(dst, table, table):
+                                fail(f"Anonymization failed for {table}; its data in the destination is still real")
+                                return
 
             store_run(result)
             log.append(f"Summary: {result.message}", "INFO" if result.status != "failed" else "ERROR")
@@ -1681,6 +1767,7 @@ async def main(page: ft.Page) -> None:
     db_save_button.on_click = save_db_profile
     ssh_new_button.on_click = lambda _: open_ssh_dialog(None)
     rules_new_button.on_click = lambda _: open_rule_dialog(None)
+    db_use_ssh.on_change = on_tunnel_toggle
     rule_save_button.on_click = save_rule
     db_new_button.on_click = lambda _: open_db_dialog(None)
 
@@ -1774,7 +1861,7 @@ async def main(page: ft.Page) -> None:
     )
 
     def close_dialog(_: object = None) -> None:
-        page.pop_dialog()
+        dismiss(open_dialogs.get("current"))
         page.update()
 
     def dialog(title: ft.Text, body: list[ft.Control], save_button: ft.Control) -> ft.AlertDialog:

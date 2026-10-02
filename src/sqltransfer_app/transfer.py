@@ -143,9 +143,80 @@ def _report_failure_text(report: object) -> str | None:
     return None
 
 
+def group_generated_columns_by_table(rows: list[tuple[str, str]]) -> dict[str, list[str]]:
+    """(table, column) rows into {table: [column, ...]}, order preserved."""
+    grouped: dict[str, list[str]] = {}
+    for table, column in rows:
+        grouped.setdefault(str(table), []).append(str(column))
+    return grouped
+
+
+_GENERATED_COLUMNS_SQL = {
+    "mysql": (
+        "SELECT table_name, column_name FROM information_schema.columns "
+        "WHERE table_schema = %s AND extra LIKE '%%GENERATED%%' ORDER BY table_name, ordinal_position"
+    ),
+    "postgres": (
+        "SELECT table_name, column_name FROM information_schema.columns "
+        "WHERE table_schema = %s AND is_generated = 'ALWAYS' ORDER BY table_name, ordinal_position"
+    ),
+}
+
+
+def _generated_columns_sync(
+    host: str,
+    port: int,
+    database: str,
+    username: str,
+    password: str,
+    db_type: str,
+    schemas: list[str],
+    *,
+    tls: TlsSettings,
+) -> dict[str, list[str]]:
+    """Every generated column of the given schemas, in one round trip."""
+    rows: list[tuple[str, str]] = []
+    if db_type == "mysql":
+        conn = _mysql_connect(tls, host=host, port=port, user=username, password=password,
+                              database=database, connect_timeout=5, autocommit=True)
+    else:
+        conn = _pg_connect(tls, host=host, port=port, user=username, password=password,
+                           dbname=database, connect_timeout=5, autocommit=True)
+    try:
+        with conn.cursor() as cur:
+            for schema in schemas:
+                cur.execute(_GENERATED_COLUMNS_SQL[db_type], (schema,))
+                rows.extend((str(r[0]), str(r[1])) for r in cur.fetchall())
+    finally:
+        conn.close()
+    return group_generated_columns_by_table(rows)
+
+
+def build_mysql_insert_columns(
+    final_columns: list[tuple[str, bool]], temp_columns: list[str]
+) -> list[str]:
+    """Which columns an INSERT .. SELECT may carry: (name, is generated) for the
+    destination, plain names for the temp table.
+
+    MySQL refuses a value for a generated column (error 3105), and "SELECT *"
+    supplies one for every column the temp table has, so a Shopware order table
+    with its generated order_date could never be replaced in place.
+    """
+    available = {name.lower() for name in temp_columns}
+    usable = [name for name, generated in final_columns if not generated and name.lower() in available]
+    if not usable:
+        raise ValueError("no columns to copy: every column is generated or missing in the temp table")
+    return usable
+
+
 _COLUMNS_SQL = (
-    "SELECT column_name, data_type, character_maximum_length FROM information_schema.columns "
-    "WHERE table_schema = %s AND table_name = %s ORDER BY ordinal_position"
+    "SELECT column_name, data_type, character_maximum_length, extra, is_generated "
+    "FROM information_schema.columns WHERE table_schema = %s AND table_name = %s ORDER BY ordinal_position"
+)
+
+_MYSQL_COLUMNS_SQL = (
+    "SELECT column_name, data_type, character_maximum_length, extra "
+    "FROM information_schema.columns WHERE table_schema = %s AND table_name = %s ORDER BY ordinal_position"
 )
 
 
@@ -168,9 +239,19 @@ def _table_columns_sync(
                            dbname=database, connect_timeout=5, autocommit=True)
     try:
         with conn.cursor() as cur:
-            cur.execute(_COLUMNS_SQL, (schema, name))
-            columns = [Column(str(row[0]), str(row[1]), int(row[2]) if row[2] is not None else None)
-                       for row in cur.fetchall()]
+            # MySQL marks a generated column in `extra`, PostgreSQL in `is_generated`.
+            cur.execute(_MYSQL_COLUMNS_SQL if db_type == "mysql" else _COLUMNS_SQL, (schema, name))
+            columns = [
+                Column(
+                    str(row[0]),
+                    str(row[1]),
+                    int(row[2]) if row[2] is not None else None,
+                    generated=("GENERATED" in str(row[3] or "").upper())
+                    if db_type == "mysql"
+                    else str(row[4] or "").upper() == "ALWAYS",
+                )
+                for row in cur.fetchall()
+            ]
         if not columns:
             # Empty means "this table is not visible from here", never "it has no
             # columns". Treating it as nothing to do let a run report success while
@@ -864,6 +945,33 @@ class TransferService:
                 self.tunnel_manager.close_tunnel(endpoint.tunnel)
 
 
+    async def source_generated_columns(
+        self, source: DBProfile, tables: list[str]
+    ) -> tuple[bool, dict[str, list[str]], str]:
+        """Which source columns the database computes, for every table in scope.
+
+        A table apitap creates or that gets swapped in keeps the values but loses
+        the expression behind them, so the copy never recomputes. One round trip
+        for the whole run, like the index read.
+        """
+        schemas = sorted({table.rpartition(".")[0].strip("`\"") or source.database for table in tables})
+        endpoint: ResolvedEndpoint | None = None
+        try:
+            endpoint = self._resolve_profile(source)
+            host = endpoint.tunnel.local_host if endpoint.tunnel else source.host
+            port = endpoint.tunnel.local_port if endpoint.tunnel else source.port
+            password = self.secret_store.get_secret(source.password_secret_key) or ""
+            grouped = await asyncio.to_thread(
+                _generated_columns_sync, host, port, source.database, source.username, password,
+                source.db_type, schemas, tls=endpoint.tls,
+            )
+            return True, grouped, ""
+        except Exception as exc:  # noqa: BLE001
+            return False, {}, str(exc)
+        finally:
+            if endpoint and endpoint.tunnel:
+                self.tunnel_manager.close_tunnel(endpoint.tunnel)
+
     async def table_columns(self, profile: DBProfile, table: str) -> tuple[bool, list[Column], str]:
         """Column names and types of one destination table: (ok, columns, error)."""
         endpoint: ResolvedEndpoint | None = None
@@ -1476,9 +1584,24 @@ def _mysql_replace_final_from_temp_sync(
                 cur.execute("SET SESSION net_read_timeout=600")
                 cur.execute("SET SESSION net_write_timeout=600")
                 cur.execute("SET FOREIGN_KEY_CHECKS=0")
+                cur.execute(
+                    "SELECT column_name, extra FROM information_schema.columns "
+                    "WHERE table_schema = DATABASE() AND table_name = %s ORDER BY ordinal_position",
+                    (final_table,),
+                )
+                final_columns = [(str(r[0]), "GENERATED" in str(r[1] or "").upper()) for r in cur.fetchall()]
+                cur.execute(
+                    "SELECT column_name FROM information_schema.columns "
+                    "WHERE table_schema = DATABASE() AND table_name = %s",
+                    (temp_table,),
+                )
+                temp_columns = [str(r[0]) for r in cur.fetchall()]
+                names = build_mysql_insert_columns(final_columns, temp_columns)
+                column_list = ", ".join(_quote_mysql_ident(name) for name in names)
                 cur.execute(f"DELETE FROM {_quote_mysql_ident(final_table)}")
                 cur.execute(
-                    f"INSERT INTO {_quote_mysql_ident(final_table)} SELECT * FROM {_quote_mysql_ident(temp_table)}"
+                    f"INSERT INTO {_quote_mysql_ident(final_table)} ({column_list}) "
+                    f"SELECT {column_list} FROM {_quote_mysql_ident(temp_table)}"
                 )
                 cur.execute(f"DROP TABLE {_quote_mysql_ident(temp_table)}")
                 cur.execute("SET FOREIGN_KEY_CHECKS=1")

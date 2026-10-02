@@ -80,6 +80,7 @@ class Column:
     name: str
     data_type: str
     max_length: int | None = None  # characters, as information_schema reports it
+    generated: bool = False  # computed by the database; it refuses an UPDATE on one
 
 
 @dataclass(frozen=True, slots=True)
@@ -129,7 +130,11 @@ def plan_table(table: str, columns: Sequence[Column], rules: Sequence[Rule]) -> 
     for column in columns:
         rule = match_rule(column.name, rules)
         data_type = column.data_type.lower()
-        if rule and data_type in TEXT_TYPES:
+        if rule and column.generated:
+            # Shopware's order.tax_status is one of these: the database computes it,
+            # and an UPDATE on it fails with "not allowed".
+            skipped.append((column.name, "generated column, the database computes it"))
+        elif rule and data_type in TEXT_TYPES:
             targets.append((column.name, rule.kind, column.max_length))
         elif rule:
             skipped.append((column.name, f"not a text column ({data_type})"))

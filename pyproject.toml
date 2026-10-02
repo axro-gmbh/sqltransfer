@@ -1,6 +1,6 @@
 [project]
 name = "sqltransfer"
-version = "1.3.0"
+version = "1.3.1"
 description = "Flet desktop app for transferring SQL data with optional SSH tunneling"
 readme = "README.md"
 license = {text = "Apache-2.0"}
@@ -27,7 +27,7 @@ org = "de.axro"
 bundle_id = "de.axro.sqltransfer"
 # CFBundleVersion. Sparkle compares this, not the version string: raise it with
 # every release, never reuse one.
-build_number = 5
+build_number = 6
 
 # Sparkle auto-updates. The updater itself is set up in Swift by
 # scripts/patch_macos_runner.py, which also puts "Check for Updates…" into the
