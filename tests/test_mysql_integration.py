@@ -16,6 +16,7 @@ so never point it at a server whose data matters.
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import re
 import time
@@ -365,10 +366,23 @@ def _rows(database: str, sql: str) -> list[tuple]:
 
 
 def _anonymize(dst, table: str, rules: list[Rule]) -> tuple[bool, int, str]:
+    """The three steps the app takes: read the columns, look into the JSON ones, rewrite."""
+    from dataclasses import replace as _replace
+
+    from sqltransfer_app.anonymize import plan_json_column
+
     service = _service()
     ok, columns, message = asyncio.run(service.table_columns(dst, table))
     assert ok, message
-    return asyncio.run(service.anonymize_table(dst, plan_table(table, columns, rules)))
+    plan = plan_table(table, columns, rules)
+    json_targets = []
+    for column, column_type in plan.json_columns:
+        ok, nodes, message = asyncio.run(service.json_paths(dst, table, column))
+        if not ok:
+            continue
+        found, _skipped, _descend = plan_json_column(column, nodes, rules)
+        json_targets += [_replace(t, column_type=column_type) for t in found]
+    return asyncio.run(service.anonymize_table(dst, _replace(plan, json_targets=tuple(json_targets))))
 
 
 def test_anonymizing_replaces_only_the_matched_columns(databases):
@@ -561,3 +575,45 @@ def test_a_text_column_that_is_not_json_is_refused_cleanly(databases):
     ok, nodes, message = asyncio.run(service.json_paths(dst, "keinjson", "notiz"))
     assert not ok and not nodes
     assert "json" in message.lower()
+
+
+def test_values_inside_json_are_replaced_and_the_structure_survives(databases):
+    dst = _profile("local", DST_DB)
+    _exec(DST_DB, "DROP TABLE IF EXISTS jsonkunde",
+          "CREATE TABLE jsonkunde (id INT PRIMARY KEY, email VARCHAR(190), custom_fields JSON,"
+          " daten LONGTEXT)",
+          """INSERT INTO jsonkunde VALUES
+             (1,'max@axro.de','{"email":"max@axro.de","adresse":{"ort":"Hamburg"},"umsatz":42,
+                                "positionen":[{"email":"x@y.de"}]}','{"email":"max@axro.de"}'),
+             (2,'erika@axro.de','{"notiz":"ohne mail"}','{}'),
+             (3,'leer@axro.de', NULL, NULL)""")
+
+    rules = [Rule(id=1, pattern="*mail*", kind="email"), Rule(id=2, pattern="ort", kind="city"),
+             Rule(id=3, pattern="daten", kind="json")]
+    ok, affected, message = _anonymize(dst, "jsonkunde", rules)
+    assert ok, message
+
+    rows = _rows(DST_DB, "SELECT id, email, custom_fields, daten FROM jsonkunde ORDER BY id")
+    first = json.loads(rows[0][2])
+    assert first["email"].endswith("@example.invalid")
+    assert first["email"] == rows[0][1]              # same original, same fake, column and JSON
+    assert first["umsatz"] == 42                     # untouched sibling
+    assert first["adresse"]["ort"] != "Hamburg"      # nested replaced
+    assert first["positionen"] == [{"email": "x@y.de"}]  # arrays stay, and are reported
+    assert json.loads(rows[0][3])["email"] == first["email"]  # the longtext column too
+    assert json.loads(rows[1][2]) == {"notiz": "ohne mail"}
+    assert rows[2][2] is None and rows[2][3] is None
+    assert "max@axro.de" not in str(rows) and "Hamburg" not in str(rows)
+
+
+def test_a_text_column_marked_as_json_but_holding_prose_is_reported(databases):
+    dst = _profile("local", DST_DB)
+    _exec(DST_DB, "DROP TABLE IF EXISTS prosa",
+          "CREATE TABLE prosa (id INT PRIMARY KEY, daten LONGTEXT)",
+          "INSERT INTO prosa VALUES (1, 'kein json, nur text')")
+    service = _service()
+    ok, columns, _ = asyncio.run(service.table_columns(dst, "prosa"))
+    plan = plan_table("prosa", columns, [Rule(id=1, pattern="daten", kind="json")])
+    assert plan.json_columns == (("daten", "longtext"),)
+    ok, nodes, message = asyncio.run(service.json_paths(dst, "prosa", "daten"))
+    assert not ok and "json" in message.lower()

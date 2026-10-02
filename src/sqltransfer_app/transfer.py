@@ -295,8 +295,9 @@ def build_mysql_insert_columns(
     return usable
 
 
+# PostgreSQL has no `extra` column; MySQL has no `is_generated`.
 _COLUMNS_SQL = (
-    "SELECT column_name, data_type, character_maximum_length, extra, is_generated "
+    "SELECT column_name, data_type, character_maximum_length, is_generated "
     "FROM information_schema.columns WHERE table_schema = %s AND table_name = %s ORDER BY ordinal_position"
 )
 
@@ -332,9 +333,10 @@ def _table_columns_sync(
                     str(row[0]),
                     str(row[1]),
                     int(row[2]) if row[2] is not None else None,
+                    # MySQL puts it in `extra`, PostgreSQL in `is_generated`; both land in row[3].
                     generated=("GENERATED" in str(row[3] or "").upper())
                     if db_type == "mysql"
-                    else str(row[4] or "").upper() == "ALWAYS",
+                    else str(row[3] or "").upper() == "ALWAYS",
                 )
                 for row in cur.fetchall()
             ]
