@@ -25,7 +25,8 @@ A user guide is in [docs/user-guide.md](docs/user-guide.md), and in German in
   colour-coded, auto-scrolling log
 - MySQL and PostgreSQL as source and destination
 - MySQL to MySQL keeps the source's secondary indexes (unique, fulltext, prefix, functional) and
-  foreign keys, including their `ON DELETE` / `ON UPDATE` rules
+  foreign keys, including their `ON DELETE` / `ON UPDATE` rules, and restores generated columns,
+  defaults, check constraints and `AUTO_INCREMENT` after the swap
 - Per-profile encryption: Automatic, Off, Encrypted (certificate not checked), Encrypted and
   verified; a custom CA for PostgreSQL
 - SSH host keys are checked against `~/.ssh/known_hosts`; a changed key stops the connection

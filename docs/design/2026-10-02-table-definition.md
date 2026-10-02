@@ -1,6 +1,7 @@
 # Design: restoring the table definition
 
-Status: draft, not implemented. Written 02.10.2026.
+Status: implemented in 1.5.0. Written 02.10.2026.
+Implementation plan: [2026-10-02-table-definition-plan.md](2026-10-02-table-definition-plan.md).
 
 A destination table the app creates or swaps in keeps the data and the primary key,
 and the app already restores the secondary indexes and the foreign keys. What it does

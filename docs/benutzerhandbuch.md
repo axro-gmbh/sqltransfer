@@ -170,7 +170,11 @@ Rechts stehen die letzten 20 Läufe mit Status, Quelle, Ziel, Umfang, Zeilenzahl
 
 **Die Zieltabelle wird ersetzt, nicht ergänzt.** Eine Übertragung überschreibt die Tabelle im Ziel. Sie hängt keine Zeilen an und gleicht nichts ab. Deshalb gilt: Ziel ist deine lokale Entwicklungsdatenbank, niemals etwas, dessen Inhalt jemand braucht.
 
-**Berechnete Spalten überleben den Tausch nicht.** Legt die App eine Tabelle neu an oder tauscht sie aus, bekommt die Kopie das Schema, das apitap erzeugt: Spalten und Primärschlüssel, dazu die Indizes und Fremdschlüssel der Quelle. Eine generierte Spalte (`order_date date AS (cast(order_date_time as date)) stored`) wird dabei zu einer gewöhnlichen Spalte. Die Werte stimmen im Moment der Übertragung, werden aber nie neu berechnet: Änderst du lokal `order_date_time`, bleibt `order_date` stehen. Das Protokoll nennt die betroffenen Spalten als WARN. Nur Tabellen, auf die Fremdschlüssel zeigen, behalten ihr Schema, weil dort lediglich die Daten ersetzt werden.
+**Die Tabellendefinition wird wiederhergestellt.** Legt die App eine Tabelle neu an oder tauscht sie aus, bringt apitap nur Spalten, Typen und Primärschlüssel mit. Die App setzt danach wieder, was zum Schreiben gehört: **berechnete Spalten** samt ihrer Formel, **Standardwerte**, **CHECK-Bedingungen** und **AUTO_INCREMENT** samt Zählerstand, dazu wie bisher Indizes und Fremdschlüssel. Eine Kopie verhält sich beim Schreiben also wie das Original: `order_date` rechnet wieder mit, ein Einfügen ohne Spalte nimmt den Standardwert, und eine verletzte Bedingung wird abgelehnt.
+
+Scheitert dabei ein Schritt, bricht der Lauf ab und es wird **nicht** getauscht. Lieber die alte Tabelle als eine halb hergestellte.
+
+Nicht eingeholt werden: Trigger, Views, Partitionierung und Spaltenkommentare. Bei PostgreSQL gehen Standardwerte und Bedingungen, aber keine berechneten Spalten, weil die dort nicht nachträglich gesetzt werden können; sie werden gemeldet.
 
 **Sonderbehandlung bei MySQL als Ziel.** Die App überträgt jede Tabelle zuerst in eine Zwischentabelle und tauscht sie am Ende in einem Schritt aus, sodass niemand eine halb gefüllte Tabelle sieht. Verweisen andere Tabellen per Fremdschlüssel auf die Zieltabelle, tauscht die App sie nicht aus, sondern ersetzt nur die Daten darin, denn ein Austausch würde diese Verweise brechen. Das taucht im Protokoll als WARN auf. Das ist kein Fehler, sondern der Hinweis, dass ein Umweg genommen wurde.
 
