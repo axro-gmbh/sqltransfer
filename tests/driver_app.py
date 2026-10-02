@@ -394,6 +394,36 @@ async def main() -> int:
     log = log_text(root).lower()
     check("not anonymized" in log or "still real" in log, f"the log warns about the real data: {log[-200:]}")
 
+    print("\n9e. A swapped table warns about the generated columns it loses")
+    app_module.TransferService.mysql_table_has_inbound_fk = _async((True, False, ""))
+    app_module.TransferService.mysql_swap_temp_to_final = _async((True, ""))
+    app_module.TransferService.mysql_apply_index_clauses = _async((True, [], ""))
+    app_module.TransferService.anonymize_table = _async((True, 0, ""))
+    app_module.TransferService.source_generated_columns = _async((True, {"kunde": ["voller_name", "umsatz_brutto"]}, ""))
+    destination.value = next(o.key for o in destination.options if o.text == "local-shop-renamed")
+    fire(destination, "on_select")
+    find(root, ft.Dropdown, label="Table").value = "shop.kunde"
+    click(button(root, "Run transfer"))
+    await asyncio.sleep(0.2)
+    log = log_text(root)
+    check("voller_name" in log and "umsatz_brutto" in log, f"the lost columns are named: {log[-200:]}")
+    check("recompute" in log.lower() or "static" in log.lower(), "it says what that means")
+
+    print("\n9f. A PostgreSQL destination warns about generated columns too")
+
+    async def pg_ok(*_a, **_k):
+        return TransferResult(status="success", rows=3, elapsed_ms=4, parallel=1, message="ok")
+
+    app_module.TransferService.transfer_scope = pg_ok
+    app_module.TransferService.source_generated_columns = _async((True, {"public.kunde": ["voller_name"]}, ""))
+    destination.value = next(o.key for o in destination.options if o.text == "pg-local")
+    fire(destination, "on_select")
+    find(root, ft.Dropdown, label="Table").value = "public.kunde"
+    click(button(root, "Run transfer"))
+    await asyncio.sleep(0.2)
+    log = log_text(root)
+    check("voller_name" in log, f"the PostgreSQL path names them too: {log[-160:]}")
+
     print("\n10. Every wired handler is an event its control really has")
     dead = []
     for control in walk([root, page.seen_dialogs]):

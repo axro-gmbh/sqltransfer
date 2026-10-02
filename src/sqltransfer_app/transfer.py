@@ -143,6 +143,55 @@ def _report_failure_text(report: object) -> str | None:
     return None
 
 
+def group_generated_columns_by_table(rows: list[tuple[str, str]]) -> dict[str, list[str]]:
+    """(table, column) rows into {table: [column, ...]}, order preserved."""
+    grouped: dict[str, list[str]] = {}
+    for table, column in rows:
+        grouped.setdefault(str(table), []).append(str(column))
+    return grouped
+
+
+_GENERATED_COLUMNS_SQL = {
+    "mysql": (
+        "SELECT table_name, column_name FROM information_schema.columns "
+        "WHERE table_schema = %s AND extra LIKE '%%GENERATED%%' ORDER BY table_name, ordinal_position"
+    ),
+    "postgres": (
+        "SELECT table_name, column_name FROM information_schema.columns "
+        "WHERE table_schema = %s AND is_generated = 'ALWAYS' ORDER BY table_name, ordinal_position"
+    ),
+}
+
+
+def _generated_columns_sync(
+    host: str,
+    port: int,
+    database: str,
+    username: str,
+    password: str,
+    db_type: str,
+    schemas: list[str],
+    *,
+    tls: TlsSettings,
+) -> dict[str, list[str]]:
+    """Every generated column of the given schemas, in one round trip."""
+    rows: list[tuple[str, str]] = []
+    if db_type == "mysql":
+        conn = _mysql_connect(tls, host=host, port=port, user=username, password=password,
+                              database=database, connect_timeout=5, autocommit=True)
+    else:
+        conn = _pg_connect(tls, host=host, port=port, user=username, password=password,
+                           dbname=database, connect_timeout=5, autocommit=True)
+    try:
+        with conn.cursor() as cur:
+            for schema in schemas:
+                cur.execute(_GENERATED_COLUMNS_SQL[db_type], (schema,))
+                rows.extend((str(r[0]), str(r[1])) for r in cur.fetchall())
+    finally:
+        conn.close()
+    return group_generated_columns_by_table(rows)
+
+
 def build_mysql_insert_columns(
     final_columns: list[tuple[str, bool]], temp_columns: list[str]
 ) -> list[str]:
@@ -895,6 +944,33 @@ class TransferService:
             if endpoint and endpoint.tunnel:
                 self.tunnel_manager.close_tunnel(endpoint.tunnel)
 
+
+    async def source_generated_columns(
+        self, source: DBProfile, tables: list[str]
+    ) -> tuple[bool, dict[str, list[str]], str]:
+        """Which source columns the database computes, for every table in scope.
+
+        A table apitap creates or that gets swapped in keeps the values but loses
+        the expression behind them, so the copy never recomputes. One round trip
+        for the whole run, like the index read.
+        """
+        schemas = sorted({table.rpartition(".")[0].strip("`\"") or source.database for table in tables})
+        endpoint: ResolvedEndpoint | None = None
+        try:
+            endpoint = self._resolve_profile(source)
+            host = endpoint.tunnel.local_host if endpoint.tunnel else source.host
+            port = endpoint.tunnel.local_port if endpoint.tunnel else source.port
+            password = self.secret_store.get_secret(source.password_secret_key) or ""
+            grouped = await asyncio.to_thread(
+                _generated_columns_sync, host, port, source.database, source.username, password,
+                source.db_type, schemas, tls=endpoint.tls,
+            )
+            return True, grouped, ""
+        except Exception as exc:  # noqa: BLE001
+            return False, {}, str(exc)
+        finally:
+            if endpoint and endpoint.tunnel:
+                self.tunnel_manager.close_tunnel(endpoint.tunnel)
 
     async def table_columns(self, profile: DBProfile, table: str) -> tuple[bool, list[Column], str]:
         """Column names and types of one destination table: (ok, columns, error)."""

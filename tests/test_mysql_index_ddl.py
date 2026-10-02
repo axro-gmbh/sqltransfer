@@ -75,3 +75,23 @@ def test_insert_columns_refuse_a_table_with_nothing_to_copy():
 
     with pytest.raises(ValueError, match="no columns"):
         build_mysql_insert_columns([("order_date", True)], ["order_date"])
+
+
+def test_generated_columns_are_grouped_by_bare_table_name():
+    from sqltransfer_app.transfer import group_generated_columns_by_table
+
+    rows = [
+        ("order", "order_date"),
+        ("order", "amount_total"),
+        ("customer", "search_keywords"),
+    ]
+    assert group_generated_columns_by_table(rows) == {
+        "order": ["order_date", "amount_total"],
+        "customer": ["search_keywords"],
+    }
+
+
+def test_generated_columns_of_a_table_without_any_are_absent():
+    from sqltransfer_app.transfer import group_generated_columns_by_table
+
+    assert group_generated_columns_by_table([]) == {}

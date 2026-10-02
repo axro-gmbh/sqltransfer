@@ -1356,6 +1356,24 @@ async def main(page: ft.Page) -> None:
 
                 # apitap creates tables with columns and primary key only; the other
                 # indexes come from the source, read once for the whole run.
+                # A created or swapped table keeps the values of a generated column
+                # but loses the expression behind them, so it never recomputes.
+                gen_ok, source_generated, gen_msg = await transfer_service.source_generated_columns(
+                    src, scoped_tables
+                )
+                if not gen_ok:
+                    log.append(f"Could not read the generated columns of the source: {gen_msg}", "WARN")
+                    source_generated = {}
+
+                def warn_generated(table: str) -> None:
+                    columns = source_generated.get(table, [])
+                    if columns:
+                        log.append(
+                            f"{table}: {', '.join(columns)} are generated in the source. The copy keeps the "
+                            "values from this transfer and will not recompute them.",
+                            "WARN",
+                        )
+
                 source_indexes: dict[str, dict[str, str]] = {}
                 if src.db_type == "mysql":
                     idx_ok, source_indexes, idx_msg = await transfer_service.mysql_source_index_clauses(
@@ -1484,6 +1502,7 @@ async def main(page: ft.Page) -> None:
                                 return
                             log.append(f"Swapped {temp_name} into {final_name}")
                             notes.append(f"swapped={final_name}")
+                            warn_generated(final_name)
                     else:
                         final_exists, final_err = await transfer_service.mysql_table_exists(dst, final_name)
                         if final_err:
@@ -1624,17 +1643,35 @@ async def main(page: ft.Page) -> None:
                         "already be in the destination and are NOT anonymized",
                         "ERROR",
                     )
-                if result.status == "success" and anonymize_switch.value:
+                if result.status == "success":
                     scope_ok, scoped_tables, scoped_msg = await _scope_tables_for_check(src, mode, scope)
                     if not scope_ok:
-                        fail(f"Transfer done, but the tables to anonymize could not be listed: {scoped_msg}")
+                        fail(f"Transfer done, but the tables could not be listed: {scoped_msg}")
                         return
-                    set_progress(label="Anonymizing")
-                    page.update()
+
+                    # apitap writes the destination table itself here, so a generated
+                    # column arrives as a plain one: right now, but never recomputed.
+                    gen_ok, source_generated, gen_msg = await transfer_service.source_generated_columns(
+                        src, scoped_tables
+                    )
+                    if not gen_ok:
+                        log.append(f"Could not read the generated columns of the source: {gen_msg}", "WARN")
                     for table in scoped_tables:
-                        if not await anonymize_step(dst, table, table):
-                            fail(f"Anonymization failed for {table}; its data in the destination is still real")
-                            return
+                        columns = source_generated.get(table) or source_generated.get(table.rpartition(".")[2])
+                        if columns:
+                            log.append(
+                                f"{table}: {', '.join(columns)} are generated in the source. The copy keeps "
+                                "the values from this transfer and will not recompute them.",
+                                "WARN",
+                            )
+
+                    if anonymize_switch.value:
+                        set_progress(label="Anonymizing")
+                        page.update()
+                        for table in scoped_tables:
+                            if not await anonymize_step(dst, table, table):
+                                fail(f"Anonymization failed for {table}; its data in the destination is still real")
+                                return
 
             store_run(result)
             log.append(f"Summary: {result.message}", "INFO" if result.status != "failed" else "ERROR")

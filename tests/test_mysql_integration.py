@@ -496,3 +496,19 @@ def test_a_generated_column_is_never_anonymized(databases):
     row = _rows(DST_DB, "SELECT email, kontakt_mail FROM gen2")[0]
     assert row[0].endswith("@example.invalid")
     assert row[1] == row[0] + ".test"           # followed along, computed by the database
+
+
+def test_generated_columns_of_the_source_are_read_in_one_go(databases):
+    service = _service()
+    src = _profile("remote", SRC_DB)
+    _exec(SRC_DB, "DROP TABLE IF EXISTS gen_a", "DROP TABLE IF EXISTS gen_b",
+          "CREATE TABLE gen_a (id INT PRIMARY KEY, zeit DATETIME NOT NULL,"
+          " tag DATE AS (CAST(zeit AS DATE)) STORED, kennung VARCHAR(16) AS (CONCAT('a-', id)) VIRTUAL)",
+          "CREATE TABLE gen_b (id INT PRIMARY KEY, name VARCHAR(50))")
+
+    ok, generated, message = asyncio.run(
+        service.source_generated_columns(src, [f"{SRC_DB}.gen_a", f"{SRC_DB}.gen_b"])
+    )
+    assert ok, message
+    assert generated.get("gen_a") == ["tag", "kennung"]
+    assert "gen_b" not in generated  # a table without generated columns is simply absent
