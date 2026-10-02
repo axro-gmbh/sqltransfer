@@ -507,6 +507,35 @@ async def main() -> int:
     check('custom_fields$."email"' in preview and "Would anonymize" in preview,
           f"the preview names the JSON path too: {preview[-200:]}")
 
+    print("\n9j. The table definition is restored before the swap")
+    order: list[str] = []
+
+    async def record_definition(_self, _dst, table, clauses):
+        order.append(f"definition:{table}")
+        return True, ""
+
+    async def record_swap(_self, _dst, temp_table, final_table):
+        order.append("swap")
+        return True, ""
+
+    app_module.TransferService.source_table_definitions = _async((True, {"kunde": ["AUTO_INCREMENT = 7"]}, ""))
+    app_module.TransferService.apply_definition_clauses = record_definition
+    app_module.TransferService.mysql_swap_temp_to_final = record_swap
+    app_module.TransferService.json_paths = _async((True, [], ""))
+    click(button(root, "Run transfer"))
+    await asyncio.sleep(0.2)
+    check(order and order[0].startswith("definition:") and order[-1] == "swap",
+          f"definition first, then the swap: {order}")
+
+    async def failing_definition(_self, _dst, _table, _clauses):
+        return False, "Unknown column 'weg' in generated column"
+
+    app_module.TransferService.apply_definition_clauses = failing_definition
+    order.clear()
+    click(button(root, "Run transfer"))
+    await asyncio.sleep(0.2)
+    check("swap" not in order, f"a failed restore stops the swap: {order}")
+
     print("\n10. Every wired handler is an event its control really has")
     dead = []
     for control in walk([root, page.seen_dialogs]):

@@ -1457,6 +1457,18 @@ async def main(page: ft.Page) -> None:
                             "WARN",
                         )
 
+                # apitap carries columns, types and the primary key; what governs
+                # writing (generated columns, defaults, AUTO_INCREMENT, checks) has to
+                # be put back on the temp table before it is swapped in.
+                def_ok, source_definitions, def_msg = await transfer_service.source_table_definitions(
+                    src, scoped_tables
+                )
+                if not def_ok:
+                    log.append(f"Could not read the table definitions of the source: {def_msg}", "WARN")
+                    source_definitions = {}
+                elif source_definitions:
+                    log.append(f"Read the definition of {len(source_definitions)} source table(s)")
+
                 source_indexes: dict[str, dict[str, str]] = {}
                 if src.db_type == "mysql":
                     idx_ok, source_indexes, idx_msg = await transfer_service.mysql_source_index_clauses(
@@ -1577,6 +1589,20 @@ async def main(page: ft.Page) -> None:
                             # Index the temp table before the swap, so the table that gets
                             # published is complete from its first moment.
                             await apply_source_indexes(temp_name, final_name)
+
+                            # The definition comes after the indexes: AUTO_INCREMENT needs
+                            # a key on its column. A failure here must not be published,
+                            # so the run stops and the table is not swapped.
+                            clauses = source_definitions.get(final_name, [])
+                            if clauses:
+                                def_applied, def_error = await transfer_service.apply_definition_clauses(
+                                    dst, temp_name, clauses
+                                )
+                                if not def_applied:
+                                    fail(f"Could not restore the definition of {final_name}: {def_error}")
+                                    return
+                                log.append(f"Restored {len(clauses)} definition detail(s) for {final_name}")
+                                notes.append(f"definition={final_name}")
                             swapped, swap_msg = await transfer_service.mysql_swap_temp_to_final(
                                 dst, temp_table=temp_name, final_table=final_name
                             )
