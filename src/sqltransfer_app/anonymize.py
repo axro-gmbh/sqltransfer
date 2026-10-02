@@ -90,6 +90,7 @@ class TablePlan:
     table: str
     targets: tuple[tuple[str, str, int | None], ...]  # (column, kind, max length)
     skipped: tuple[tuple[str, str], ...]  # (column, reason)
+    json_targets: tuple["JsonTarget", ...] = ()  # values to rewrite inside JSON columns
 
     def __bool__(self) -> bool:
         return bool(self.targets)
@@ -237,12 +238,51 @@ def _replacement(kind: str, column: str, db_type: str) -> str:
     raise ValueError(f"unknown kind: {kind}")
 
 
+def _mysql_json_path(path: tuple[str, ...]) -> str:
+    return "$" + "".join('."' + key.replace('"', '""') + '"' for key in path)
+
+
+def _json_assignment(column: str, targets: list[JsonTarget], db_type: str) -> str:
+    """One assignment that rewrites every planned path of one column.
+
+    PostgreSQL only edits jsonb, so a json or text column is cast on the way in and
+    back on the way out; MySQL takes the JSON value straight into a JSON or text
+    column. A path that a row does not have is left alone by both.
+    """
+    quoted = _quote(column, db_type)
+    if db_type == "mysql":
+        expression = quoted
+        for target in targets:
+            path = _mysql_json_path(target.path).replace("'", "''")
+            current = f"JSON_UNQUOTE(JSON_EXTRACT({quoted}, '{path}'))"
+            expression = f"JSON_REPLACE({expression}, '{path}', {_replacement(target.kind, current, db_type)})"
+        return f"{quoted} = {expression}"
+
+    # Read through ::jsonb in every case (a no-op for a jsonb column), and cast the
+    # result back to whatever the column is declared as.
+    column_type = (targets[0].column_type or "jsonb").lower()
+    expression = f"{quoted}::jsonb"
+    for target in targets:
+        keys = "{" + ",".join(key.replace("\\", "\\\\").replace(",", "\\,") for key in target.path) + "}"
+        current = f"({quoted}::jsonb #>> '{keys}')"
+        replacement = _replacement(target.kind, current, db_type)
+        expression = (
+            f"CASE WHEN {quoted}::jsonb #> '{keys}' IS NULL THEN {expression} "
+            f"ELSE jsonb_set({expression}, '{keys}', to_jsonb({replacement})) END"
+        )
+    if column_type == "json":
+        expression = f"({expression})::json"
+    elif column_type != "jsonb":
+        expression = f"({expression})::text"
+    return f"{quoted} = {expression}"
+
+
 def update_statement(plan: TablePlan, db_type: str, salt: str) -> tuple[str, list[str]] | None:
     """One UPDATE for the whole table, or None when there is nothing to rewrite.
 
     The salt is a query parameter, once per column, so it never reaches the SQL text.
     """
-    if not plan.targets:
+    if not plan.targets and not plan.json_targets:
         return None
     assignments = []
     for column, kind, max_length in plan.targets:
@@ -256,6 +296,11 @@ def update_statement(plan: TablePlan, db_type: str, salt: str) -> tuple[str, lis
             f"{quoted} = CASE WHEN {quoted} IS NULL THEN NULL WHEN {quoted} = '' THEN '' "
             f"ELSE {replacement} END"
         )
+    by_column: dict[str, list[JsonTarget]] = {}
+    for target in plan.json_targets:
+        by_column.setdefault(target.column, []).append(target)
+    assignments += [_json_assignment(column, targets, db_type) for column, targets in by_column.items()]
+
     sql = f"UPDATE {_quote_table(plan.table, db_type)} SET " + ", ".join(assignments)
     # One salt per placeholder, not per column: a kind like street or fullname
     # embeds the digest twice and therefore carries two.
@@ -275,6 +320,7 @@ class JsonTarget:
     column: str
     path: tuple[str, ...]
     kind: str
+    column_type: str = "jsonb"  # what the column is declared as, which decides the casts
 
 
 def json_path_text(column: str, path: tuple[str, ...]) -> str:
