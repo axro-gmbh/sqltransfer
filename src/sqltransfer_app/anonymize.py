@@ -260,3 +260,44 @@ def update_statement(plan: TablePlan, db_type: str, salt: str) -> tuple[str, lis
     # One salt per placeholder, not per column: a kind like street or fullname
     # embeds the digest twice and therefore carries two.
     return sql, [salt] * sql.count("%s")
+
+
+@dataclass(frozen=True, slots=True)
+class JsonNode:
+    """One key path seen in a column, with every JSON type observed for it."""
+
+    path: tuple[str, ...]
+    types: frozenset[str]
+
+
+@dataclass(frozen=True, slots=True)
+class JsonTarget:
+    column: str
+    path: tuple[str, ...]
+    kind: str
+
+
+def json_path_text(column: str, path: tuple[str, ...]) -> str:
+    """How a path is written in the log and in MySQL: column$."a"."b"."""
+    return column + "$" + "".join('."' + key.replace('"', '""') + '"' for key in path)
+
+
+def plan_json_column(column: str, nodes, rules):
+    targets: list[JsonTarget] = []
+    skipped: list[tuple[str, str]] = []
+    descend: list[tuple[str, ...]] = []
+    for node in nodes:
+        text = json_path_text(column, node.path)
+        if "OBJECT" in node.types:
+            descend.append(node.path)
+        if "ARRAY" in node.types:
+            skipped.append((text, "array, not followed"))
+        rule = match_rule(node.path[-1], rules)
+        if not rule:
+            continue
+        if "STRING" in node.types:
+            targets.append(JsonTarget(column, node.path, rule.kind))
+        elif not ({"OBJECT", "ARRAY"} & node.types):
+            other = sorted(t for t in node.types if t != "NULL") or ["NULL"]
+            skipped.append((text, f"not a string value ({other[0]})"))
+    return tuple(targets), tuple(skipped), tuple(descend)
