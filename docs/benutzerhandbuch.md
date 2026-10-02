@@ -136,6 +136,10 @@ Im Bereich **Transfer** steht der Schalter **Anonymize personal data**. Er ist a
 
 **Gleicher Wert ergibt immer denselben Ersatz.** Eine Adresse, die in zwei Tabellen steht, wird in beiden gleich ersetzt, Verknüpfungen bleiben also heil. Eindeutig bleiben allerdings nur die Arten, deren Ersatz den Hash enthält: **E-Mail** und **Generic text**. Namen, Orte und Straßen stammen aus einer Liste und wiederholen sich; auf einer UNIQUE-Spalte nimm deshalb E-Mail oder Generic text. Dafür sorgt ein Zufallswert im Schlüsselbund, der deinen Rechner nie verlässt. `NULL` bleibt `NULL`, Leeres bleibt leer.
 
+**Auch in JSON wird ersetzt.** Spalten vom Typ `json` werden automatisch durchsucht. Liegt das JSON in einer Textspalte (bei Shopware der Normalfall, etwa `custom_fields`), legst du dafür eine Regel mit der Art **Look inside the JSON** an. Darin greifen deine übrigen Regeln auf die **Schlüsselnamen**: `*mail*` trifft dann den Schlüssel `email` genauso wie eine Spalte `email`. Die Struktur bleibt, nur die Werte ändern sich, und Schlüssel ohne Regel bleiben unberührt.
+
+Drei Grenzen dabei: Werte in **Listen** (`{"positionen":[{"email":...}]}`) werden gemeldet, aber nicht ersetzt. Verschachtelung wird bis zur **vierten Ebene** verfolgt. Und Werte, die **keine Zeichenkette** sind (eine Telefonnummer als Zahl), bleiben stehen, damit die Anwendung keinen anderen Typ zurückbekommt. Alle drei Fälle stehen als WARN im Protokoll.
+
 **Vorher sehen, was passiert:** **Preview plan** listet die betroffenen Spalten, bevor eine Zeile kopiert wird. Nach dem Lauf steht im Protokoll, was ersetzt wurde. Spalten, die nach Personendaten aussehen, aber keine Regel haben, erscheinen als WARN mit Begründung.
 
 **Grenzen, die du kennen solltest:**

@@ -1,6 +1,7 @@
 # Design: anonymizing personal data inside JSON
 
-Status: draft, not implemented. Written 02.10.2026.
+Status: implemented in 1.4.0. Written 02.10.2026.
+Implementation plan: [2026-10-02-json-anonymization-plan.md](2026-10-02-json-anonymization-plan.md).
 Builds on [2026-10-01-anonymization.md](2026-10-01-anonymization.md); everything there about rules,
 salted hashes, the point in the run and the guard rails still holds.
 
