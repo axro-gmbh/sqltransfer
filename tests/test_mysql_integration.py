@@ -653,3 +653,28 @@ def test_nesting_past_the_limit_is_reported(databases):
     assert ok, message
     deep = [n for n in nodes if "TOO_DEEP" in n.types]
     assert [n.path for n in deep] == [("a", "b", "c", "d")]
+
+
+def test_table_definitions_are_read_for_every_table_in_scope(databases):
+    service = _service()
+    src = _profile("remote", SRC_DB)
+    _exec(SRC_DB, "DROP TABLE IF EXISTS def_a", "DROP TABLE IF EXISTS def_b",
+          """CREATE TABLE def_a (
+               id INT PRIMARY KEY,
+               lauf BIGINT UNSIGNED NOT NULL AUTO_INCREMENT UNIQUE,
+               zeit DATETIME NOT NULL,
+               tag DATE AS (CAST(zeit AS DATE)) STORED,
+               betrag DECIMAL(10,2) DEFAULT 1.00,
+               geprueft INT CHECK (geprueft > 0))""",
+          "CREATE TABLE def_b (id INT PRIMARY KEY, name VARCHAR(20))",
+          "INSERT INTO def_a (id, zeit, geprueft) VALUES (1,'2026-01-01 10:00:00',3)")
+
+    ok, clauses, message = asyncio.run(
+        service.source_table_definitions(src, [f"{SRC_DB}.def_a", f"{SRC_DB}.def_b"])
+    )
+    assert ok, message
+    assert "def_b" not in clauses                      # nothing to restore there
+    joined = " | ".join(clauses["def_a"])
+    assert "GENERATED ALWAYS AS" in joined and "SET DEFAULT" in joined
+    assert "AUTO_INCREMENT" in joined and "CHECK" in joined
+    assert joined.index("GENERATED") < joined.index("AUTO_INCREMENT") < joined.index("CHECK")

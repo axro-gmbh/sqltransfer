@@ -363,6 +363,131 @@ def _default_literal(default: str, extra: str) -> str:
     return "'" + text.replace("'", "''") + "'"
 
 
+_DEFINITION_COLUMNS_SQL = {
+    "mysql": (
+        "SELECT table_name, column_name, column_type, column_default, extra, "
+        "generation_expression, is_nullable FROM information_schema.columns "
+        "WHERE table_schema = %s ORDER BY table_name, ordinal_position"
+    ),
+    "postgres": (
+        "SELECT table_name, column_name, data_type, column_default, '', generation_expression, is_nullable "
+        "FROM information_schema.columns WHERE table_schema = %s ORDER BY table_name, ordinal_position"
+    ),
+}
+
+_DEFINITION_CHECKS_SQL = (
+    "SELECT tc.table_name, cc.constraint_name, cc.check_clause "
+    "FROM information_schema.check_constraints cc "
+    "JOIN information_schema.table_constraints tc ON tc.constraint_name = cc.constraint_name "
+    "AND tc.constraint_schema = cc.constraint_schema "
+    "WHERE tc.constraint_schema = %s AND tc.constraint_type = 'CHECK'"
+)
+
+_DEFINITION_AUTO_SQL = (
+    "SELECT table_name, auto_increment FROM information_schema.tables "
+    "WHERE table_schema = %s AND auto_increment IS NOT NULL"
+)
+
+
+def _schema_of(table: str, profile: DBProfile) -> str:
+    """The schema information_schema knows this table under.
+
+    In MySQL the prefix of a qualified name is the database, which is also the schema.
+    In PostgreSQL the prefix is the schema itself, and a bare name lives in public;
+    the database name is never a schema there.
+    """
+    prefix = table.rpartition(".")[0].strip('`"')
+    if profile.db_type == "mysql":
+        return prefix or profile.database
+    if not prefix or prefix == profile.database:
+        return "public"
+    return prefix
+
+
+def _table_definitions_sync(
+    host: str,
+    port: int,
+    database: str,
+    username: str,
+    password: str,
+    db_type: str,
+    schemas: list[str],
+    *,
+    tls: TlsSettings,
+) -> dict[str, list[str]]:
+    """Read what every table in the given schemas needs put back, in one round trip."""
+    if db_type == "mysql":
+        conn = _mysql_connect(tls, host=host, port=port, user=username, password=password,
+                              database=database, connect_timeout=5, autocommit=True)
+    else:
+        conn = _pg_connect(tls, host=host, port=port, user=username, password=password,
+                           dbname=database, connect_timeout=5, autocommit=True)
+    columns: dict[str, list[dict]] = {}
+    checks: dict[str, list[tuple[str, str]]] = {}
+    counters: dict[str, int] = {}
+    try:
+        with conn.cursor() as cur:
+            for schema in schemas:
+                cur.execute(_DEFINITION_COLUMNS_SQL[db_type], (schema,))
+                for table, name, type_, default, extra, expression, nullable in cur.fetchall():
+                    columns.setdefault(str(table), []).append({
+                        "name": str(name), "type": str(type_), "default": default,
+                        "extra": extra or "", "generation_expression": expression or None,
+                        "is_nullable": nullable,
+                    })
+                cur.execute(_DEFINITION_CHECKS_SQL, (schema,))
+                for table, name, clause in cur.fetchall():
+                    # PostgreSQL also lists NOT NULL as a check constraint; those are
+                    # carried by the column itself.
+                    if str(clause).upper().endswith("IS NOT NULL"):
+                        continue
+                    checks.setdefault(str(table), []).append((str(name), str(clause)))
+                if db_type == "mysql":
+                    cur.execute(_DEFINITION_AUTO_SQL, (schema,))
+                    for table, counter in cur.fetchall():
+                        counters[str(table)] = int(counter)
+    finally:
+        conn.close()
+
+    definitions: dict[str, list[str]] = {}
+    for table, table_columns in columns.items():
+        clauses = build_definition_clauses(
+            table_columns, checks.get(table, []), counters.get(table), db_type
+        )
+        if clauses:
+            definitions[table] = clauses
+    return definitions
+
+
+def _apply_definition_clauses_sync(
+    host: str,
+    port: int,
+    database: str,
+    username: str,
+    password: str,
+    db_type: str,
+    table: str,
+    clauses: list[str],
+    *,
+    tls: TlsSettings,
+) -> None:
+    """Run the clauses in order; the first failure raises, nothing is swallowed."""
+    quote = _quote_mysql_ident if db_type == "mysql" else _quote_pg_ident
+    quoted = ".".join(quote(part.strip('`"')) for part in table.split("."))
+    if db_type == "mysql":
+        conn = _mysql_connect(tls, host=host, port=port, user=username, password=password,
+                              database=database, connect_timeout=5, read_timeout=600, autocommit=True)
+    else:
+        conn = _pg_connect(tls, host=host, port=port, user=username, password=password,
+                           dbname=database, connect_timeout=5, autocommit=True)
+    try:
+        with conn.cursor() as cur:
+            for clause in clauses:
+                cur.execute(f"ALTER TABLE {quoted} {clause}")
+    finally:
+        conn.close()
+
+
 def build_mysql_insert_columns(
     final_columns: list[tuple[str, bool]], temp_columns: list[str]
 ) -> list[str]:
@@ -1141,6 +1266,51 @@ class TransferService:
             return True, grouped, ""
         except Exception as exc:  # noqa: BLE001
             return False, {}, str(exc)
+        finally:
+            if endpoint and endpoint.tunnel:
+                self.tunnel_manager.close_tunnel(endpoint.tunnel)
+
+    async def source_table_definitions(
+        self, source: DBProfile, tables: list[str]
+    ) -> tuple[bool, dict[str, list[str]], str]:
+        """What has to be put back after a swap, per table, read once for the whole run."""
+        schemas = sorted({_schema_of(table, source) for table in tables})
+        endpoint: ResolvedEndpoint | None = None
+        try:
+            endpoint = self._resolve_profile(source)
+            host = endpoint.tunnel.local_host if endpoint.tunnel else source.host
+            port = endpoint.tunnel.local_port if endpoint.tunnel else source.port
+            password = self.secret_store.get_secret(source.password_secret_key) or ""
+            definitions = await asyncio.to_thread(
+                _table_definitions_sync, host, port, source.database, source.username, password,
+                source.db_type, schemas, tls=endpoint.tls,
+            )
+            return True, definitions, ""
+        except Exception as exc:  # noqa: BLE001
+            return False, {}, str(exc)
+        finally:
+            if endpoint and endpoint.tunnel:
+                self.tunnel_manager.close_tunnel(endpoint.tunnel)
+
+    async def apply_definition_clauses(
+        self, destination: DBProfile, table: str, clauses: list[str]
+    ) -> tuple[bool, str]:
+        """Put the definition back on one table: (ok, error). Order is the caller's."""
+        if not clauses:
+            return True, ""
+        endpoint: ResolvedEndpoint | None = None
+        try:
+            endpoint = self._resolve_profile(destination)
+            host = endpoint.tunnel.local_host if endpoint.tunnel else destination.host
+            port = endpoint.tunnel.local_port if endpoint.tunnel else destination.port
+            password = self.secret_store.get_secret(destination.password_secret_key) or ""
+            await asyncio.to_thread(
+                _apply_definition_clauses_sync, host, port, destination.database, destination.username,
+                password, destination.db_type, table, clauses, tls=endpoint.tls,
+            )
+            return True, ""
+        except Exception as exc:  # noqa: BLE001
+            return False, str(exc)
         finally:
             if endpoint and endpoint.tunnel:
                 self.tunnel_manager.close_tunnel(endpoint.tunnel)
