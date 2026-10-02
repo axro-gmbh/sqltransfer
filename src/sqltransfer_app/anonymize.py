@@ -23,6 +23,7 @@ KINDS: tuple[tuple[str, str], ...] = (
     ("city", "City"),
     ("postcode", "Postcode"),
     ("text", "Generic text"),
+    ("json", "Look inside the JSON"),
     ("empty", "Empty"),
 )
 
@@ -49,6 +50,9 @@ DEFAULT_RULES: tuple[tuple[str, str], ...] = (
 )
 
 # information_schema data types we dare to overwrite with a string.
+# Columns whose type already says the content is JSON; no rule needed for those.
+JSON_TYPES: frozenset[str] = frozenset({"json", "jsonb"})
+
 TEXT_TYPES: frozenset[str] = frozenset(
     {"char", "varchar", "text", "tinytext", "mediumtext", "longtext", "character varying", "character", "citext"}
 )
@@ -91,6 +95,7 @@ class TablePlan:
     targets: tuple[tuple[str, str, int | None], ...]  # (column, kind, max length)
     skipped: tuple[tuple[str, str], ...]  # (column, reason)
     json_targets: tuple["JsonTarget", ...] = ()  # values to rewrite inside JSON columns
+    json_columns: tuple[tuple[str, str], ...] = ()  # (column, data type) to look into
 
     def __bool__(self) -> bool:
         return bool(self.targets)
@@ -128,10 +133,18 @@ def plan_table(table: str, columns: Sequence[Column], rules: Sequence[Rule]) -> 
     """Split a table's columns into what gets rewritten and what is reported."""
     targets: list[tuple[str, str, int | None]] = []
     skipped: list[tuple[str, str]] = []
+    json_columns: list[tuple[str, str]] = []
     for column in columns:
         rule = match_rule(column.name, rules)
         data_type = column.data_type.lower()
-        if rule and column.generated:
+        if data_type in JSON_TYPES or (rule and rule.kind == "json"):
+            # Looked into rather than overwritten: replacing the whole value would
+            # destroy the structure the application reads back.
+            if column.generated:
+                skipped.append((column.name, "generated column, the database computes it"))
+            else:
+                json_columns.append((column.name, data_type))
+        elif rule and column.generated:
             # Shopware's order.tax_status is one of these: the database computes it,
             # and an UPDATE on it fails with "not allowed".
             skipped.append((column.name, "generated column, the database computes it"))
@@ -142,7 +155,9 @@ def plan_table(table: str, columns: Sequence[Column], rules: Sequence[Rule]) -> 
         elif looks_personal(column.name):
             disabled = any(fnmatchcase(column.name.lower(), r.pattern.lower()) for r in rules if not r.enabled)
             skipped.append((column.name, "rule disabled" if disabled else "no rule"))
-    return TablePlan(table=table, targets=tuple(targets), skipped=tuple(skipped))
+    return TablePlan(
+        table=table, targets=tuple(targets), skipped=tuple(skipped), json_columns=tuple(json_columns)
+    )
 
 
 # Invented values, picked by hash. Short lists keep the generated SQL readable.

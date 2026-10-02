@@ -88,3 +88,20 @@ def test_no_default_rule_renames_every_name_column():
 
     assert "name" not in [pattern for pattern, _kind in DEFAULT_RULES]
     assert any(pattern == "*vorname*" or pattern == "vorname" for pattern, _kind in DEFAULT_RULES)
+
+
+def test_a_json_rule_marks_a_column_for_looking_into_it():
+    from sqltransfer_app.anonymize import Column, Rule, plan_table
+
+    columns = [Column("custom_fields", "longtext"), Column("payload", "json"), Column("notiz", "text")]
+    plan = plan_table("kunde", columns, [Rule(id=1, pattern="custom_fields", kind="json")])
+    # the rule, plus the column whose type says JSON on its own
+    assert plan.json_columns == (("custom_fields", "longtext"), ("payload", "json"))
+    assert plan.targets == ()  # a JSON column is never replaced as a whole
+
+
+def test_a_json_column_without_a_rule_is_still_looked_into():
+    from sqltransfer_app.anonymize import Column, Rule, plan_table
+
+    plan = plan_table("kunde", [Column("payload", "jsonb")], [Rule(id=1, pattern="*mail*", kind="email")])
+    assert plan.json_columns == (("payload", "jsonb"),)

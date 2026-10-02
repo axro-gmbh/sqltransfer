@@ -23,7 +23,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 import flet as ft
 
 from sqltransfer_app import app as app_module
-from sqltransfer_app.anonymize import Column
+from sqltransfer_app.anonymize import Column, JsonNode
 from sqltransfer_app.models import TransferResult
 
 FAILURES: list[str] = []
@@ -476,6 +476,30 @@ async def main() -> int:
     click(button(dialog, "Save"))
     row = [r for r in rows_of(db_rows) if "mit-tunnel" in r][0]
     check("SSH" not in row, f"the profile no longer uses a tunnel: {row}")
+
+    print("\n9i. A JSON column is looked into, not overwritten")
+    app_module.TransferService.json_paths = _async(
+        (True, [JsonNode(("email",), frozenset({"STRING"})), JsonNode(("positionen",), frozenset({"ARRAY"}))], "")
+    )
+    app_module.TransferService.table_columns = _async((True, [Column("custom_fields", "json")], ""))
+    app_module.TransferService.mysql_table_has_inbound_fk = _async((True, False, ""))
+    captured: list = []
+
+    async def record_plan(_self, _profile, plan):
+        captured.append(plan)
+        return True, 1, ""
+
+    app_module.TransferService.anonymize_table = record_plan
+    destination.value = next(o.key for o in destination.options if o.text == "local-shop-renamed")
+    fire(destination, "on_select")
+    find(root, ft.Dropdown, label="Table").value = "shop.kunde"
+    click(button(root, "Run transfer"))
+    await asyncio.sleep(0.2)
+    check(captured and captured[-1].json_targets, f"the plan carries a JSON target: {captured[-1:]}")
+    check(captured[-1].targets == (), "and does not replace the column as a whole")
+    log = log_text(root)
+    check('custom_fields$."email"' in log, f"the log names the path: {log[-200:]}")
+    check("array, not followed" in log, "and reports the array it left alone")
 
     print("\n10. Every wired handler is an event its control really has")
     dead = []
