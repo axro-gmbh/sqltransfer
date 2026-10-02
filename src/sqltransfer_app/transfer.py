@@ -314,6 +314,55 @@ def _json_paths_sync(
     return nodes
 
 
+def build_definition_clauses(
+    columns: list[dict], checks: list[tuple[str, str]], auto_increment: int | None, db_type: str
+) -> list[str]:
+    """ALTER TABLE fragments that put a table's definition back, in application order.
+
+    apitap creates the destination with columns, types and the primary key. What governs
+    writing is lost: generated columns, defaults, AUTO_INCREMENT and checks. The order
+    matters, AUTO_INCREMENT needs its key to exist, which the index step creates first.
+
+    PostgreSQL takes defaults and checks only: an existing column cannot be turned into a
+    generated one there, it would have to be dropped and re-added.
+    """
+    quote = _quote_mysql_ident if db_type == "mysql" else _quote_pg_ident
+    generated: list[str] = []
+    defaults: list[str] = []
+    increments: list[str] = []
+
+    for column in columns:
+        name = quote(column["name"])
+        extra = str(column.get("extra") or "").upper()
+        expression = column.get("generation_expression")
+        if db_type == "mysql" and expression and "GENERATED" in extra:
+            kind = "VIRTUAL" if "VIRTUAL" in extra else "STORED"
+            generated.append(f"MODIFY COLUMN {name} {column['type']} GENERATED ALWAYS AS ({expression}) {kind}")
+            continue  # a generated column carries no default of its own
+        default = column.get("default")
+        if default is not None:
+            defaults.append(f"ALTER COLUMN {name} SET DEFAULT {_default_literal(default, extra)}")
+        if db_type == "mysql" and "AUTO_INCREMENT" in extra:
+            null = "NOT NULL" if str(column.get("is_nullable", "YES")).upper() == "NO" else "NULL"
+            increments.append(f"MODIFY COLUMN {name} {column['type']} {null} AUTO_INCREMENT")
+
+    if db_type == "mysql" and increments and auto_increment:
+        increments.append(f"AUTO_INCREMENT = {int(auto_increment)}")
+
+    constraints = [f"ADD CONSTRAINT {quote(name)} CHECK ({expression})" for name, expression in checks]
+    return generated + defaults + increments + constraints
+
+
+def _default_literal(default: str, extra: str) -> str:
+    """A default is either an expression the server computes or a literal value."""
+    text = str(default)
+    if "DEFAULT_GENERATED" in extra.upper() or text.upper() in {"CURRENT_TIMESTAMP", "NULL", "NOW()"}:
+        return text
+    if text.startswith("(") and text.endswith(")"):  # PostgreSQL hands expressions back in brackets
+        return text
+    return "'" + text.replace("'", "''") + "'"
+
+
 def build_mysql_insert_columns(
     final_columns: list[tuple[str, bool]], temp_columns: list[str]
 ) -> list[str]:
