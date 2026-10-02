@@ -287,21 +287,11 @@ def test_a_generated_column_is_recognised(databases):
     assert by_name["email"].generated is False
 
 
-def test_table_definitions_cover_defaults_and_checks(databases):
+def test_definitions_are_not_carried_from_a_postgresql_source(databases):
+    # The DDL of one dialect is not the DDL of the other. Rather than build clauses a
+    # MySQL destination cannot run, the app says so and leaves the table alone.
     service = _service()
     src = _profile("remote", SRC_DB, "off")
-    _admin(SRC_DB, "DROP TABLE IF EXISTS def_a",
-           """CREATE TABLE def_a (
-                id INT PRIMARY KEY,
-                zeit TIMESTAMP NOT NULL,
-                tag DATE GENERATED ALWAYS AS (zeit::date) STORED,
-                betrag NUMERIC(10,2) DEFAULT 1.00,
-                geprueft INT CHECK (geprueft > 0))""")
-
-    ok, clauses, message = asyncio.run(service.source_table_definitions(src, [f"{SRC_DB}.def_a"]))
-    assert ok, message
-    joined = " | ".join(clauses["def_a"])
-    assert "SET DEFAULT" in joined and "CHECK" in joined
-    # a generated column cannot be restored here, so it must not be attempted either
-    assert "GENERATED" not in joined
-    assert "NOT NULL" not in joined   # PostgreSQL lists those as checks; they are the column's own
+    ok, definitions, message = asyncio.run(service.source_table_definitions(src, [f"{SRC_DB}.egal"]))
+    assert ok and definitions == {}
+    assert "MySQL source" in message

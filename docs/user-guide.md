@@ -174,7 +174,9 @@ On the right are the last 20 runs with status, source, destination, scope, row c
 
 If one of those steps fails, the run stops and nothing is swapped. The old table is better than a half-restored one.
 
-Not carried over: triggers, views, partitioning and column comments. With PostgreSQL, defaults and checks are restored but generated columns are not, because they cannot be set on an existing column there; those are reported.
+The source of truth is the source's own `SHOW CREATE TABLE`, the definition as the server states it. Check constraints are applied after the swap, because in MySQL their names belong to the database and the outgoing table holds them until then. One that cannot be applied is reported and does not cost the table.
+
+Not carried over: triggers, views, partitioning and column comments. **All of this is MySQL to MySQL only.** With a PostgreSQL source or destination the previous behaviour stands: the copy loses these properties and the log says so.
 
 **Special handling with MySQL as destination.** The app copies every table into a temporary table first and swaps it in one step at the end, so nobody sees a half filled table. When other tables reference the destination table by a foreign key, the app does not swap it but replaces the rows in place instead, because a swap would break those references. That shows up as WARN in the log. It is not an error, it says a detour was taken.
 

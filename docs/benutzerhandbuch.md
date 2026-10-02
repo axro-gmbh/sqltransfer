@@ -174,7 +174,9 @@ Rechts stehen die letzten 20 Läufe mit Status, Quelle, Ziel, Umfang, Zeilenzahl
 
 Scheitert dabei ein Schritt, bricht der Lauf ab und es wird **nicht** getauscht. Lieber die alte Tabelle als eine halb hergestellte.
 
-Nicht eingeholt werden: Trigger, Views, Partitionierung und Spaltenkommentare. Bei PostgreSQL gehen Standardwerte und Bedingungen, aber keine berechneten Spalten, weil die dort nicht nachträglich gesetzt werden können; sie werden gemeldet.
+Grundlage ist das `SHOW CREATE TABLE` der Quelle, also das, was der Server selbst als Definition ausgibt. Prüfbedingungen werden nach dem Tausch gesetzt, weil ihre Namen in MySQL der Datenbank gehören und die alte Tabelle sie bis dahin hält. Eine Bedingung, die sich nicht anwenden lässt, wird gemeldet und kostet nicht die ganze Tabelle.
+
+Nicht eingeholt werden: Trigger, Views, Partitionierung und Spaltenkommentare. **Das Ganze gilt nur für MySQL nach MySQL.** Bei einer PostgreSQL-Quelle oder einem PostgreSQL-Ziel bleibt es beim bisherigen Verhalten, die Kopie verliert diese Eigenschaften und das Protokoll sagt es.
 
 **Sonderbehandlung bei MySQL als Ziel.** Die App überträgt jede Tabelle zuerst in eine Zwischentabelle und tauscht sie am Ende in einem Schritt aus, sodass niemand eine halb gefüllte Tabelle sieht. Verweisen andere Tabellen per Fremdschlüssel auf die Zieltabelle, tauscht die App sie nicht aus, sondern ersetzt nur die Daten darin, denn ein Austausch würde diese Verweise brechen. Das taucht im Protokoll als WARN auf. Das ist kein Fehler, sondern der Hinweis, dass ein Umweg genommen wurde.
 

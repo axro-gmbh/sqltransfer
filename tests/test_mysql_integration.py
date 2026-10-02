@@ -164,11 +164,16 @@ def _run_table_like_the_app(table: str) -> None:
         # The definition comes after the indexes and before the swap, as in the app.
         ok, definitions, message = await service.source_table_definitions(src, [table])
         assert ok, message
-        if definitions.get(table):
-            ok, message = await service.apply_definition_clauses(dst, temp, definitions[table])
+        before_swap, after_swap = definitions.get(table, ([], []))
+        if before_swap:
+            ok, _failed, message = await service.apply_definition_clauses(dst, temp, before_swap)
             assert ok, message
         swapped, message = await service.mysql_swap_temp_to_final(dst, temp_table=temp, final_table=table)
         assert swapped, message
+        if after_swap:
+            # after the swap, like the foreign keys: the names belong to the database
+            ok, failed, message = await service.apply_definition_clauses(dst, table, after_swap, True)
+            assert ok and not failed, message or failed
         # Foreign keys come last, once the outgoing table and its key names are gone.
         if table in source_fks:
             ok, _applied, failed, message = await service.mysql_apply_fk_clauses(dst, {table: source_fks[table]})
@@ -671,19 +676,21 @@ def test_table_definitions_are_read_for_every_table_in_scope(databases):
                zeit DATETIME NOT NULL,
                tag DATE AS (CAST(zeit AS DATE)) STORED,
                betrag DECIMAL(10,2) DEFAULT 1.00,
-               geprueft INT CHECK (geprueft > 0))""",
+               geprueft INT,
+               CONSTRAINT chk_a CHECK (geprueft > 0))""",
           "CREATE TABLE def_b (id INT PRIMARY KEY, name VARCHAR(20))",
           "INSERT INTO def_a (id, zeit, geprueft) VALUES (1,'2026-01-01 10:00:00',3)")
 
-    ok, clauses, message = asyncio.run(
+    ok, definitions, message = asyncio.run(
         service.source_table_definitions(src, [f"{SRC_DB}.def_a", f"{SRC_DB}.def_b"])
     )
     assert ok, message
-    assert "def_b" not in clauses                      # nothing to restore there
-    joined = " | ".join(clauses["def_a"])
-    assert "GENERATED ALWAYS AS" in joined and "SET DEFAULT" in joined
-    assert "AUTO_INCREMENT" in joined and "CHECK" in joined
-    assert joined.index("GENERATED") < joined.index("AUTO_INCREMENT") < joined.index("CHECK")
+    assert "def_b" not in definitions                 # nothing to restore there
+    before, after = definitions["def_a"]
+    joined = " | ".join(before)
+    assert "GENERATED ALWAYS AS" in joined and "DEFAULT '1.00'" in joined
+    assert joined.index("GENERATED") < joined.index("AUTO_INCREMENT = ")
+    assert after == ["ADD CONSTRAINT `chk_a` CHECK ((`geprueft` > 0))"]
 
 
 def _normalised_ddl(database: str, table: str) -> str:
@@ -716,3 +723,51 @@ def test_the_copy_carries_the_source_definition(databases):
     assert float(row[1]) == 1.00, "the default must apply"
     with pytest.raises(Exception):
         _exec(DST_DB, "INSERT INTO voll (id, zeit, geprueft) VALUES (3,'2026-03-03 12:00:00',0)")
+
+
+HOSTILE_SCHEMA = """CREATE TABLE schwierig (
+  id INT PRIMARY KEY,
+  lauf BIGINT UNSIGNED NOT NULL AUTO_INCREMENT UNIQUE,
+  angelegt TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  wort VARCHAR(20) NOT NULL DEFAULT 'null',
+  klammer VARCHAR(20) DEFAULT '(none)',
+  coll VARCHAR(20) COLLATE utf8mb4_bin,
+  zeit DATETIME NOT NULL,
+  tag DATE AS (CAST(zeit AS DATE)) STORED,
+  mit_text VARCHAR(40) COLLATE utf8mb4_bin AS (CONCAT('x-', coll)) STORED NOT NULL,
+  virtuell VARCHAR(40) AS (CONCAT('v-', coll)) VIRTUAL,
+  betrag DECIMAL(10,2) DEFAULT 1.00,
+  art ENUM('a','b') DEFAULT 'a',
+  geprueft INT,
+  CONSTRAINT chk_positiv CHECK (geprueft > 0),
+  CONSTRAINT chk_wort CHECK (wort <> 'bad'),
+  KEY idx_tag (tag, betrag)
+)"""
+
+
+def test_the_copy_carries_a_hostile_source_definition(databases):
+    # Everything that broke the first attempt: a function default, string literals in
+    # expressions and checks, a VIRTUAL column, NOT NULL and COLLATE on a generated
+    # column, an enum, and defaults that read like keywords.
+    _exec(SRC_DB, "DROP TABLE IF EXISTS schwierig", HOSTILE_SCHEMA,
+          "INSERT INTO schwierig (id, coll, zeit, geprueft) VALUES (1,'eins','2026-01-01 10:00:00',3)")
+    _exec(DST_DB, "DROP TABLE IF EXISTS schwierig")
+
+    _run_table_like_the_app("schwierig")
+
+    assert _normalised_ddl(DST_DB, "schwierig") == _normalised_ddl(SRC_DB, "schwierig")
+
+    _exec(DST_DB, "INSERT INTO schwierig (id, coll, zeit, geprueft) VALUES (2,'zwei','2026-02-02 11:00:00',5)")
+    row = _rows(DST_DB, "SELECT tag, mit_text, virtuell, betrag, wort, klammer, art, lauf FROM schwierig WHERE id = 2")[0]
+    assert str(row[0]) == "2026-02-02"      # stored generated column recomputes
+    assert row[1] == "x-zwei"               # with NOT NULL and its own collation
+    assert row[2] == "v-zwei"               # virtual column too
+    assert float(row[3]) == 1.00            # numeric default
+    assert row[4] == "null"                 # a string that reads like a keyword
+    assert row[5] == "(none)"               # a string that reads like an expression
+    assert row[6] == "a"                    # enum default
+    assert int(row[7]) > 1                  # auto_increment counted on
+    with pytest.raises(Exception):
+        _exec(DST_DB, "INSERT INTO schwierig (id, coll, zeit, geprueft) VALUES (3,'d','2026-03-03 12:00:00',0)")
+    with pytest.raises(Exception):
+        _exec(DST_DB, "INSERT INTO schwierig (id, wort, coll, zeit, geprueft) VALUES (4,'bad','d','2026-03-03 12:00:00',1)")

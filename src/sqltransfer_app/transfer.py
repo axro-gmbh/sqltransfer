@@ -314,94 +314,52 @@ def _json_paths_sync(
     return nodes
 
 
-def build_definition_clauses(
-    columns: list[dict], checks: list[tuple[str, str]], auto_increment: int | None, db_type: str
-) -> list[str]:
-    """ALTER TABLE fragments that put a table's definition back, in application order.
+def parse_mysql_table_definition(ddl: str) -> tuple[list[str], list[str]]:
+    """Clauses that put a table's definition back, taken from its own DDL.
 
-    apitap creates the destination with columns, types and the primary key. What governs
-    writing is lost: generated columns, defaults, AUTO_INCREMENT and checks. The order
-    matters, AUTO_INCREMENT needs its key to exist, which the index step creates first.
+    Returns (before the swap, after the swap). The source of truth is
+    `SHOW CREATE TABLE`, because that is re-executable: information_schema hands back
+    expressions with escaped quotes and defaults without their brackets, neither of
+    which a server accepts.
 
-    PostgreSQL takes defaults and checks only: an existing column cannot be turned into a
-    generated one there, it would have to be dropped and re-added.
+    Only the columns that carry something apitap drops are touched: a generated
+    expression, a default, or AUTO_INCREMENT. Indexes belong to the index step, and
+    check constraints go after the swap, because their names are unique per database
+    and the outgoing table still holds them.
     """
-    quote = _quote_mysql_ident if db_type == "mysql" else _quote_pg_ident
-    generated: list[str] = []
-    defaults: list[str] = []
-    increments: list[str] = []
+    body = ddl[ddl.index("(\n") + 2: ddl.rindex("\n)")].split("\n")
+    before: list[str] = []
+    after: list[str] = []
+    auto_increment_column = False
+    previous_column: str | None = None
 
-    for column in columns:
-        name = quote(column["name"])
-        extra = str(column.get("extra") or "").upper()
-        expression = column.get("generation_expression")
-        if db_type == "mysql" and expression and "GENERATED" in extra:
-            kind = "VIRTUAL" if "VIRTUAL" in extra else "STORED"
-            generated.append(f"MODIFY COLUMN {name} {column['type']} GENERATED ALWAYS AS ({expression}) {kind}")
-            continue  # a generated column carries no default of its own
-        default = column.get("default")
-        if default is not None:
-            defaults.append(f"ALTER COLUMN {name} SET DEFAULT {_default_literal(default, extra)}")
-        if db_type == "mysql" and "AUTO_INCREMENT" in extra:
-            null = "NOT NULL" if str(column.get("is_nullable", "YES")).upper() == "NO" else "NULL"
-            increments.append(f"MODIFY COLUMN {name} {column['type']} {null} AUTO_INCREMENT")
+    for raw in body:
+        line = raw.strip().rstrip(",")
+        if line.startswith("CONSTRAINT ") and " CHECK " in line:
+            after.append(f"ADD {line}")
+            continue
+        if not line.startswith("`"):
+            continue  # PRIMARY KEY, KEY, UNIQUE KEY: the index step owns those
+        name = line[: line.index("`", 1) + 1]
+        carries_default = " DEFAULT " in line and not line.endswith(" DEFAULT NULL")
+        generated = "GENERATED ALWAYS AS" in line
+        auto = "AUTO_INCREMENT" in line
+        if generated and line.rstrip().endswith("VIRTUAL"):
+            # MySQL refuses to change the STORED status of a column (error 3106), so
+            # a virtual column is rebuilt where it stood.
+            before.append(f"DROP COLUMN {name}")
+            position = f" AFTER {previous_column}" if previous_column else " FIRST"
+            before.append(f"ADD COLUMN {line}{position}")
+        elif generated or carries_default or auto:
+            before.append(f"MODIFY COLUMN {line}")
+        auto_increment_column = auto_increment_column or auto
+        previous_column = name
 
-    if db_type == "mysql" and increments and auto_increment:
-        increments.append(f"AUTO_INCREMENT = {int(auto_increment)}")
-
-    constraints = [f"ADD CONSTRAINT {quote(name)} CHECK ({expression})" for name, expression in checks]
-    return generated + defaults + increments + constraints
-
-
-def _default_literal(default: str, extra: str) -> str:
-    """A default is either an expression the server computes or a literal value."""
-    text = str(default)
-    if "DEFAULT_GENERATED" in extra.upper() or text.upper() in {"CURRENT_TIMESTAMP", "NULL", "NOW()"}:
-        return text
-    if text.startswith("(") and text.endswith(")"):  # PostgreSQL hands expressions back in brackets
-        return text
-    return "'" + text.replace("'", "''") + "'"
-
-
-_DEFINITION_COLUMNS_SQL = {
-    "mysql": (
-        "SELECT table_name, column_name, column_type, column_default, extra, "
-        "generation_expression, is_nullable FROM information_schema.columns "
-        "WHERE table_schema = %s ORDER BY table_name, ordinal_position"
-    ),
-    "postgres": (
-        "SELECT table_name, column_name, data_type, column_default, '', generation_expression, is_nullable "
-        "FROM information_schema.columns WHERE table_schema = %s ORDER BY table_name, ordinal_position"
-    ),
-}
-
-_DEFINITION_CHECKS_SQL = (
-    "SELECT tc.table_name, cc.constraint_name, cc.check_clause "
-    "FROM information_schema.check_constraints cc "
-    "JOIN information_schema.table_constraints tc ON tc.constraint_name = cc.constraint_name "
-    "AND tc.constraint_schema = cc.constraint_schema "
-    "WHERE tc.constraint_schema = %s AND tc.constraint_type = 'CHECK'"
-)
-
-_DEFINITION_AUTO_SQL = (
-    "SELECT table_name, auto_increment FROM information_schema.tables "
-    "WHERE table_schema = %s AND auto_increment IS NOT NULL"
-)
-
-
-def _schema_of(table: str, profile: DBProfile) -> str:
-    """The schema information_schema knows this table under.
-
-    In MySQL the prefix of a qualified name is the database, which is also the schema.
-    In PostgreSQL the prefix is the schema itself, and a bare name lives in public;
-    the database name is never a schema there.
-    """
-    prefix = table.rpartition(".")[0].strip('`"')
-    if profile.db_type == "mysql":
-        return prefix or profile.database
-    if not prefix or prefix == profile.database:
-        return "public"
-    return prefix
+    if auto_increment_column:
+        match = re.search(r"AUTO_INCREMENT=(\d+)", ddl)
+        if match:
+            before.append(f"AUTO_INCREMENT = {int(match.group(1))}")
+    return before, after
 
 
 def _table_definitions_sync(
@@ -410,52 +368,46 @@ def _table_definitions_sync(
     database: str,
     username: str,
     password: str,
-    db_type: str,
-    schemas: list[str],
+    tables: list[str],
     *,
     tls: TlsSettings,
-) -> dict[str, list[str]]:
-    """Read what every table in the given schemas needs put back, in one round trip."""
-    if db_type == "mysql":
-        conn = _mysql_connect(tls, host=host, port=port, user=username, password=password,
-                              database=database, connect_timeout=5, autocommit=True)
-    else:
-        conn = _pg_connect(tls, host=host, port=port, user=username, password=password,
-                           dbname=database, connect_timeout=5, autocommit=True)
-    columns: dict[str, list[dict]] = {}
-    checks: dict[str, list[tuple[str, str]]] = {}
-    counters: dict[str, int] = {}
+) -> dict[str, tuple[list[str], list[str]]]:
+    """Read every table's own DDL and turn it into clauses.
+
+    One SHOW CREATE TABLE per table that carries something apitap drops; which tables
+    those are is answered from information_schema first, so a plain schema costs one
+    cheap query per table and nothing else.
+    """
+    conn = _mysql_connect(tls, host=host, port=port, user=username, password=password,
+                          database=database, connect_timeout=5, read_timeout=600, autocommit=True)
+    definitions: dict[str, tuple[list[str], list[str]]] = {}
     try:
         with conn.cursor() as cur:
-            for schema in schemas:
-                cur.execute(_DEFINITION_COLUMNS_SQL[db_type], (schema,))
-                for table, name, type_, default, extra, expression, nullable in cur.fetchall():
-                    columns.setdefault(str(table), []).append({
-                        "name": str(name), "type": str(type_), "default": default,
-                        "extra": extra or "", "generation_expression": expression or None,
-                        "is_nullable": nullable,
-                    })
-                cur.execute(_DEFINITION_CHECKS_SQL, (schema,))
-                for table, name, clause in cur.fetchall():
-                    # PostgreSQL also lists NOT NULL as a check constraint; those are
-                    # carried by the column itself.
-                    if str(clause).upper().endswith("IS NOT NULL"):
-                        continue
-                    checks.setdefault(str(table), []).append((str(name), str(clause)))
-                if db_type == "mysql":
-                    cur.execute(_DEFINITION_AUTO_SQL, (schema,))
-                    for table, counter in cur.fetchall():
-                        counters[str(table)] = int(counter)
+            for table in tables:
+                schema = table.rpartition(".")[0].strip('`"') or database
+                bare = table.rpartition(".")[2].strip('`"')
+                cur.execute(
+                    "SELECT 1 FROM information_schema.columns WHERE table_schema = %s AND table_name = %s "
+                    "AND (generation_expression <> '' OR extra LIKE '%%auto_increment%%' "
+                    "OR column_default IS NOT NULL) LIMIT 1",
+                    (schema, bare),
+                )
+                interesting = cur.fetchone() is not None
+                if not interesting:
+                    cur.execute(
+                        "SELECT 1 FROM information_schema.table_constraints WHERE table_schema = %s "
+                        "AND table_name = %s AND constraint_type = 'CHECK' LIMIT 1",
+                        (schema, bare),
+                    )
+                    interesting = cur.fetchone() is not None
+                if not interesting:
+                    continue
+                cur.execute(f"SHOW CREATE TABLE {_quote_mysql_ident(schema)}.{_quote_mysql_ident(bare)}")
+                before, after = parse_mysql_table_definition(cur.fetchone()[1])
+                if before or after:
+                    definitions[bare] = (before, after)
     finally:
         conn.close()
-
-    definitions: dict[str, list[str]] = {}
-    for table, table_columns in columns.items():
-        clauses = build_definition_clauses(
-            table_columns, checks.get(table, []), counters.get(table), db_type
-        )
-        if clauses:
-            definitions[table] = clauses
     return definitions
 
 
@@ -465,27 +417,31 @@ def _apply_definition_clauses_sync(
     database: str,
     username: str,
     password: str,
-    db_type: str,
     table: str,
     clauses: list[str],
+    tolerate_failures: bool,
     *,
     tls: TlsSettings,
-) -> None:
-    """Run the clauses in order; the first failure raises, nothing is swallowed."""
-    quote = _quote_mysql_ident if db_type == "mysql" else _quote_pg_ident
-    quoted = ".".join(quote(part.strip('`"')) for part in table.split("."))
-    if db_type == "mysql":
-        conn = _mysql_connect(tls, host=host, port=port, user=username, password=password,
-                              database=database, connect_timeout=5, read_timeout=600, autocommit=True)
-    else:
-        conn = _pg_connect(tls, host=host, port=port, user=username, password=password,
-                           dbname=database, connect_timeout=5, autocommit=True)
+) -> list[str]:
+    """Run the clauses in order; returns the ones that failed when that is tolerated."""
+    quoted = ".".join(_quote_mysql_ident(part.strip('`"')) for part in table.split("."))
+    conn = _mysql_connect(tls, host=host, port=port, user=username, password=password,
+                          database=database, connect_timeout=5,
+                          # MODIFY COLUMN on a generated column rebuilds the table, like an index build.
+                          read_timeout=3600, write_timeout=3600, autocommit=True)
+    failed: list[str] = []
     try:
         with conn.cursor() as cur:
             for clause in clauses:
-                cur.execute(f"ALTER TABLE {quoted} {clause}")
+                try:
+                    cur.execute(f"ALTER TABLE {quoted} {clause}")
+                except Exception as exc:  # noqa: BLE001
+                    if not tolerate_failures:
+                        raise
+                    failed.append(f"{clause}: {exc}")
     finally:
         conn.close()
+    return failed
 
 
 def build_mysql_insert_columns(
@@ -1272,9 +1228,14 @@ class TransferService:
 
     async def source_table_definitions(
         self, source: DBProfile, tables: list[str]
-    ) -> tuple[bool, dict[str, list[str]], str]:
-        """What has to be put back after a swap, per table, read once for the whole run."""
-        schemas = sorted({_schema_of(table, source) for table in tables})
+    ) -> tuple[bool, dict[str, tuple[list[str], list[str]]], str]:
+        """What has to be put back per table: (clauses before the swap, clauses after it).
+
+        MySQL only: the DDL of one dialect is not the DDL of the other, so another
+        source type yields nothing rather than clauses the destination cannot run.
+        """
+        if source.db_type != "mysql":
+            return True, {}, "Definitions are only carried over from a MySQL source"
         endpoint: ResolvedEndpoint | None = None
         try:
             endpoint = self._resolve_profile(source)
@@ -1283,7 +1244,7 @@ class TransferService:
             password = self.secret_store.get_secret(source.password_secret_key) or ""
             definitions = await asyncio.to_thread(
                 _table_definitions_sync, host, port, source.database, source.username, password,
-                source.db_type, schemas, tls=endpoint.tls,
+                tables, tls=endpoint.tls,
             )
             return True, definitions, ""
         except Exception as exc:  # noqa: BLE001
@@ -1293,24 +1254,31 @@ class TransferService:
                 self.tunnel_manager.close_tunnel(endpoint.tunnel)
 
     async def apply_definition_clauses(
-        self, destination: DBProfile, table: str, clauses: list[str]
-    ) -> tuple[bool, str]:
-        """Put the definition back on one table: (ok, error). Order is the caller's."""
+        self, destination: DBProfile, table: str, clauses: list[str], tolerate_failures: bool = False
+    ) -> tuple[bool, list[str], str]:
+        """Put part of a definition back: (ok, failed clauses, error).
+
+        With tolerate_failures the clauses run one by one and the ones that do not apply
+        are reported instead of stopping the run. Check constraints need that: one
+        referring to a column apitap did not carry must not cost the whole table.
+        """
         if not clauses:
-            return True, ""
+            return True, [], ""
+        if destination.db_type != "mysql":
+            return True, [], "Destination is not MySQL"
         endpoint: ResolvedEndpoint | None = None
         try:
             endpoint = self._resolve_profile(destination)
             host = endpoint.tunnel.local_host if endpoint.tunnel else destination.host
             port = endpoint.tunnel.local_port if endpoint.tunnel else destination.port
             password = self.secret_store.get_secret(destination.password_secret_key) or ""
-            await asyncio.to_thread(
+            failed = await asyncio.to_thread(
                 _apply_definition_clauses_sync, host, port, destination.database, destination.username,
-                password, destination.db_type, table, clauses, tls=endpoint.tls,
+                password, table, clauses, tolerate_failures, tls=endpoint.tls,
             )
-            return True, ""
+            return True, failed, ""
         except Exception as exc:  # noqa: BLE001
-            return False, str(exc)
+            return False, [], str(exc)
         finally:
             if endpoint and endpoint.tunnel:
                 self.tunnel_manager.close_tunnel(endpoint.tunnel)

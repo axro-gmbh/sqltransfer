@@ -510,31 +510,36 @@ async def main() -> int:
     print("\n9j. The table definition is restored before the swap")
     order: list[str] = []
 
-    async def record_definition(_self, _dst, table, clauses):
-        order.append(f"definition:{table}")
-        return True, ""
+    async def record_definition(_self, _dst, table, clauses, tolerate_failures=False):
+        order.append(f"{'checks' if tolerate_failures else 'definition'}:{table}")
+        return True, [], ""
 
     async def record_swap(_self, _dst, temp_table, final_table):
         order.append("swap")
         return True, ""
 
-    app_module.TransferService.source_table_definitions = _async((True, {"kunde": ["AUTO_INCREMENT = 7"]}, ""))
+    app_module.TransferService.source_table_definitions = _async(
+        (True, {"kunde": (["AUTO_INCREMENT = 7"], ["ADD CONSTRAINT `c` CHECK ((1 = 1))"])}, "")
+    )
     app_module.TransferService.apply_definition_clauses = record_definition
     app_module.TransferService.mysql_swap_temp_to_final = record_swap
     app_module.TransferService.json_paths = _async((True, [], ""))
     click(button(root, "Run transfer"))
     await asyncio.sleep(0.2)
-    check(order and order[0].startswith("definition:") and order[-1] == "swap",
-          f"definition first, then the swap: {order}")
+    check(order and order[0].startswith("definition:") and "swap" in order,
+          f"the definition comes before the swap: {order}")
+    check(order[-1].startswith("checks:"), f"and the check constraints after it: {order}")
 
-    async def failing_definition(_self, _dst, _table, _clauses):
-        return False, "Unknown column 'weg' in generated column"
+    async def failing_definition(_self, _dst, _table, _clauses, tolerate_failures=False):
+        return False, [], "Unknown column 'weg' in generated column"
 
     app_module.TransferService.apply_definition_clauses = failing_definition
     order.clear()
     click(button(root, "Run transfer"))
     await asyncio.sleep(0.2)
+    status_after = find(root, ft.Text, size=13, expand=True).value
     check("swap" not in order, f"a failed restore stops the swap: {order}")
+    check("failed" in status_after.lower(), f"and the run reports failure: {status_after!r}")
 
     print("\n10. Every wired handler is an event its control really has")
     dead = []

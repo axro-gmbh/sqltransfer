@@ -39,6 +39,14 @@ original.
 
 ## How it works
 
+**The source of truth is `SHOW CREATE TABLE`, not information_schema.** The first attempt
+built the clauses from information_schema and failed against a real server: expressions
+come back with escaped quotes (`concat(_utf8mb4\\'x\\',\`coll\`)`), function defaults come
+back without the brackets MySQL requires (`CURRENT_TIMESTAMP` instead of
+`(CURRENT_TIMESTAMP)`), and neither is re-executable. `SHOW CREATE TABLE` is what the
+server itself would run, which also brings `NOT NULL`, the column collation and the
+`STORED`/`VIRTUAL` keyword along for free.
+
 Read once per run, like the indexes: `information_schema.columns` gives the default,
 `extra` and the generation expression per column, `information_schema.check_constraints`
 joined with `table_constraints` gives the checks, and `information_schema.tables` gives
@@ -54,7 +62,12 @@ depend on the earlier ones:
 3. defaults: `ALTER TABLE … ALTER COLUMN x SET DEFAULT …`
 4. `AUTO_INCREMENT`: `MODIFY COLUMN x <type> AUTO_INCREMENT`, then
    `ALTER TABLE … AUTO_INCREMENT = <counter>`
-5. checks: `ALTER TABLE … ADD CONSTRAINT <name> CHECK (…)`
+Check constraints are the exception: they run **after** the swap, with the foreign keys,
+because their names belong to the database and the outgoing table still carries them. A
+check that cannot be applied is reported and the rest still run.
+
+A `VIRTUAL` generated column cannot be converted from a plain one (error 3106), so it is
+dropped and re-added in place.
 
 A failure in any of these **fails the run**; the temp table is not swapped in, so the
 destination keeps its previous content rather than a half-restored definition. That is
@@ -65,11 +78,9 @@ replaced, only its rows are, so its definition was never lost.
 
 ## Limits
 
-- **PostgreSQL generated columns** cannot be added to an existing column; the column
-  would have to be dropped and re-added, which moves it to the end of the table. Out of
-  scope for now: the app reports them instead, as it does today.
-- **PostgreSQL identity columns** are left alone for the same reason.
-- Defaults and checks are restored on both dialects.
+- **MySQL to MySQL only.** The DDL of one dialect is not the DDL of the other, so a
+  PostgreSQL source yields no clauses at all rather than clauses the destination cannot
+  run, and a PostgreSQL destination is left as it was. Both are stated in the log.
 - A check constraint referring to a column apitap did not carry is reported and skipped
   rather than failing the run.
 

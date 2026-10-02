@@ -1466,8 +1466,13 @@ async def main(page: ft.Page) -> None:
                 if not def_ok:
                     log.append(f"Could not read the table definitions of the source: {def_msg}", "WARN")
                     source_definitions = {}
+                elif def_msg:
+                    log.append(def_msg, "WARN")
                 elif source_definitions:
                     log.append(f"Read the definition of {len(source_definitions)} source table(s)")
+                # Check constraints wait for the swap: their names are unique per
+                # database and the outgoing table still holds them.
+                deferred_checks: dict[str, list[str]] = {}
 
                 source_indexes: dict[str, dict[str, str]] = {}
                 if src.db_type == "mysql":
@@ -1593,16 +1598,18 @@ async def main(page: ft.Page) -> None:
                             # The definition comes after the indexes: AUTO_INCREMENT needs
                             # a key on its column. A failure here must not be published,
                             # so the run stops and the table is not swapped.
-                            clauses = source_definitions.get(final_name, [])
-                            if clauses:
-                                def_applied, def_error = await transfer_service.apply_definition_clauses(
-                                    dst, temp_name, clauses
+                            before_swap, after_swap = source_definitions.get(final_name, ([], []))
+                            if before_swap:
+                                def_applied, _failed, def_error = await transfer_service.apply_definition_clauses(
+                                    dst, temp_name, before_swap
                                 )
                                 if not def_applied:
                                     fail(f"Could not restore the definition of {final_name}: {def_error}")
                                     return
-                                log.append(f"Restored {len(clauses)} definition detail(s) for {final_name}")
+                                log.append(f"Restored {len(before_swap)} definition detail(s) for {final_name}")
                                 notes.append(f"definition={final_name}")
+                            if after_swap:
+                                deferred_checks[final_name] = after_swap
                             swapped, swap_msg = await transfer_service.mysql_swap_temp_to_final(
                                 dst, temp_table=temp_name, final_table=final_name
                             )
@@ -1611,7 +1618,8 @@ async def main(page: ft.Page) -> None:
                                 return
                             log.append(f"Swapped {temp_name} into {final_name}")
                             notes.append(f"swapped={final_name}")
-                            warn_generated(final_name)
+                            if final_name not in source_definitions:
+                                warn_generated(final_name)
                     else:
                         final_exists, final_err = await transfer_service.mysql_table_exists(dst, final_name)
                         if final_err:
@@ -1707,6 +1715,27 @@ async def main(page: ft.Page) -> None:
                         return
                     notes.append("fk_second_pass=ok")
                     log.append("Deferred foreign keys applied")
+
+                # Check constraints come after the swap for the same reason the foreign
+                # keys do: their names belong to the database, not to the table, so the
+                # outgoing table has to be gone first. One that cannot apply is reported
+                # and the rest still get their turn.
+                for table, check_clauses in deferred_checks.items():
+                    if table not in landed_tables:
+                        continue
+                    chk_ok, chk_failed, chk_err = await transfer_service.apply_definition_clauses(
+                        dst, table, check_clauses, tolerate_failures=True
+                    )
+                    if not chk_ok:
+                        log.append(f"Check constraints of {table} could not be restored: {chk_err}", "WARN")
+                        notes.append(f"check_restore_error={table}")
+                        continue
+                    for failure in chk_failed:
+                        log.append(f"Check constraint not restored on {table}: {failure}", "WARN")
+                        notes.append(f"check_failed={table}")
+                    applied = len(check_clauses) - len(chk_failed)
+                    if applied:
+                        notes.append(f"checks_restored={table}")
 
                 # Restore the foreign keys the swap dropped. Runs after a cancel too:
                 # the tables copied so far lost their keys either way. Keys that

@@ -1,69 +1,99 @@
-# tests/test_table_definition_ddl.py
+"""Turning a table's own DDL back into ALTER clauses.
+
+The fixtures below are verbatim `SHOW CREATE TABLE` output from MySQL 8, not written
+by hand: the first attempt at this feature built clauses from information_schema, whose
+text is not re-executable (escaped quotes, unparenthesised function defaults), and the
+hand-written fixtures agreed with the bug.
+"""
+
 from __future__ import annotations
 
-import pytest
+from sqltransfer_app.transfer import parse_mysql_table_definition
 
-from sqltransfer_app.transfer import build_definition_clauses
+HOSTILE_DDL = """CREATE TABLE `schwierig` (
+  `id` int NOT NULL,
+  `lauf` bigint unsigned NOT NULL AUTO_INCREMENT,
+  `angelegt` timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  `wort` varchar(20) NOT NULL DEFAULT 'null',
+  `klammer` varchar(20) DEFAULT '(none)',
+  `coll` varchar(20) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin DEFAULT NULL,
+  `zeit` datetime NOT NULL,
+  `tag` date GENERATED ALWAYS AS (cast(`zeit` as date)) STORED,
+  `mit_text` varchar(40) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin GENERATED ALWAYS AS (concat(_utf8mb4'x-',`coll`)) STORED NOT NULL,
+  `virtuell` varchar(40) GENERATED ALWAYS AS (concat(_utf8mb4'v-',`coll`)) VIRTUAL,
+  `betrag` decimal(10,2) DEFAULT '1.00',
+  `art` enum('a','b') DEFAULT 'a',
+  `geprueft` int DEFAULT NULL,
+  PRIMARY KEY (`id`),
+  UNIQUE KEY `lauf` (`lauf`),
+  KEY `idx_tag` (`tag`,`betrag`),
+  CONSTRAINT `chk_positiv` CHECK ((`geprueft` > 0)),
+  CONSTRAINT `chk_wort` CHECK ((`wort` <> _utf8mb4'bad'))
+) ENGINE=InnoDB AUTO_INCREMENT=7 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"""
 
-
-def _column(name, type_="varchar(20)", default=None, extra="", expression=None, nullable="YES"):
-    return {"name": name, "type": type_, "default": default, "extra": extra,
-            "generation_expression": expression, "is_nullable": nullable}
+PLAIN_DDL = """CREATE TABLE `schlicht` (
+  `id` int NOT NULL,
+  `name` varchar(20) DEFAULT NULL,
+  PRIMARY KEY (`id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"""
 
 
 def test_a_plain_table_needs_nothing():
-    assert build_definition_clauses([_column("name")], [], None, "mysql") == []
+    # "DEFAULT NULL" is what a nullable column has anyway; restating it is noise.
+    assert parse_mysql_table_definition(PLAIN_DDL) == ([], [])
 
 
-def test_a_generated_column_comes_before_a_default():
-    clauses = build_definition_clauses(
-        [_column("tag", "date", extra="STORED GENERATED", expression="cast(`zeit` as date)"),
-         _column("betrag", "decimal(10,2)", default="1.00")],
-        [], None, "mysql")
-    assert clauses == [
-        "MODIFY COLUMN `tag` date GENERATED ALWAYS AS (cast(`zeit` as date)) STORED",
-        "ALTER COLUMN `betrag` SET DEFAULT '1.00'",
+def test_the_column_line_is_taken_as_the_server_wrote_it():
+    before, _after = parse_mysql_table_definition(HOSTILE_DDL)
+    assert "MODIFY COLUMN `angelegt` timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP" in before
+    assert "MODIFY COLUMN `wort` varchar(20) NOT NULL DEFAULT 'null'" in before
+    assert "MODIFY COLUMN `klammer` varchar(20) DEFAULT '(none)'" in before
+    assert "MODIFY COLUMN `betrag` decimal(10,2) DEFAULT '1.00'" in before
+    assert "MODIFY COLUMN `art` enum('a','b') DEFAULT 'a'" in before
+
+
+def test_a_generated_column_keeps_its_collation_and_not_null():
+    before, _after = parse_mysql_table_definition(HOSTILE_DDL)
+    assert (
+        "MODIFY COLUMN `mit_text` varchar(40) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin "
+        "GENERATED ALWAYS AS (concat(_utf8mb4'x-',`coll`)) STORED NOT NULL"
+    ) in before
+
+
+def test_a_virtual_column_is_dropped_and_added_in_its_place():
+    # MySQL refuses to turn a plain column into a VIRTUAL one (error 3106), so the
+    # column is rebuilt where it stood.
+    before, _after = parse_mysql_table_definition(HOSTILE_DDL)
+    assert "DROP COLUMN `virtuell`" in before
+    assert (
+        "ADD COLUMN `virtuell` varchar(40) GENERATED ALWAYS AS (concat(_utf8mb4'v-',`coll`)) "
+        "VIRTUAL AFTER `mit_text`"
+    ) in before
+    positions = [i for i, clause in enumerate(before) if "`virtuell`" in clause]
+    assert before[positions[0]].startswith("DROP COLUMN") and before[positions[1]].startswith("ADD COLUMN")
+
+
+def test_untouched_columns_produce_nothing():
+    before, _after = parse_mysql_table_definition(HOSTILE_DDL)
+    untouched = ("MODIFY COLUMN `id`", "MODIFY COLUMN `zeit`", "MODIFY COLUMN `coll`")
+    assert not [clause for clause in before if clause.startswith(untouched)]
+
+
+def test_auto_increment_comes_with_its_counter_and_after_the_columns():
+    before, _after = parse_mysql_table_definition(HOSTILE_DDL)
+    assert "MODIFY COLUMN `lauf` bigint unsigned NOT NULL AUTO_INCREMENT" in before
+    assert before[-1] == "AUTO_INCREMENT = 7"
+
+
+def test_checks_are_separate_because_their_names_are_unique_per_database():
+    # Adding them before the swap collides with the original table's constraints.
+    _before, after = parse_mysql_table_definition(HOSTILE_DDL)
+    assert after == [
+        "ADD CONSTRAINT `chk_positiv` CHECK ((`geprueft` > 0))",
+        "ADD CONSTRAINT `chk_wort` CHECK ((`wort` <> _utf8mb4'bad'))",
     ]
 
 
-def test_a_virtual_generated_column_keeps_being_virtual():
-    clauses = build_definition_clauses(
-        [_column("k", "varchar(32)", extra="VIRTUAL GENERATED", expression="concat('k-',`id`)")],
-        [], None, "mysql")
-    assert clauses == ["MODIFY COLUMN `k` varchar(32) GENERATED ALWAYS AS (concat('k-',`id`)) VIRTUAL"]
-
-
-def test_a_function_default_is_not_quoted():
-    clauses = build_definition_clauses(
-        [_column("angelegt", "datetime", default="CURRENT_TIMESTAMP", extra="DEFAULT_GENERATED")],
-        [], None, "mysql")
-    assert clauses == ["ALTER COLUMN `angelegt` SET DEFAULT CURRENT_TIMESTAMP"]
-
-
-def test_auto_increment_carries_its_counter_and_comes_after_the_defaults():
-    clauses = build_definition_clauses(
-        [_column("lauf", "bigint unsigned", extra="auto_increment", nullable="NO"),
-         _column("betrag", "decimal(10,2)", default="1.00")],
-        [], 42, "mysql")
-    assert clauses == [
-        "ALTER COLUMN `betrag` SET DEFAULT '1.00'",
-        "MODIFY COLUMN `lauf` bigint unsigned NOT NULL AUTO_INCREMENT",
-        "AUTO_INCREMENT = 42",
-    ]
-
-
-def test_checks_come_last():
-    clauses = build_definition_clauses([_column("betrag", "decimal(10,2)", default="1.00")],
-                                       [("probe_chk_1", "(`betrag` > 0)")], None, "mysql")
-    assert clauses[-1] == "ADD CONSTRAINT `probe_chk_1` CHECK ((`betrag` > 0))"
-
-
-def test_postgres_takes_defaults_and_checks_only():
-    clauses = build_definition_clauses(
-        [_column("tag", "date", extra="", expression="(zeit)::date"),
-         _column("betrag", "numeric(10,2)", default="1.00")],
-        [("probe_chk_1", "(betrag > 0)")], None, "postgres")
-    assert clauses == [
-        'ALTER COLUMN "betrag" SET DEFAULT \'1.00\'',
-        'ADD CONSTRAINT "probe_chk_1" CHECK ((betrag > 0))',
-    ]
+def test_indexes_and_keys_are_left_to_the_index_step():
+    before, after = parse_mysql_table_definition(HOSTILE_DDL)
+    assert not [clause for clause in before + after if "KEY" in clause]
