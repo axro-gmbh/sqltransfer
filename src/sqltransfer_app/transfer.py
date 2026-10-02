@@ -143,9 +143,31 @@ def _report_failure_text(report: object) -> str | None:
     return None
 
 
+def build_mysql_insert_columns(
+    final_columns: list[tuple[str, bool]], temp_columns: list[str]
+) -> list[str]:
+    """Which columns an INSERT .. SELECT may carry: (name, is generated) for the
+    destination, plain names for the temp table.
+
+    MySQL refuses a value for a generated column (error 3105), and "SELECT *"
+    supplies one for every column the temp table has, so a Shopware order table
+    with its generated order_date could never be replaced in place.
+    """
+    available = {name.lower() for name in temp_columns}
+    usable = [name for name, generated in final_columns if not generated and name.lower() in available]
+    if not usable:
+        raise ValueError("no columns to copy: every column is generated or missing in the temp table")
+    return usable
+
+
 _COLUMNS_SQL = (
-    "SELECT column_name, data_type, character_maximum_length FROM information_schema.columns "
-    "WHERE table_schema = %s AND table_name = %s ORDER BY ordinal_position"
+    "SELECT column_name, data_type, character_maximum_length, extra, is_generated "
+    "FROM information_schema.columns WHERE table_schema = %s AND table_name = %s ORDER BY ordinal_position"
+)
+
+_MYSQL_COLUMNS_SQL = (
+    "SELECT column_name, data_type, character_maximum_length, extra "
+    "FROM information_schema.columns WHERE table_schema = %s AND table_name = %s ORDER BY ordinal_position"
 )
 
 
@@ -168,9 +190,19 @@ def _table_columns_sync(
                            dbname=database, connect_timeout=5, autocommit=True)
     try:
         with conn.cursor() as cur:
-            cur.execute(_COLUMNS_SQL, (schema, name))
-            columns = [Column(str(row[0]), str(row[1]), int(row[2]) if row[2] is not None else None)
-                       for row in cur.fetchall()]
+            # MySQL marks a generated column in `extra`, PostgreSQL in `is_generated`.
+            cur.execute(_MYSQL_COLUMNS_SQL if db_type == "mysql" else _COLUMNS_SQL, (schema, name))
+            columns = [
+                Column(
+                    str(row[0]),
+                    str(row[1]),
+                    int(row[2]) if row[2] is not None else None,
+                    generated=("GENERATED" in str(row[3] or "").upper())
+                    if db_type == "mysql"
+                    else str(row[4] or "").upper() == "ALWAYS",
+                )
+                for row in cur.fetchall()
+            ]
         if not columns:
             # Empty means "this table is not visible from here", never "it has no
             # columns". Treating it as nothing to do let a run report success while
@@ -1476,9 +1508,24 @@ def _mysql_replace_final_from_temp_sync(
                 cur.execute("SET SESSION net_read_timeout=600")
                 cur.execute("SET SESSION net_write_timeout=600")
                 cur.execute("SET FOREIGN_KEY_CHECKS=0")
+                cur.execute(
+                    "SELECT column_name, extra FROM information_schema.columns "
+                    "WHERE table_schema = DATABASE() AND table_name = %s ORDER BY ordinal_position",
+                    (final_table,),
+                )
+                final_columns = [(str(r[0]), "GENERATED" in str(r[1] or "").upper()) for r in cur.fetchall()]
+                cur.execute(
+                    "SELECT column_name FROM information_schema.columns "
+                    "WHERE table_schema = DATABASE() AND table_name = %s",
+                    (temp_table,),
+                )
+                temp_columns = [str(r[0]) for r in cur.fetchall()]
+                names = build_mysql_insert_columns(final_columns, temp_columns)
+                column_list = ", ".join(_quote_mysql_ident(name) for name in names)
                 cur.execute(f"DELETE FROM {_quote_mysql_ident(final_table)}")
                 cur.execute(
-                    f"INSERT INTO {_quote_mysql_ident(final_table)} SELECT * FROM {_quote_mysql_ident(temp_table)}"
+                    f"INSERT INTO {_quote_mysql_ident(final_table)} ({column_list}) "
+                    f"SELECT {column_list} FROM {_quote_mysql_ident(temp_table)}"
                 )
                 cur.execute(f"DROP TABLE {_quote_mysql_ident(temp_table)}")
                 cur.execute("SET FOREIGN_KEY_CHECKS=1")
