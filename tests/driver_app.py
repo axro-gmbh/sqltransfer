@@ -73,22 +73,28 @@ class FakePage:
         pass
 
     def show_dialog(self, dialog):
+        # Flet keeps snack bars and alert dialogs on one stack, so the driver does too:
+        # popping "the top one" can hit a snack bar that opened over a dialog.
+        dialog.open = True
+        self.dialogs.append(dialog)
         if isinstance(dialog, ft.SnackBar):
             self.snacks.append(text_of(dialog))
         else:
-            self.dialogs.append(dialog)
             self.seen_dialogs.append(dialog)
 
     def pop_dialog(self, *_a):
-        if self.dialogs:
-            self.dialogs.pop()
+        for dialog in reversed(self.dialogs):
+            if dialog.open:
+                dialog.open = False
+                return dialog
+        return None
 
     def run_task(self, coro_fn, *args):
         self.tasks.append(asyncio.ensure_future(coro_fn(*args)))
 
     @property
     def dialog(self):
-        return self.dialogs[-1] if self.dialogs else None
+        return next((d for d in reversed(self.dialogs) if d.open and not isinstance(d, ft.SnackBar)), None)
 
 
 def walk(node, seen=None):
@@ -423,6 +429,53 @@ async def main() -> int:
     await asyncio.sleep(0.2)
     log = log_text(root)
     check("voller_name" in log, f"the PostgreSQL path names them too: {log[-160:]}")
+
+    print("\n9g. A message on top of the dialog does not steal the close")
+    click(button(root, "New database profile"))
+    dialog = page.dialog
+    for label, value in (("Profile name", "mit-meldung"), ("DB host", "127.0.0.1"),
+                         ("Database name", "shop"), ("DB username", "root")):
+        find(dialog, ft.TextField, label=label).value = value
+    # what "Test connection" leaves behind: a snack bar above the open dialog
+    page.show_dialog(ft.SnackBar(content=ft.Text("Connection ok")))
+    click(button(dialog, "Save"))
+    check(dialog.open is False, "the profile dialog closed")
+    check(page.dialog is None, "no dialog is left open")
+    check(any("mit-meldung" in row for row in rows_of(db_rows)), "and the profile was saved")
+
+    print("\n9h. An SSH profile can be taken off a database profile again")
+    click(button(root, "New SSH profile"))
+    dialog = page.dialog
+    for label, value in (("Profile name", "jump"), ("SSH host", "jump.example.com"),
+                         ("SSH username", "deploy"), ("Private key path", "~/.ssh/id_ed25519")):
+        find(dialog, ft.TextField, label=label).value = value
+    click(button(dialog, "Save"))
+    check(page.dialog is None, "the SSH profile is saved")
+
+    click(button(root, "New database profile"))
+    dialog = page.dialog
+    for label, value in (("Profile name", "mit-tunnel"), ("DB host", "10.0.0.5"),
+                         ("Database name", "shop"), ("DB username", "reader")):
+        find(dialog, ft.TextField, label=label).value = value
+    tunnel_box = find(dialog, ft.Checkbox, label="Use SSH tunnel")
+    ssh_pick = find(dialog, ft.Dropdown, label="SSH profile")
+    tunnel_box.value = True
+    fire(tunnel_box, "on_change")
+    ssh_pick.value = next(o.key for o in ssh_pick.options if o.key)
+    click(button(dialog, "Save"))
+
+    click([c for c in walk(db_rows) if isinstance(c, ft.IconButton) and c.tooltip == "Edit"][
+        [r.split()[0] for r in rows_of(db_rows)].index("mit-tunnel")])
+    dialog = page.dialog
+    ssh_pick = find(dialog, ft.Dropdown, label="SSH profile")
+    tunnel_box = find(dialog, ft.Checkbox, label="Use SSH tunnel")
+    check(any(not o.key for o in ssh_pick.options), "the dropdown offers an empty entry")
+    tunnel_box.value = False
+    fire(tunnel_box, "on_change")
+    check(ssh_pick.value in (None, "") and ssh_pick.disabled, "unticking clears and locks the pick")
+    click(button(dialog, "Save"))
+    row = [r for r in rows_of(db_rows) if "mit-tunnel" in r][0]
+    check("SSH" not in row, f"the profile no longer uses a tunnel: {row}")
 
     print("\n10. Every wired handler is an event its control really has")
     dead = []
