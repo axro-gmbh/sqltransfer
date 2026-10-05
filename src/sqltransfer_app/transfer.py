@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from typing import Any, Literal
 from urllib.parse import quote_plus, urlencode
 
-from .anonymize import Column, TablePlan, update_statement
+from .anonymize import Column, JsonNode, TablePlan, mysql_json_path, update_statement
 from .models import DBProfile, SSHProfile, TransferResult
 from .secrets import SecretStore
 from .storage import Storage
@@ -192,6 +192,128 @@ def _generated_columns_sync(
     return group_generated_columns_by_table(rows)
 
 
+# Escaping a key for a MySQL JSON path, done by the server so the key never travels
+# through the statement text: backslash first, then the quote, both with a backslash.
+_JSON_LEVEL_BATCH = 25  # parents per discovery statement
+
+_MYSQL_KEY_ESCAPE = r"""REPLACE(REPLACE(jt.k, '\\', '\\\\'), '"', '\\"')"""
+
+
+def _json_paths_sync(
+    host: str,
+    port: int,
+    database: str,
+    username: str,
+    password: str,
+    db_type: str,
+    table: str,
+    column: str,
+    max_depth: int,
+    *,
+    tls: TlsSettings,
+) -> list[Column]:
+    """Discover the key paths of a JSON column, one query per level over all rows.
+
+    Returns JsonNode-shaped data: every path seen, with every JSON type observed for
+    it. Row-by-row inspection would mean a query per row; this is a query per level.
+    """
+    if db_type == "mysql":
+        conn = _mysql_connect(tls, host=host, port=port, user=username, password=password,
+                              database=database, connect_timeout=5, read_timeout=600, autocommit=True)
+    else:
+        conn = _pg_connect(tls, host=host, port=port, user=username, password=password,
+                           dbname=database, connect_timeout=5, autocommit=True)
+    quote = _quote_mysql_ident if db_type == "mysql" else _quote_pg_ident
+    quoted_table = ".".join(quote(part.strip('`"')) for part in table.split("."))
+    quoted_column = quote(column)
+    nodes: list[JsonNode] = []
+    try:
+        with conn.cursor() as cur:
+            if db_type == "mysql":
+                cur.execute(
+                    f"SELECT COUNT(*) FROM {quoted_table} WHERE {quoted_column} IS NOT NULL "
+                    f"AND NOT JSON_VALID({quoted_column})"
+                )
+                if int(cur.fetchone()[0]):
+                    raise ValueError(f"{table}.{column} does not hold valid JSON in every row")
+            else:
+                cur.execute(
+                    f"SELECT COUNT(*) FROM {quoted_table} WHERE {quoted_column} IS NOT NULL "
+                    f"AND pg_input_is_valid({quoted_column}::text, 'jsonb') IS NOT TRUE"
+                )
+                if int(cur.fetchone()[0]):
+                    raise ValueError(f"{table}.{column} does not hold valid JSON in every row")
+
+            # What the whole value is: an array or a scalar is reported rather than
+            # quietly yielding no keys at all.
+            if db_type == "mysql":
+                cur.execute(
+                    f"SELECT DISTINCT JSON_TYPE({quoted_column}) FROM {quoted_table} "
+                    f"WHERE {quoted_column} IS NOT NULL"
+                )
+            else:
+                cur.execute(
+                    f"SELECT DISTINCT jsonb_typeof({quoted_column}::jsonb) FROM {quoted_table} "
+                    f"WHERE {quoted_column} IS NOT NULL"
+                )
+            root_types = {str(row[0] or "NULL").upper() for row in cur.fetchall()}
+            if root_types and "OBJECT" not in root_types:
+                return [JsonNode(path=(), types=frozenset(root_types))]
+
+            parents: list[tuple[str, ...]] = [()]
+            for _depth in range(max_depth):
+                next_parents: list[tuple[str, ...]] = []
+                seen: dict[tuple[str, ...], set[str]] = {}
+                # One statement per batch of parents rather than per parent: a
+                # document with 40 objects on one level used to cost 40 round trips.
+                for chunk_start in range(0, len(parents), _JSON_LEVEL_BATCH):
+                    chunk = parents[chunk_start:chunk_start + _JSON_LEVEL_BATCH]
+                    branches, args = [], []
+                    for index, parent in enumerate(chunk):
+                        if db_type == "mysql":
+                            branches.append(
+                                f"SELECT DISTINCT {index} AS parent_index, "
+                                f"CAST(jt.k AS CHAR CHARACTER SET utf8mb4) COLLATE utf8mb4_bin AS k, "
+                                f"JSON_TYPE(JSON_EXTRACT(t.{quoted_column}, CONCAT(%s, '.\"', "
+                                f"{_MYSQL_KEY_ESCAPE}, '\"'))) AS t "
+                                f"FROM {quoted_table} t, JSON_TABLE(JSON_KEYS(t.{quoted_column}, %s), "
+                                f"'$[*]' COLUMNS (k VARCHAR(1024) CHARACTER SET utf8mb4 "
+                                f"COLLATE utf8mb4_bin PATH '$')) jt WHERE t.{quoted_column} IS NOT NULL"
+                            )
+                            args += [mysql_json_path(parent), mysql_json_path(parent)]
+                        else:
+                            at_parent = f"t.{quoted_column}::jsonb" + (" #> %s" if parent else "")
+                            branches.append(
+                                f"SELECT DISTINCT {index} AS parent_index, k, "
+                                f"jsonb_typeof(({at_parent}) -> k) AS t "
+                                f"FROM {quoted_table} t, LATERAL jsonb_object_keys({at_parent}) k "
+                                f"WHERE t.{quoted_column} IS NOT NULL "
+                                f"AND jsonb_typeof({at_parent}) = 'object'"
+                            )
+                            args += [list(parent)] * (3 if parent else 0)
+                    cur.execute(" UNION ALL ".join(branches), args)
+                    for parent_index, key, json_type in cur.fetchall():
+                        parent = chunk[int(parent_index)]
+                        if key is None:
+                            seen.setdefault((*parent, "?"), set()).add("UNREADABLE")
+                            continue
+                        seen.setdefault((*parent, str(key)), set()).add(str(json_type or "NULL").upper())
+
+                for path, types in seen.items():
+                    nodes.append(JsonNode(path=path, types=frozenset(types)))
+                    if "OBJECT" in types:
+                        next_parents.append(path)
+                parents = next_parents
+                if not parents:
+                    break
+            # Whatever is still waiting here sits deeper than max_depth.
+            for parent in parents:
+                nodes.append(JsonNode(path=parent, types=frozenset({"TOO_DEEP"})))
+    finally:
+        conn.close()
+    return nodes
+
+
 def build_mysql_insert_columns(
     final_columns: list[tuple[str, bool]], temp_columns: list[str]
 ) -> list[str]:
@@ -209,8 +331,9 @@ def build_mysql_insert_columns(
     return usable
 
 
+# PostgreSQL has no `extra` column; MySQL has no `is_generated`.
 _COLUMNS_SQL = (
-    "SELECT column_name, data_type, character_maximum_length, extra, is_generated "
+    "SELECT column_name, data_type, character_maximum_length, is_generated "
     "FROM information_schema.columns WHERE table_schema = %s AND table_name = %s ORDER BY ordinal_position"
 )
 
@@ -246,9 +369,10 @@ def _table_columns_sync(
                     str(row[0]),
                     str(row[1]),
                     int(row[2]) if row[2] is not None else None,
+                    # MySQL puts it in `extra`, PostgreSQL in `is_generated`; both land in row[3].
                     generated=("GENERATED" in str(row[3] or "").upper())
                     if db_type == "mysql"
-                    else str(row[4] or "").upper() == "ALWAYS",
+                    else str(row[3] or "").upper() == "ALWAYS",
                 )
                 for row in cur.fetchall()
             ]
@@ -968,6 +1092,31 @@ class TransferService:
             return True, grouped, ""
         except Exception as exc:  # noqa: BLE001
             return False, {}, str(exc)
+        finally:
+            if endpoint and endpoint.tunnel:
+                self.tunnel_manager.close_tunnel(endpoint.tunnel)
+
+    async def json_paths(
+        self, profile: DBProfile, table: str, column: str, max_depth: int = 4
+    ) -> tuple[bool, list[JsonNode], str]:
+        """Key paths inside a JSON column: (ok, nodes, error).
+
+        A column that does not hold valid JSON is an error for that column, not for
+        the run: the caller reports it and leaves the column alone.
+        """
+        endpoint: ResolvedEndpoint | None = None
+        try:
+            endpoint = self._resolve_profile(profile)
+            host = endpoint.tunnel.local_host if endpoint.tunnel else profile.host
+            port = endpoint.tunnel.local_port if endpoint.tunnel else profile.port
+            password = self.secret_store.get_secret(profile.password_secret_key) or ""
+            nodes = await asyncio.to_thread(
+                _json_paths_sync, host, port, profile.database, profile.username, password,
+                profile.db_type, table, column, max_depth, tls=endpoint.tls,
+            )
+            return True, nodes, ""
+        except Exception as exc:  # noqa: BLE001
+            return False, [], str(exc)
         finally:
             if endpoint and endpoint.tunnel:
                 self.tunnel_manager.close_tunnel(endpoint.tunnel)

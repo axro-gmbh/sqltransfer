@@ -136,6 +136,10 @@ The **Transfer** section has a switch, **Anonymize personal data**. It is on as 
 
 **The same value always yields the same replacement.** An address appearing in two tables is replaced identically in both, so joins keep working. Uniqueness, however, only holds for the kinds whose replacement carries the hash: **e-mail** and **generic text**. Names, cities and streets come from a list and repeat, so on a `UNIQUE` column pick e-mail or generic text. A random value in the Keychain, which never leaves your machine, makes those replacements unguessable. `NULL` stays `NULL`, empty stays empty.
 
+**JSON is rewritten too.** Columns of type `json` are searched automatically. When the JSON sits in a text column (the normal case in Shopware, `custom_fields` for example), add a rule with the kind **Look inside the JSON**. Your other rules then apply to the **key names**: `*mail*` covers the key `email` just as it covers a column `email`. The structure stays, only values change, and keys without a rule are left alone.
+
+Three limits: values inside **arrays** (`{"positions":[{"email":...}]}`) are reported but not replaced. Nesting is followed to the **fourth level**. And values that are **not strings** (a phone number stored as a number) stay as they are, so the application does not read back a different type. All three appear as WARN in the log.
+
 **See it before it happens:** **Preview plan** lists the affected columns before a single row is copied. After the run the log says what was replaced. Columns that look personal but have no rule appear as WARN, with the reason.
 
 **Limits worth knowing:**

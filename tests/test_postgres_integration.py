@@ -11,6 +11,7 @@ The test drops and recreates the databases `sqlt_pg_src` and `sqlt_pg_dst`.
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import re
 
@@ -146,10 +147,23 @@ def _rows(database: str, sql: str) -> list[tuple]:
 
 
 def _anonymize(dst: DBProfile, table: str, rules: list[Rule]) -> tuple[bool, int, str]:
+    """The three steps the app takes: read the columns, look into the JSON ones, rewrite."""
+    from dataclasses import replace as _replace
+
+    from sqltransfer_app.anonymize import plan_json_column
+
     service = _service()
     ok, columns, message = asyncio.run(service.table_columns(dst, table))
     assert ok, message
-    return asyncio.run(service.anonymize_table(dst, plan_table(table, columns, rules)))
+    plan = plan_table(table, columns, rules)
+    json_targets = []
+    for column, column_type in plan.json_columns:
+        ok, nodes, message = asyncio.run(service.json_paths(dst, table, column))
+        if not ok:
+            continue
+        found, _skipped, _descend = plan_json_column(column, nodes, rules)
+        json_targets += [_replace(t, column_type=column_type) for t in found]
+    return asyncio.run(service.anonymize_table(dst, _replace(plan, json_targets=tuple(json_targets))))
 
 
 def test_anonymizing_replaces_only_the_matched_columns(databases):
@@ -197,3 +211,77 @@ def test_a_unique_column_stays_unique(databases):
     ok, _affected, message = _anonymize(dst, "public.viele", [Rule(id=1, pattern="email", kind="email")])
     assert ok, message
     assert _rows(DST_DB, "SELECT COUNT(DISTINCT email) FROM viele")[0][0] == 200
+
+
+def test_json_paths_are_discovered_level_by_level(databases):
+    service = _service()
+    dst = _profile("local", DST_DB, "off")
+    _admin(DST_DB, "DROP TABLE IF EXISTS mitjson",
+           "CREATE TABLE mitjson (id INT PRIMARY KEY, custom_fields JSONB)",
+           """INSERT INTO mitjson VALUES
+              (1, '{"email":"a@axro.de","adresse":{"ort":"Hamburg","nummer":7},"positionen":[{"email":"x@y.de"}]}'),
+              (2, '{"email":"b@axro.de","notiz":"ohne"}'),
+              (3, NULL)""")
+
+    ok, nodes, message = asyncio.run(service.json_paths(dst, "public.mitjson", "custom_fields"))
+    assert ok, message
+    found = {node.path: node.types for node in nodes}
+    assert found[("email",)] == frozenset({"STRING"})
+    assert found[("adresse",)] == frozenset({"OBJECT"})
+    assert found[("adresse", "ort")] == frozenset({"STRING"})
+    assert found[("adresse", "nummer")] == frozenset({"NUMBER"})
+    assert found[("positionen",)] == frozenset({"ARRAY"})
+    assert ("positionen", "email") not in found
+
+
+def test_a_text_column_that_is_not_json_is_refused_cleanly(databases):
+    service = _service()
+    dst = _profile("local", DST_DB, "off")
+    _admin(DST_DB, "DROP TABLE IF EXISTS keinjson",
+           "CREATE TABLE keinjson (id INT PRIMARY KEY, notiz TEXT)",
+           "INSERT INTO keinjson VALUES (1, 'das ist kein json')")
+    ok, nodes, message = asyncio.run(service.json_paths(dst, "public.keinjson", "notiz"))
+    assert not ok and not nodes
+    assert "json" in message.lower()
+
+
+def test_values_inside_json_are_replaced_and_the_structure_survives(databases):
+    dst = _profile("local", DST_DB, "off")
+    _admin(DST_DB, "DROP TABLE IF EXISTS jsonkunde",
+           "CREATE TABLE jsonkunde (id INT PRIMARY KEY, email TEXT, custom_fields JSONB, daten TEXT)",
+           """INSERT INTO jsonkunde VALUES
+              (1,'max@axro.de','{"email":"max@axro.de","adresse":{"ort":"Hamburg"},"umsatz":42,
+                                 "positionen":[{"email":"x@y.de"}]}','{"email":"max@axro.de"}'),
+              (2,'erika@axro.de','{"notiz":"ohne mail"}','{}'),
+              (3,'leer@axro.de', NULL, NULL)""")
+
+    rules = [Rule(id=1, pattern="*mail*", kind="email"), Rule(id=2, pattern="ort", kind="city"),
+             Rule(id=3, pattern="daten", kind="json")]
+    ok, _affected, message = _anonymize(dst, "public.jsonkunde", rules)
+    assert ok, message
+
+    rows = _rows(DST_DB, "SELECT id, email, custom_fields, daten FROM jsonkunde ORDER BY id")
+    first = rows[0][2] if isinstance(rows[0][2], dict) else json.loads(rows[0][2])
+    assert first["email"].endswith("@example.invalid")
+    assert first["email"] == rows[0][1]
+    assert first["umsatz"] == 42
+    assert first["adresse"]["ort"] != "Hamburg"
+    assert first["positionen"] == [{"email": "x@y.de"}]
+    assert json.loads(rows[0][3])["email"] == first["email"]   # the text column keeps being text
+    assert rows[2][2] is None and rows[2][3] is None
+    assert "max@axro.de" not in str(rows) and "Hamburg" not in str(rows)
+
+
+def test_a_generated_column_is_recognised(databases):
+    # The column query used to select MySQL's `extra`, which PostgreSQL does not
+    # have: every destination of this type failed with 'column "extra" does not exist'.
+    service = _service()
+    dst = _profile("local", DST_DB, "off")
+    _admin(DST_DB, "DROP TABLE IF EXISTS generiert",
+           "CREATE TABLE generiert (id INT PRIMARY KEY, email TEXT,"
+           " kontakt TEXT GENERATED ALWAYS AS (email || '.test') STORED)")
+    ok, columns, message = asyncio.run(service.table_columns(dst, "public.generiert"))
+    assert ok, message
+    by_name = {c.name: c for c in columns}
+    assert by_name["kontakt"].generated is True
+    assert by_name["email"].generated is False

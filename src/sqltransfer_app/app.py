@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 import socket
@@ -10,7 +11,8 @@ from uuid import uuid4
 import flet as ft
 
 from . import __version__, ui
-from .anonymize import KINDS, Rule, plan_table
+
+from .anonymize import KINDS, JsonTarget, Rule, json_path_text, plan_json_column, plan_table
 from .models import DBProfile, SSHProfile, TransferResult
 from .profiles import (
     DestinationWarning,
@@ -1173,18 +1175,38 @@ async def main(page: ft.Page) -> None:
             log.append(f"Could not read columns of {label}: {message}", "ERROR")
             return False
         plan = plan_table(table, columns, rules)
+
+        # A JSON column is looked into: its paths are discovered in the database and
+        # planned like columns, so the structure survives and only values change.
+        json_targets: list[JsonTarget] = []
+        json_skipped: list[tuple[str, str]] = []
+        for column, column_type in plan.json_columns:
+            ok, nodes, message = await transfer_service.json_paths(profile, table, column)
+            if not ok:
+                # One unreadable column must not stop a transfer; say so and move on.
+                log.append(f"{label}.{column} was not searched: {message}", "WARN")
+                continue
+            found, skipped_paths, _descend = plan_json_column(column, nodes, rules)
+            json_targets += [replace(target, column_type=column_type) for target in found]
+            json_skipped += list(skipped_paths)
+        plan = replace(plan, json_targets=tuple(json_targets), skipped=plan.skipped + tuple(json_skipped))
+
         for column, reason in plan.skipped:
-            log.append(f"{label}.{column} looks personal but was not anonymized: {reason}", "WARN")
-        if not plan.targets:
+            log.append(f"{label}.{column} was not anonymized: {reason}", "WARN")
+        if not plan.targets and not plan.json_targets:
             return True
         started = time.monotonic()
         ok, affected, message = await transfer_service.anonymize_table(profile, plan)
         if not ok:
             log.append(f"Anonymizing {label} failed: {message}", "ERROR")
             return False
-        names = ", ".join(column for column, _kind, _length in plan.targets)
+        names = ", ".join(
+            [column for column, _kind, _length in plan.targets]
+            + [json_path_text(t.column, t.path) for t in plan.json_targets]
+        )
         log.append(
-            f"Anonymized {label}: {names} ({len(plan.targets)} columns, {ui.format_rows(affected)} rows, "
+            f"Anonymized {label}: {names} ({len(plan.targets) + len(plan.json_targets)} values, "
+            f"{ui.format_rows(affected)} rows, "
             f"{ui.format_duration(int((time.monotonic() - started) * 1000))})"
         )
         return True
@@ -1321,10 +1343,22 @@ async def main(page: ft.Page) -> None:
                     log.append(f"Could not read columns of {table}: {message}", "WARN")
                     continue
                 table_plan = plan_table(table, columns, rules)
-                if table_plan.targets:
-                    log.append(f"Would anonymize {table}: " + ", ".join(c for c, _k, _l in table_plan.targets))
-                for column, reason in table_plan.skipped:
-                    log.append(f"{table}.{column} looks personal but has no rule: {reason}", "WARN")
+                would = [c for c, _k, _l in table_plan.targets]
+                reported = list(table_plan.skipped)
+                # The same look into the JSON columns the run will take, so the
+                # preview does not stay silent about the paths it would rewrite.
+                for column, _column_type in table_plan.json_columns:
+                    ok, nodes, message = await transfer_service.json_paths(src, table, column)
+                    if not ok:
+                        log.append(f"{table}.{column} could not be searched: {message}", "WARN")
+                        continue
+                    found, skipped_paths, _descend = plan_json_column(column, nodes, rules)
+                    would += [json_path_text(t.column, t.path) for t in found]
+                    reported += list(skipped_paths)
+                if would:
+                    log.append(f"Would anonymize {table}: " + ", ".join(would))
+                for column, reason in reported:
+                    log.append(f"{table}.{column} was not anonymized: {reason}", "WARN")
             if len(scoped_tables) > 20:
                 log.append(f"({len(scoped_tables) - 20} further tables not checked in the preview)")
 
