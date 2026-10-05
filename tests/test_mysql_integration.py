@@ -872,3 +872,27 @@ def test_auto_increment_without_its_key_is_reported_not_fatal(databases):
     ))
     assert ok, message
     assert len(failed) == 1 and "auto column" in failed[0]
+
+
+def test_the_scope_database_decides_which_tables_are_listed(databases):
+    """A whole-database scope names its own database; the profile's is only the fallback.
+
+    Everything after the listing (indexes, definitions) derives the schema from the
+    table name, so a bare name from the wrong database silently restores nothing.
+    """
+    service = _service()
+
+    # the usual case: profile and scope name the same database
+    ok, tables, message = asyncio.run(service.list_tables(_profile("remote", SRC_DB), schema_hint=SRC_DB))
+    assert ok, message
+    assert "items" in tables
+
+    # the profile has no database of its own
+    ok, tables, message = asyncio.run(service.list_tables(_profile("remote", ""), schema_hint=SRC_DB))
+    assert ok, message
+    assert f"{SRC_DB}.items" in tables, tables
+
+    # the profile points somewhere else
+    ok, tables, message = asyncio.run(service.list_tables(_profile("remote", DST_DB), schema_hint=SRC_DB))
+    assert ok, message
+    assert f"{SRC_DB}.items" in tables, tables

@@ -1420,6 +1420,10 @@ def _list_tables_sync(
         write_timeout=8,
         autocommit=True,
     )
+    # The scope names its own database; the profile's is only the fallback. Everything
+    # after the listing (indexes, definitions) reads the schema off the table name, so
+    # a bare name from the wrong database would silently restore nothing.
+    schema = (schema_hint or "").strip().strip('`"') or database
     try:
         with conn.cursor() as cur:
             cur.execute(
@@ -1431,11 +1435,14 @@ def _list_tables_sync(
                 ORDER BY table_name
                 LIMIT %s
                 """,
-                (database, limit),
+                (schema, limit),
             )
-            return [str(row[0]) for row in cur.fetchall()]
+            names = [str(row[0]) for row in cur.fetchall()]
     finally:
         conn.close()
+    if schema == database:
+        return names
+    return [f"{schema}.{name}" for name in names]
 
 
 def _quote_mysql_ident(name: str) -> str:
