@@ -203,3 +203,26 @@ def test_one_impossible_clause_does_not_cost_the_rest_of_the_definition(database
 
     ddl = _sql(DST_DB, "SHOW CREATE TABLE neu")[0][1]
     assert "GENERATED ALWAYS AS (cast(`zeit` as date)) STORED" in ddl, ddl
+
+
+def test_an_aborted_run_takes_its_temp_table_with_it(databases, monkeypatch):
+    """Otherwise every failed run leaves another apx_… table in the destination."""
+    _sql(SRC_DB, "CREATE TABLE neu (id INT PRIMARY KEY, zeit DATETIME NOT NULL)",
+         "INSERT INTO neu (id, zeit) VALUES (1,'2026-01-01 10:00:00')")
+
+    tmp = Path(tempfile.mkdtemp(prefix="sqlt-real-"))
+    monkeypatch.setattr(app_module, "_app_data_dir", lambda: tmp)
+    SharedSecrets.store = {}
+    monkeypatch.setattr(app_module, "SecretStore", SharedSecrets)
+
+    async def kein_tausch(self, destination, *, temp_table, final_table):
+        return False, "swap refused on purpose"
+
+    monkeypatch.setattr(app_module.TransferService, "mysql_swap_temp_to_final", kein_tausch)
+
+    page = FakePage()
+    status = asyncio.run(_run_whole_database(page))
+    assert "failed" in status.lower(), status
+
+    rest = _sql(DST_DB, "SHOW TABLES LIKE 'apx\\_%'")
+    assert rest == (), f"left behind: {rest}"

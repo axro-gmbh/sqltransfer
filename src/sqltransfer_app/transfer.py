@@ -424,6 +424,37 @@ def _table_definitions_sync(
     return definitions, problems
 
 
+def _drop_mysql_tables_sync(
+    host: str,
+    port: int,
+    database: str,
+    username: str,
+    password: str,
+    tables: list[str],
+    *,
+    tls: TlsSettings,
+) -> int:
+    """Returns how many of the tables were actually there."""
+    conn = _mysql_connect(tls, host=host, port=port, user=username, password=password,
+                          database=database, connect_timeout=5, read_timeout=600, autocommit=True)
+    dropped = 0
+    try:
+        with conn.cursor() as cur:
+            for table in tables:
+                cur.execute(
+                    "SELECT 1 FROM information_schema.tables WHERE table_schema = DATABASE() "
+                    "AND table_name = %s LIMIT 1",
+                    (table,),
+                )
+                if cur.fetchone() is None:
+                    continue
+                cur.execute(f"DROP TABLE {_quote_mysql_ident(table)}")
+                dropped += 1
+    finally:
+        conn.close()
+    return dropped
+
+
 def _apply_definition_clauses_sync(
     host: str,
     port: int,
@@ -1071,6 +1102,33 @@ class TransferService:
             return True, applied, failed, ""
         except Exception as exc:  # noqa: BLE001
             return False, {}, [], str(exc)
+        finally:
+            if endpoint and endpoint.tunnel:
+                self.tunnel_manager.close_tunnel(endpoint.tunnel)
+
+    async def mysql_drop_tables(
+        self, destination: DBProfile, tables: list[str]
+    ) -> tuple[bool, int, str]:
+        """Drop the given tables, ignoring the ones that are not there.
+
+        Used to take a run's own temp tables with it when it fails: they are useless
+        to anyone and used to pile up in the destination with every failed run.
+        """
+        if destination.db_type != "mysql":
+            return True, 0, ""
+        endpoint: ResolvedEndpoint | None = None
+        try:
+            endpoint = self._resolve_profile(destination)
+            host = endpoint.tunnel.local_host if endpoint.tunnel else destination.host
+            port = endpoint.tunnel.local_port if endpoint.tunnel else destination.port
+            password = self.secret_store.get_secret(destination.password_secret_key) or ""
+            dropped = await asyncio.to_thread(
+                _drop_mysql_tables_sync, host, port, destination.database, destination.username,
+                password, tables, tls=endpoint.tls,
+            )
+            return True, dropped, ""
+        except Exception as exc:  # noqa: BLE001
+            return False, 0, str(exc)
         finally:
             if endpoint and endpoint.tunnel:
                 self.tunnel_manager.close_tunnel(endpoint.tunnel)

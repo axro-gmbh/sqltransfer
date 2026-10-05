@@ -1421,6 +1421,10 @@ async def main(page: ft.Page) -> None:
             )
             refresh_run_history()
 
+        # Temp tables this run created and has not got rid of yet. A failing run takes
+        # them with it instead of leaving them in the destination for good.
+        open_temp_tables: list[str] = []
+
         try:
             if dst.db_type == "mysql":
                 scope_ok, scoped_tables, scoped_msg = await _scope_tables_for_check(src, mode, scope)
@@ -1553,6 +1557,8 @@ async def main(page: ft.Page) -> None:
                         f"rows={item_result.rows}, ms={item_result.elapsed_ms}"
                     )
 
+                    open_temp_tables.append(temp_name)
+
                     temp_exists, temp_err = await transfer_service.mysql_table_exists(dst, temp_name)
                     if temp_err:
                         fail(f"Could not verify temp table for {final_name}: {temp_err}")
@@ -1582,6 +1588,8 @@ async def main(page: ft.Page) -> None:
                             if not replaced:
                                 fail(f"In-place replace failed for {final_name}: {replace_msg}")
                                 return
+                            if temp_name in open_temp_tables:
+                                open_temp_tables.remove(temp_name)
                             log.append(f"In-place replace done for {final_name}: {replace_msg}")
                             notes.append(f"inplace={final_name}")
 
@@ -1688,6 +1696,8 @@ async def main(page: ft.Page) -> None:
                             swapped, swap_msg = await transfer_service.mysql_swap_temp_to_final(
                                 dst, temp_table=temp_name, final_table=final_name
                             )
+                            if swapped and temp_name in open_temp_tables:
+                                open_temp_tables.remove(temp_name)
                             if not swapped:
                                 fail(f"Swap failed for {final_name}: {swap_msg}")
                                 return
@@ -1907,6 +1917,15 @@ async def main(page: ft.Page) -> None:
             page.update()
         except Exception as exc:  # noqa: BLE001
             fail(f"Unhandled error: {exc}")
+        finally:
+            if open_temp_tables:
+                gone_ok, gone, gone_err = await transfer_service.mysql_drop_tables(dst, open_temp_tables)
+                if not gone_ok:
+                    log.append(f"Temp table(s) of this run could not be removed: {gone_err}", "WARN")
+                elif gone:
+                    log.append(f"Removed {gone} temp table(s) this run had left over")
+                open_temp_tables.clear()
+                page.update()
 
     # ------------------------------------------------------------------ wiring
 

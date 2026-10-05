@@ -937,3 +937,22 @@ def test_a_definition_in_a_charset_the_connection_cannot_decode_is_still_read(da
     assert ok, message
     before, _after = definitions["marke"]
     assert any("`zeichen`" in clause for clause in before), before
+
+
+def test_leftover_temp_tables_can_be_dropped(databases):
+    """An aborted run used to leave its temp table in the destination for good."""
+    _exec(DST_DB, "CREATE TABLE apx_rest_1 (id INT PRIMARY KEY)")
+
+    ok, dropped, error = asyncio.run(
+        _service().mysql_drop_tables(_profile("local", DST_DB), ["apx_rest_1", "gibt_es_nicht"])
+    )
+    assert ok, error
+    assert dropped == 1
+
+    conn = pymysql.connect(**_conn_args(), database=DST_DB, autocommit=True)
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SHOW TABLES LIKE 'apx\\_%'")
+            assert cur.fetchall() == ()
+    finally:
+        conn.close()
