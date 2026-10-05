@@ -95,3 +95,18 @@ def test_generated_columns_of_a_table_without_any_are_absent():
     from sqltransfer_app.transfer import group_generated_columns_by_table
 
     assert group_generated_columns_by_table([]) == {}
+
+
+def test_a_function_default_is_not_a_generated_column():
+    # MySQL puts DEFAULT_GENERATED in the same `extra` column as STORED GENERATED.
+    # Reading it as "generated" dropped created_at-style columns from the in-place
+    # copy, silently, and emptied the column list for tables made only of such columns.
+    from sqltransfer_app.transfer import mysql_column_is_generated
+
+    assert mysql_column_is_generated("STORED GENERATED") is True
+    assert mysql_column_is_generated("VIRTUAL GENERATED") is True
+    assert mysql_column_is_generated("DEFAULT_GENERATED") is False
+    assert mysql_column_is_generated("DEFAULT_GENERATED on update CURRENT_TIMESTAMP") is False
+    assert mysql_column_is_generated("auto_increment") is False
+    assert mysql_column_is_generated("") is False
+    assert mysql_column_is_generated(None) is False

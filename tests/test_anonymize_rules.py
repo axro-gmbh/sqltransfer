@@ -87,7 +87,19 @@ def test_no_default_rule_renames_every_name_column():
     from sqltransfer_app.anonymize import DEFAULT_RULES
 
     assert "name" not in [pattern for pattern, _kind in DEFAULT_RULES]
-    assert any(pattern == "*vorname*" or pattern == "vorname" for pattern, _kind in DEFAULT_RULES)
+    assert any(pattern == "firstname" for pattern, _kind in DEFAULT_RULES)
+
+
+def test_the_prefill_is_english_only():
+    """The Axro databases name their columns in English, so German patterns only
+    lengthen a list every developer has to read."""
+    from sqltransfer_app.anonymize import DEFAULT_RULES
+
+    muster = [pattern for pattern, _kind in DEFAULT_RULES]
+    assert not [p for p in muster if p in {"vorname", "nachname", "*vorname*", "*nachname*",
+                                           "adresse", "ort", "plz", "strasse", "*telefon*"}], muster
+    for erwartet in ("firstname", "lastname", "company", "department"):
+        assert erwartet in muster, muster
 
 
 def test_a_json_rule_marks_a_column_for_looking_into_it():

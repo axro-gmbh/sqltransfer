@@ -170,7 +170,13 @@ On the right are the last 20 runs with status, source, destination, scope, row c
 
 **The destination table is replaced, not added to.** A transfer overwrites the table at the destination. It does not append rows and does not merge anything. So the destination is your local development database, never something whose content anyone depends on.
 
-**Computed columns do not survive a swap.** When the app creates a table or swaps one in, the copy gets the schema apitap produces: columns and primary key, plus the source's indexes and foreign keys. A generated column (`order_date date AS (cast(order_date_time as date)) stored`) becomes an ordinary one. Its values are right at the moment of the transfer but are never recomputed: change `order_date_time` locally and `order_date` stays as it was. The log names the affected columns as WARN. Only tables that other tables reference keep their schema, because there just the rows are replaced.
+**The table definition is restored.** When the app creates a table or swaps one in, apitap brings columns, types and the primary key only. The app then puts back what governs writing: **generated columns** with their expression, **defaults**, **CHECK constraints** and **AUTO_INCREMENT** with its counter, on top of the indexes and foreign keys it already restored. Writing against the copy therefore behaves like writing against the original: `order_date` follows along again, an insert without the column takes the default, and a violated constraint is refused.
+
+If one of those steps fails, the run stops and nothing is swapped. The old table is better than a half-restored one.
+
+The source of truth is the source's own `SHOW CREATE TABLE`, the definition as the server states it. Check constraints are applied after the swap, because in MySQL their names belong to the database and the outgoing table holds them until then. One that cannot be applied is reported and does not cost the table. That holds for every detail: whatever the server will not take back (a binary default, for instance, which it writes differently from how it accepts it) goes into the log with its clause and the reason, and the table's other details are still applied.
+
+Not carried over: triggers, views, partitioning and column comments. **All of this is MySQL to MySQL only.** With a PostgreSQL source or destination the previous behaviour stands: the copy loses these properties and the log says so.
 
 **Special handling with MySQL as destination.** The app copies every table into a temporary table first and swaps it in one step at the end, so nobody sees a half filled table. When other tables reference the destination table by a foreign key, the app does not swap it but replaces the rows in place instead, because a swap would break those references. That shows up as WARN in the log. It is not an error, it says a detour was taken.
 

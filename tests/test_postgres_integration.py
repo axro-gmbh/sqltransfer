@@ -285,3 +285,13 @@ def test_a_generated_column_is_recognised(databases):
     by_name = {c.name: c for c in columns}
     assert by_name["kontakt"].generated is True
     assert by_name["email"].generated is False
+
+
+def test_definitions_are_not_carried_from_a_postgresql_source(databases):
+    # The DDL of one dialect is not the DDL of the other. Rather than build clauses a
+    # MySQL destination cannot run, the app says so and leaves the table alone.
+    service = _service()
+    src = _profile("remote", SRC_DB, "off")
+    ok, definitions, message = asyncio.run(service.table_definitions(src, [f"{SRC_DB}.egal"]))
+    assert ok and definitions == {}
+    assert "MySQL source" in message

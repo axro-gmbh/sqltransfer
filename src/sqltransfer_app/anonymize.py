@@ -27,26 +27,22 @@ KINDS: tuple[tuple[str, str], ...] = (
     ("empty", "Empty"),
 )
 
-# Seeded on first start; German and English spellings of the usual columns.
+# Seeded on first start. English only: the Axro databases name their columns that
+# way, and a German pattern nobody matches just lengthens the list.
 DEFAULT_RULES: tuple[tuple[str, str], ...] = (
     ("*mail*", "email"),
-    ("vorname", "firstname"),
+    ("firstname", "firstname"),
     ("first_name", "firstname"),
-    ("nachname", "lastname"),
+    ("lastname", "lastname"),
     ("last_name", "lastname"),
-    ("*vorname*", "firstname"),
-    ("*nachname*", "lastname"),
-    ("*telefon*", "phone"),
     ("phone*", "phone"),
     ("mobil*", "phone"),
-    ("strasse", "street"),
     ("street*", "street"),
-    ("adresse", "street"),
     ("address*", "street"),
-    ("plz", "postcode"),
     ("zip*", "postcode"),
-    ("ort", "city"),
     ("city", "city"),
+    ("company", "text"),
+    ("department", "text"),
 )
 
 # information_schema data types we dare to overwrite with a string.

@@ -1421,6 +1421,10 @@ async def main(page: ft.Page) -> None:
             )
             refresh_run_history()
 
+        # Temp tables this run created and has not got rid of yet. A failing run takes
+        # them with it instead of leaving them in the destination for good.
+        open_temp_tables: list[str] = []
+
         try:
             if dst.db_type == "mysql":
                 scope_ok, scoped_tables, scoped_msg = await _scope_tables_for_check(src, mode, scope)
@@ -1456,6 +1460,25 @@ async def main(page: ft.Page) -> None:
                             "values from this transfer and will not recompute them.",
                             "WARN",
                         )
+
+                # apitap carries columns, types and the primary key; what governs
+                # writing (generated columns, defaults, AUTO_INCREMENT, checks) has to
+                # be put back on the temp table before it is swapped in.
+                def_ok, source_definitions, def_msg = await transfer_service.table_definitions(
+                    src, scoped_tables
+                )
+                if not def_ok:
+                    # Carrying on would hand back a copy that looks finished and is
+                    # missing every generated column, default and check.
+                    fail(f"Could not read the table definitions of the source: {def_msg}")
+                    return
+                elif def_msg:
+                    log.append(def_msg, "WARN")
+                elif source_definitions:
+                    log.append(f"Read the definition of {len(source_definitions)} source table(s)")
+                # Check constraints wait for the swap: their names are unique per
+                # database and the outgoing table still holds them.
+                deferred_checks: dict[str, list[str]] = {}
 
                 source_indexes: dict[str, dict[str, str]] = {}
                 if src.db_type == "mysql":
@@ -1534,6 +1557,8 @@ async def main(page: ft.Page) -> None:
                         f"rows={item_result.rows}, ms={item_result.elapsed_ms}"
                     )
 
+                    open_temp_tables.append(temp_name)
+
                     temp_exists, temp_err = await transfer_service.mysql_table_exists(dst, temp_name)
                     if temp_err:
                         fail(f"Could not verify temp table for {final_name}: {temp_err}")
@@ -1563,8 +1588,57 @@ async def main(page: ft.Page) -> None:
                             if not replaced:
                                 fail(f"In-place replace failed for {final_name}: {replace_msg}")
                                 return
+                            if temp_name in open_temp_tables:
+                                open_temp_tables.remove(temp_name)
                             log.append(f"In-place replace done for {final_name}: {replace_msg}")
                             notes.append(f"inplace={final_name}")
+
+                            # This table was never replaced, so it still carries whatever
+                            # definition it had, possibly from a run of an older version
+                            # that dropped the generated columns. Compare and fix.
+                            wanted_before, wanted_after = source_definitions.get(final_name, ([], []))
+                            if wanted_before or wanted_after:
+                                have_ok, have, have_msg = await transfer_service.table_definitions(
+                                    dst, [final_name]
+                                )
+                                have_before, _have_after = have.get(final_name, ([], [])) if have_ok else ([], [])
+                                if not have_ok:
+                                    log.append(
+                                        f"Could not read the current definition of {final_name}: {have_msg}", "WARN"
+                                    )
+                                elif wanted_before and wanted_before != have_before:
+                                    def_ok, def_failed, def_err = await transfer_service.apply_definition_clauses(
+                                        dst, final_name, wanted_before, tolerate_failures=True
+                                    )
+                                    if not def_ok:
+                                        fail(f"Could not restore the definition of {final_name}: {def_err}")
+                                        return
+                                    for failure in def_failed:
+                                        log.append(
+                                            f"Definition detail not restored on {final_name}: {failure}", "WARN"
+                                        )
+                                        notes.append(f"definition_failed={final_name}")
+                                    log.append(
+                                        f"Restored {len(wanted_before) - len(def_failed)} "
+                                        f"definition detail(s) for {final_name}"
+                                    )
+                                    notes.append(f"definition={final_name}")
+                                if wanted_after:
+                                    # Constraints the table already carries come back as
+                                    # a duplicate-name error; that one is not a finding.
+                                    chk_ok, chk_failed, chk_err = await transfer_service.apply_definition_clauses(
+                                        dst, final_name, wanted_after, tolerate_failures=True
+                                    )
+                                    if not chk_ok:
+                                        log.append(
+                                            f"Check constraints of {final_name} could not be restored: {chk_err}",
+                                            "WARN",
+                                        )
+                                    for failure in chk_failed:
+                                        if "Duplicate check constraint" in failure:
+                                            continue
+                                        log.append(f"Check constraint not restored on {final_name}: {failure}", "WARN")
+                                        notes.append(f"check_failed={final_name}")
                             # The table stays in place; this repairs indexes an earlier swap removed.
                             await apply_source_indexes(final_name, final_name)
                         else:
@@ -1577,15 +1651,60 @@ async def main(page: ft.Page) -> None:
                             # Index the temp table before the swap, so the table that gets
                             # published is complete from its first moment.
                             await apply_source_indexes(temp_name, final_name)
+
+                            # The definition comes after the indexes: AUTO_INCREMENT needs
+                            # a key on its column. A failure here must not be published,
+                            # so the run stops and the table is not swapped.
+                            before_swap, after_swap = source_definitions.get(final_name, ([], []))
+                            # AUTO_INCREMENT needs a key on its column. When the index
+                            # step could not build it, that clause fails and is reported,
+                            # rather than costing the whole transfer.
+                            columns = [c for c in before_swap if "AUTO_INCREMENT" not in c]
+                            increments = [c for c in before_swap if "AUTO_INCREMENT" in c]
+                            inc_failed_names: list[str] = []
+                            definition_failures = 0
+                            if columns:
+                                # One column MySQL will not take back (a binary default,
+                                # for instance) must not cost the table every other
+                                # detail, nor the developer the whole copy.
+                                def_applied, def_failed, def_error = await transfer_service.apply_definition_clauses(
+                                    dst, temp_name, columns, tolerate_failures=True
+                                )
+                                if not def_applied:
+                                    fail(f"Could not restore the definition of {final_name}: {def_error}")
+                                    return
+                                definition_failures = len(def_failed)
+                                for failure in def_failed:
+                                    log.append(f"Definition detail not restored on {final_name}: {failure}", "WARN")
+                                    notes.append(f"definition_failed={final_name}")
+                            if increments:
+                                inc_ok, inc_failed, inc_error = await transfer_service.apply_definition_clauses(
+                                    dst, temp_name, increments, tolerate_failures=True
+                                )
+                                if not inc_ok:
+                                    log.append(f"AUTO_INCREMENT of {final_name} not restored: {inc_error}", "WARN")
+                                inc_failed_names = list(inc_failed)
+                                for failure in inc_failed:
+                                    log.append(f"AUTO_INCREMENT of {final_name} not restored: {failure}", "WARN")
+                                    notes.append(f"auto_increment_failed={final_name}")
+                            if before_swap:
+                                restored = len(before_swap) - definition_failures - len(inc_failed_names)
+                                log.append(f"Restored {restored} definition detail(s) for {final_name}")
+                                notes.append(f"definition={final_name}")
+                            if after_swap:
+                                deferred_checks[final_name] = after_swap
                             swapped, swap_msg = await transfer_service.mysql_swap_temp_to_final(
                                 dst, temp_table=temp_name, final_table=final_name
                             )
+                            if swapped and temp_name in open_temp_tables:
+                                open_temp_tables.remove(temp_name)
                             if not swapped:
                                 fail(f"Swap failed for {final_name}: {swap_msg}")
                                 return
                             log.append(f"Swapped {temp_name} into {final_name}")
                             notes.append(f"swapped={final_name}")
-                            warn_generated(final_name)
+                            if final_name not in source_definitions:
+                                warn_generated(final_name)
                     else:
                         final_exists, final_err = await transfer_service.mysql_table_exists(dst, final_name)
                         if final_err:
@@ -1682,6 +1801,27 @@ async def main(page: ft.Page) -> None:
                     notes.append("fk_second_pass=ok")
                     log.append("Deferred foreign keys applied")
 
+                # Check constraints come after the swap for the same reason the foreign
+                # keys do: their names belong to the database, not to the table, so the
+                # outgoing table has to be gone first. One that cannot apply is reported
+                # and the rest still get their turn.
+                for table, check_clauses in deferred_checks.items():
+                    if table not in landed_tables:
+                        continue
+                    chk_ok, chk_failed, chk_err = await transfer_service.apply_definition_clauses(
+                        dst, table, check_clauses, tolerate_failures=True
+                    )
+                    if not chk_ok:
+                        log.append(f"Check constraints of {table} could not be restored: {chk_err}", "WARN")
+                        notes.append(f"check_restore_error={table}")
+                        continue
+                    for failure in chk_failed:
+                        log.append(f"Check constraint not restored on {table}: {failure}", "WARN")
+                        notes.append(f"check_failed={table}")
+                    applied = len(check_clauses) - len(chk_failed)
+                    if applied:
+                        notes.append(f"checks_restored={table}")
+
                 # Restore the foreign keys the swap dropped. Runs after a cancel too:
                 # the tables copied so far lost their keys either way. Keys that
                 # already exist (in-place tables, the deferred pass above) are skipped.
@@ -1777,6 +1917,15 @@ async def main(page: ft.Page) -> None:
             page.update()
         except Exception as exc:  # noqa: BLE001
             fail(f"Unhandled error: {exc}")
+        finally:
+            if open_temp_tables:
+                gone_ok, gone, gone_err = await transfer_service.mysql_drop_tables(dst, open_temp_tables)
+                if not gone_ok:
+                    log.append(f"Temp table(s) of this run could not be removed: {gone_err}", "WARN")
+                elif gone:
+                    log.append(f"Removed {gone} temp table(s) this run had left over")
+                open_temp_tables.clear()
+                page.update()
 
     # ------------------------------------------------------------------ wiring
 

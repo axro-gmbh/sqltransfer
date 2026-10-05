@@ -157,12 +157,39 @@ def _run_table_like_the_app(table: str) -> None:
         temp = service.build_mysql_temp_name(table)
         result = await service.transfer_single_table(src, dst, table, dest_table=temp)
         assert result.status == "success", result.message
+        ok, has_inbound, message = await service.mysql_table_has_inbound_fk(dst, table)
+        assert ok, message
+        if has_inbound:
+            # in-place: the rows are replaced and the table keeps standing, so its
+            # definition has to be compared against the source's and fixed.
+            replaced, message = await service.mysql_replace_final_from_temp(dst, temp_table=temp, final_table=table)
+            assert replaced, message
+            ok, definitions, message = await service.table_definitions(src, [table])
+            assert ok, message
+            before_swap, after_swap = definitions.get(table, ([], []))
+            if before_swap:
+                ok, _failed, message = await service.apply_definition_clauses(dst, table, before_swap)
+                assert ok, message
+            if after_swap:
+                await service.apply_definition_clauses(dst, table, after_swap, True)
+            return
         ok, _applied, failed, message = await service.mysql_apply_index_clauses(
             dst, target_table=temp, clauses=source_indexes.get(table, {})
         )
         assert ok and not failed, message or failed
+        # The definition comes after the indexes and before the swap, as in the app.
+        ok, definitions, message = await service.table_definitions(src, [table])
+        assert ok, message
+        before_swap, after_swap = definitions.get(table, ([], []))
+        if before_swap:
+            ok, _failed, message = await service.apply_definition_clauses(dst, temp, before_swap)
+            assert ok, message
         swapped, message = await service.mysql_swap_temp_to_final(dst, temp_table=temp, final_table=table)
         assert swapped, message
+        if after_swap:
+            # after the swap, like the foreign keys: the names belong to the database
+            ok, failed, message = await service.apply_definition_clauses(dst, table, after_swap, True)
+            assert ok and not failed, message or failed
         # Foreign keys come last, once the outgoing table and its key names are gone.
         if table in source_fks:
             ok, _applied, failed, message = await service.mysql_apply_fk_clauses(dst, {table: source_fks[table]})
@@ -653,3 +680,319 @@ def test_nesting_past_the_limit_is_reported(databases):
     assert ok, message
     deep = [n for n in nodes if "TOO_DEEP" in n.types]
     assert [n.path for n in deep] == [("a", "b", "c", "d")]
+
+
+def test_table_definitions_are_read_for_every_table_in_scope(databases):
+    service = _service()
+    src = _profile("remote", SRC_DB)
+    _exec(SRC_DB, "DROP TABLE IF EXISTS def_a", "DROP TABLE IF EXISTS def_b",
+          """CREATE TABLE def_a (
+               id INT PRIMARY KEY,
+               lauf BIGINT UNSIGNED NOT NULL AUTO_INCREMENT UNIQUE,
+               zeit DATETIME NOT NULL,
+               tag DATE AS (CAST(zeit AS DATE)) STORED,
+               betrag DECIMAL(10,2) DEFAULT 1.00,
+               geprueft INT,
+               CONSTRAINT chk_a CHECK (geprueft > 0))""",
+          "CREATE TABLE def_b (id INT PRIMARY KEY, name VARCHAR(20))",
+          "INSERT INTO def_a (id, zeit, geprueft) VALUES (1,'2026-01-01 10:00:00',3)")
+
+    ok, definitions, message = asyncio.run(
+        service.table_definitions(src, [f"{SRC_DB}.def_a", f"{SRC_DB}.def_b"])
+    )
+    assert ok, message
+    assert "def_b" not in definitions                 # nothing to restore there
+    before, after = definitions["def_a"]
+    joined = " | ".join(before)
+    assert "GENERATED ALWAYS AS" in joined and "DEFAULT '1.00'" in joined
+    assert joined.index("GENERATED") < joined.index("AUTO_INCREMENT = ")
+    assert after == ["ADD CONSTRAINT `chk_a` CHECK ((`geprueft` > 0))"]
+
+
+def _normalised_ddl(database: str, table: str) -> str:
+    ddl = _rows(database, f"SHOW CREATE TABLE {table}")[0][1]
+    ddl = re.sub(r"AUTO_INCREMENT=\d+", "AUTO_INCREMENT=N", ddl)
+    return re.sub(r"CONSTRAINT `[^`]+` CHECK", "CONSTRAINT `chk` CHECK", ddl)
+
+
+def test_the_copy_carries_the_source_definition(databases):
+    _exec(SRC_DB, "DROP TABLE IF EXISTS voll",
+          """CREATE TABLE voll (
+               id INT PRIMARY KEY,
+               lauf BIGINT UNSIGNED NOT NULL AUTO_INCREMENT UNIQUE,
+               zeit DATETIME NOT NULL,
+               tag DATE AS (CAST(zeit AS DATE)) STORED,
+               betrag DECIMAL(10,2) DEFAULT 1.00,
+               geprueft INT CHECK (geprueft > 0),
+               KEY idx_tag (tag, betrag))""",
+          "INSERT INTO voll (id, zeit, geprueft) VALUES (1,'2026-01-01 10:00:00',3)")
+    _exec(DST_DB, "DROP TABLE IF EXISTS voll")
+
+    _run_table_like_the_app("voll")
+
+    assert _normalised_ddl(DST_DB, "voll") == _normalised_ddl(SRC_DB, "voll")
+
+    # and it behaves like the original
+    _exec(DST_DB, "INSERT INTO voll (id, zeit, geprueft) VALUES (2,'2026-02-02 11:00:00',5)")
+    row = _rows(DST_DB, "SELECT tag, betrag FROM voll WHERE id = 2")[0]
+    assert str(row[0]) == "2026-02-02", "the generated column must recompute"
+    assert float(row[1]) == 1.00, "the default must apply"
+    with pytest.raises(Exception):
+        _exec(DST_DB, "INSERT INTO voll (id, zeit, geprueft) VALUES (3,'2026-03-03 12:00:00',0)")
+
+
+HOSTILE_SCHEMA = """CREATE TABLE schwierig (
+  id INT PRIMARY KEY,
+  lauf BIGINT UNSIGNED NOT NULL AUTO_INCREMENT UNIQUE,
+  angelegt TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  wort VARCHAR(20) NOT NULL DEFAULT 'null',
+  klammer VARCHAR(20) DEFAULT '(none)',
+  coll VARCHAR(20) COLLATE utf8mb4_bin,
+  zeit DATETIME NOT NULL,
+  tag DATE AS (CAST(zeit AS DATE)) STORED,
+  mit_text VARCHAR(40) COLLATE utf8mb4_bin AS (CONCAT('x-', coll)) STORED NOT NULL,
+  virtuell VARCHAR(40) AS (CONCAT('v-', coll)) VIRTUAL,
+  betrag DECIMAL(10,2) DEFAULT 1.00,
+  art ENUM('a','b') DEFAULT 'a',
+  geprueft INT,
+  CONSTRAINT chk_positiv CHECK (geprueft > 0),
+  CONSTRAINT chk_wort CHECK (wort <> 'bad'),
+  KEY idx_tag (tag, betrag)
+)"""
+
+
+def test_the_copy_carries_a_hostile_source_definition(databases):
+    # Everything that broke the first attempt: a function default, string literals in
+    # expressions and checks, a VIRTUAL column, NOT NULL and COLLATE on a generated
+    # column, an enum, and defaults that read like keywords.
+    _exec(SRC_DB, "DROP TABLE IF EXISTS schwierig", HOSTILE_SCHEMA,
+          "INSERT INTO schwierig (id, coll, zeit, geprueft) VALUES (1,'eins','2026-01-01 10:00:00',3)")
+    _exec(DST_DB, "DROP TABLE IF EXISTS schwierig")
+
+    _run_table_like_the_app("schwierig")
+
+    assert _normalised_ddl(DST_DB, "schwierig") == _normalised_ddl(SRC_DB, "schwierig")
+
+    _exec(DST_DB, "INSERT INTO schwierig (id, coll, zeit, geprueft) VALUES (2,'zwei','2026-02-02 11:00:00',5)")
+    row = _rows(DST_DB, "SELECT tag, mit_text, virtuell, betrag, wort, klammer, art, lauf FROM schwierig WHERE id = 2")[0]
+    assert str(row[0]) == "2026-02-02"      # stored generated column recomputes
+    assert row[1] == "x-zwei"               # with NOT NULL and its own collation
+    assert row[2] == "v-zwei"               # virtual column too
+    assert float(row[3]) == 1.00            # numeric default
+    assert row[4] == "null"                 # a string that reads like a keyword
+    assert row[5] == "(none)"               # a string that reads like an expression
+    assert row[6] == "a"                    # enum default
+    assert int(row[7]) > 1                  # auto_increment counted on
+    with pytest.raises(Exception):
+        _exec(DST_DB, "INSERT INTO schwierig (id, coll, zeit, geprueft) VALUES (3,'d','2026-03-03 12:00:00',0)")
+    with pytest.raises(Exception):
+        _exec(DST_DB, "INSERT INTO schwierig (id, wort, coll, zeit, geprueft) VALUES (4,'bad','d','2026-03-03 12:00:00',1)")
+
+
+def test_in_place_replace_keeps_columns_with_a_function_default(databases):
+    # DEFAULT_GENERATED sits in the same information_schema column as STORED GENERATED.
+    # Reading it as "generated" dropped created_at-style columns from the copy without
+    # a word, and a table made only of such columns failed with "no columns to copy".
+    service = _service()
+    dst = _profile("local", DST_DB)
+    _exec(DST_DB, "DROP TABLE IF EXISTS fn_tmp", "DROP TABLE IF EXISTS fn",
+          "CREATE TABLE fn (id INT PRIMARY KEY, angelegt DATETIME DEFAULT CURRENT_TIMESTAMP,"
+          " geaendert DATETIME DEFAULT (NOW()), tag DATE AS (CAST(angelegt AS DATE)) STORED)",
+          "INSERT INTO fn (id, angelegt, geaendert) VALUES (1,'2020-01-01 08:00:00','2020-01-01 08:00:00')",
+          "CREATE TABLE fn_tmp (id INT PRIMARY KEY, angelegt DATETIME, geaendert DATETIME, tag DATE)",
+          "INSERT INTO fn_tmp VALUES (2,'2026-06-06 09:00:00','2026-06-07 10:00:00','2026-06-06')")
+
+    ok, message = asyncio.run(service.mysql_replace_final_from_temp(dst, temp_table="fn_tmp", final_table="fn"))
+    assert ok, message
+    row = _rows(DST_DB, "SELECT id, angelegt, geaendert, tag FROM fn")[0]
+    assert row[0] == 2
+    assert str(row[1]) == "2026-06-06 09:00:00", "a function default does not make a column generated"
+    assert str(row[2]) == "2026-06-07 10:00:00"
+    assert str(row[3]) == "2026-06-06", "the real generated column is recomputed by the database"
+
+
+def test_a_table_with_inbound_fk_gets_its_definition_back_too(databases):
+    # The in-place path replaces rows and keeps the table, so a destination created by
+    # an older version keeps its plain columns forever unless the definition is checked.
+    _exec(SRC_DB, "DROP TABLE IF EXISTS kind", "DROP TABLE IF EXISTS eltern",
+          """CREATE TABLE eltern (
+               id INT PRIMARY KEY,
+               zeit DATETIME NOT NULL,
+               tag DATE AS (CAST(zeit AS DATE)) STORED,
+               betrag DECIMAL(10,2) DEFAULT 1.00)""",
+          "CREATE TABLE kind (id INT PRIMARY KEY, eltern_id INT, CONSTRAINT fk_k FOREIGN KEY (eltern_id) REFERENCES eltern(id))",
+          "INSERT INTO eltern (id, zeit) VALUES (1,'2026-01-01 10:00:00')")
+    # the destination as an older version left it: plain columns, and a table pointing at it
+    _exec(DST_DB, "DROP TABLE IF EXISTS kind", "DROP TABLE IF EXISTS eltern",
+          "CREATE TABLE eltern (id INT PRIMARY KEY, zeit DATETIME NOT NULL, tag DATE, betrag DECIMAL(10,2))",
+          "CREATE TABLE kind (id INT PRIMARY KEY, eltern_id INT, CONSTRAINT fk_k FOREIGN KEY (eltern_id) REFERENCES eltern(id))",
+          "INSERT INTO eltern VALUES (9,'2020-01-01 08:00:00','2020-01-01',5.00)")
+
+    _run_table_like_the_app("eltern")
+
+    assert _normalised_ddl(DST_DB, "eltern") == _normalised_ddl(SRC_DB, "eltern")
+    _exec(DST_DB, "INSERT INTO eltern (id, zeit) VALUES (2,'2026-02-02 11:00:00')")
+    row = _rows(DST_DB, "SELECT tag, betrag FROM eltern WHERE id = 2")[0]
+    assert str(row[0]) == "2026-02-02" and float(row[1]) == 1.00
+
+
+def test_the_auto_increment_counter_continues_in_the_copy(databases):
+    # The DDL comparison normalises AUTO_INCREMENT=n away, so the counter needs its
+    # own check: without it the copy would hand out ids the source already used.
+    _exec(SRC_DB, "DROP TABLE IF EXISTS zaehler",
+          # a signed key: apitap reads the cursor column as i64 and refuses BIGINT UNSIGNED
+          "CREATE TABLE zaehler (id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY, name VARCHAR(20))",
+          "INSERT INTO zaehler (name) VALUES ('a'),('b'),('c')")
+    _exec(DST_DB, "DROP TABLE IF EXISTS zaehler")
+
+    _run_table_like_the_app("zaehler")
+
+    source_next = _rows(SRC_DB, "SELECT auto_increment FROM information_schema.tables "
+                                f"WHERE table_schema='{SRC_DB}' AND table_name='zaehler'")[0][0]
+    copy_next = _rows(DST_DB, "SELECT auto_increment FROM information_schema.tables "
+                              f"WHERE table_schema='{DST_DB}' AND table_name='zaehler'")[0][0]
+    assert copy_next == source_next, "the counter must survive the swap, not restart"
+    _exec(DST_DB, "INSERT INTO zaehler (name) VALUES ('d')")
+    assert _rows(DST_DB, "SELECT id FROM zaehler WHERE name='d'")[0][0] == source_next
+
+
+def test_auto_increment_without_its_key_is_reported_not_fatal(databases):
+    # AUTO_INCREMENT needs a key on its column. If the index step could not build it,
+    # the column stays plain and the run goes on; aborting here would turn a warning
+    # into a lost transfer.
+    service = _service()
+    dst = _profile("local", DST_DB)
+    _exec(DST_DB, "DROP TABLE IF EXISTS ohne_key",
+          "CREATE TABLE ohne_key (id INT PRIMARY KEY, lauf BIGINT NOT NULL)")
+
+    ok, failed, message = asyncio.run(service.apply_definition_clauses(
+        dst, "ohne_key",
+        ["MODIFY COLUMN `lauf` bigint NOT NULL AUTO_INCREMENT", "AUTO_INCREMENT = 7"],
+        tolerate_failures=True,
+    ))
+    assert ok, message
+    assert len(failed) == 1 and "auto column" in failed[0]
+
+
+def test_the_scope_database_decides_which_tables_are_listed(databases):
+    """A whole-database scope names its own database; the profile's is only the fallback.
+
+    Everything after the listing (indexes, definitions) derives the schema from the
+    table name, so a bare name from the wrong database silently restores nothing.
+    """
+    service = _service()
+
+    # the usual case: profile and scope name the same database
+    ok, tables, message = asyncio.run(service.list_tables(_profile("remote", SRC_DB), schema_hint=SRC_DB))
+    assert ok, message
+    assert "items" in tables
+
+    # the profile has no database of its own
+    ok, tables, message = asyncio.run(service.list_tables(_profile("remote", ""), schema_hint=SRC_DB))
+    assert ok, message
+    assert f"{SRC_DB}.items" in tables, tables
+
+    # the profile points somewhere else
+    ok, tables, message = asyncio.run(service.list_tables(_profile("remote", DST_DB), schema_hint=SRC_DB))
+    assert ok, message
+    assert f"{SRC_DB}.items" in tables, tables
+
+
+def test_one_unreadable_table_does_not_cost_the_others_their_definitions(databases, monkeypatch):
+    """A table whose DDL cannot be read is named and skipped, the run goes on.
+
+    Real finding: one table in a customer database returned bytes that are not UTF-8
+    ('utf-8' codec can't decode byte 0xa9), and that one table silently cost every
+    other table its generated columns, defaults and checks.
+    """
+    _exec(SRC_DB,
+          "CREATE TABLE zaehler (id INT PRIMARY KEY, lauf INT NOT NULL AUTO_INCREMENT, UNIQUE KEY u (lauf))",
+          "CREATE TABLE sperrig (id INT PRIMARY KEY, lauf INT NOT NULL AUTO_INCREMENT, UNIQUE KEY u (lauf))")
+
+    from sqltransfer_app import transfer as transfer_module
+
+    echt = transfer_module.parse_mysql_table_definition
+
+    def kaputt(ddl: str, codec: str = "utf-8"):
+        if "`sperrig`" in ddl:
+            raise UnicodeDecodeError("utf-8", b"\xa9", 0, 1, "invalid start byte")
+        return echt(ddl, codec=codec)
+
+    monkeypatch.setattr(transfer_module, "parse_mysql_table_definition", kaputt)
+
+    ok, definitions, message = asyncio.run(
+        _service().table_definitions(_profile("remote", SRC_DB), ["sperrig", "zaehler"])
+    )
+    assert ok, message
+    assert "zaehler" in definitions, "the readable table must keep its definition"
+    assert "sperrig" in message and "0xa9" in message, message
+
+
+def test_a_definition_in_a_charset_the_connection_cannot_decode_is_still_read(databases):
+    """MySQL writes the DDL in the table's own charset, not the connection's."""
+    _exec(SRC_DB, "CREATE TABLE marke (id INT PRIMARY KEY, zeichen VARCHAR(20) CHARACTER SET latin1 "
+                   "DEFAULT _latin1 0xA9, lauf INT NOT NULL AUTO_INCREMENT, UNIQUE KEY u (lauf)) DEFAULT CHARSET=latin1")
+
+    ok, definitions, message = asyncio.run(_service().table_definitions(_profile("remote", SRC_DB), ["marke"]))
+    assert ok, message
+    before, _after = definitions["marke"]
+    assert any("`zeichen`" in clause for clause in before), before
+
+
+def test_leftover_temp_tables_can_be_dropped(databases):
+    """An aborted run used to leave its temp table in the destination for good."""
+    _exec(DST_DB, "CREATE TABLE apx_rest_1 (id INT PRIMARY KEY)")
+
+    ok, dropped, error = asyncio.run(
+        _service().mysql_drop_tables(_profile("local", DST_DB), ["apx_rest_1", "gibt_es_nicht"])
+    )
+    assert ok, error
+    assert dropped == 1
+
+    conn = pymysql.connect(**_conn_args(), database=DST_DB, autocommit=True)
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SHOW TABLES LIKE 'apx\\_%'")
+            assert cur.fetchall() == ()
+    finally:
+        conn.close()
+
+
+def test_a_binary_default_is_restored_as_the_same_bytes(databases):
+    """The hex clause the parser builds has to be accepted and byte-exact.
+
+    The quoted form in the fixture is what a Shopware server returned for
+    category.cms_page_version_id; this server writes hex, so the parser is fed the
+    customer's form and only the applying is measured here.
+    """
+    from sqltransfer_app.transfer import parse_mysql_table_definition
+
+    roh = bytes([0x20, 0xC2, 0xA9, 0x20, 0xE3, 0xA9, 0x6A, 0x4B,
+                 0x41, 0xBE, 0x4B, 0xD9, 0xCE, 0x75, 0x2C, 0x34])
+    ddl = (
+        "CREATE TABLE `kategorie` (\n"
+        "  `id` binary(16) NOT NULL,\n"
+        "  `cms_page_version_id` binary(16) NOT NULL DEFAULT '" + roh.decode("latin-1") + "',\n"
+        "  PRIMARY KEY (`id`)\n"
+        ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"
+    )
+    before, _after = parse_mysql_table_definition(ddl, codec="latin-1")
+
+    _exec(DST_DB, "CREATE TABLE kategorie (id BINARY(16) NOT NULL PRIMARY KEY, "
+                  "cms_page_version_id BINARY(16) NOT NULL)")
+    ok, failed, error = asyncio.run(
+        _service().apply_definition_clauses(_profile("local", DST_DB), "kategorie", before)
+    )
+    assert ok, error
+    assert failed == []
+
+    # What counts is the value a row gets when it leaves the column out.
+    conn = pymysql.connect(**_conn_args(), database=DST_DB, autocommit=True)
+    try:
+        with conn.cursor() as cur:
+            cur.execute("INSERT INTO kategorie (id) VALUES (0x0102030405060708090A0B0C0D0E0F10)")
+            cur.execute("SELECT HEX(cms_page_version_id) FROM kategorie")
+            gespeichert = cur.fetchone()[0]
+    finally:
+        conn.close()
+    assert str(gespeichert).upper() == roh.hex().upper(), gespeichert
