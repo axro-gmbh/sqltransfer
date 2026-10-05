@@ -511,7 +511,10 @@ async def main() -> int:
     order: list[str] = []
 
     async def record_definition(_self, _dst, table, clauses, tolerate_failures=False):
-        order.append(f"{'checks' if tolerate_failures else 'definition'}:{table}")
+        # three calls now: the strict column clauses, the tolerant AUTO_INCREMENT one
+        # before the swap, and the check constraints after it
+        kind = "definition" if not tolerate_failures else ("auto" if "AUTO_INCREMENT" in clauses[0] else "checks")
+        order.append(f"{kind}:{table}")
         return True, [], ""
 
     async def record_swap(_self, _dst, temp_table, final_table):
@@ -519,15 +522,16 @@ async def main() -> int:
         return True, ""
 
     app_module.TransferService.table_definitions = _async(
-        (True, {"kunde": (["AUTO_INCREMENT = 7"], ["ADD CONSTRAINT `c` CHECK ((1 = 1))"])}, "")
+        (True, {"kunde": (["MODIFY COLUMN `n` int DEFAULT '1'", "AUTO_INCREMENT = 7"],
+                          ["ADD CONSTRAINT `c` CHECK ((1 = 1))"])}, "")
     )
     app_module.TransferService.apply_definition_clauses = record_definition
     app_module.TransferService.mysql_swap_temp_to_final = record_swap
     app_module.TransferService.json_paths = _async((True, [], ""))
     click(button(root, "Run transfer"))
     await asyncio.sleep(0.2)
-    check(order and order[0].startswith("definition:") and "swap" in order,
-          f"the definition comes before the swap: {order}")
+    check(order[:3] == [f"definition:{order[0].split(':', 1)[1]}", f"auto:{order[1].split(':', 1)[1]}", "swap"],
+          f"columns, then AUTO_INCREMENT, then the swap: {order}")
     check(order[-1].startswith("checks:"), f"and the check constraints after it: {order}")
 
     async def failing_definition(_self, _dst, _table, _clauses, tolerate_failures=False):

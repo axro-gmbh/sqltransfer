@@ -834,3 +834,41 @@ def test_a_table_with_inbound_fk_gets_its_definition_back_too(databases):
     _exec(DST_DB, "INSERT INTO eltern (id, zeit) VALUES (2,'2026-02-02 11:00:00')")
     row = _rows(DST_DB, "SELECT tag, betrag FROM eltern WHERE id = 2")[0]
     assert str(row[0]) == "2026-02-02" and float(row[1]) == 1.00
+
+
+def test_the_auto_increment_counter_continues_in_the_copy(databases):
+    # The DDL comparison normalises AUTO_INCREMENT=n away, so the counter needs its
+    # own check: without it the copy would hand out ids the source already used.
+    _exec(SRC_DB, "DROP TABLE IF EXISTS zaehler",
+          # a signed key: apitap reads the cursor column as i64 and refuses BIGINT UNSIGNED
+          "CREATE TABLE zaehler (id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY, name VARCHAR(20))",
+          "INSERT INTO zaehler (name) VALUES ('a'),('b'),('c')")
+    _exec(DST_DB, "DROP TABLE IF EXISTS zaehler")
+
+    _run_table_like_the_app("zaehler")
+
+    source_next = _rows(SRC_DB, "SELECT auto_increment FROM information_schema.tables "
+                                f"WHERE table_schema='{SRC_DB}' AND table_name='zaehler'")[0][0]
+    copy_next = _rows(DST_DB, "SELECT auto_increment FROM information_schema.tables "
+                              f"WHERE table_schema='{DST_DB}' AND table_name='zaehler'")[0][0]
+    assert copy_next == source_next, "the counter must survive the swap, not restart"
+    _exec(DST_DB, "INSERT INTO zaehler (name) VALUES ('d')")
+    assert _rows(DST_DB, "SELECT id FROM zaehler WHERE name='d'")[0][0] == source_next
+
+
+def test_auto_increment_without_its_key_is_reported_not_fatal(databases):
+    # AUTO_INCREMENT needs a key on its column. If the index step could not build it,
+    # the column stays plain and the run goes on; aborting here would turn a warning
+    # into a lost transfer.
+    service = _service()
+    dst = _profile("local", DST_DB)
+    _exec(DST_DB, "DROP TABLE IF EXISTS ohne_key",
+          "CREATE TABLE ohne_key (id INT PRIMARY KEY, lauf BIGINT NOT NULL)")
+
+    ok, failed, message = asyncio.run(service.apply_definition_clauses(
+        dst, "ohne_key",
+        ["MODIFY COLUMN `lauf` bigint NOT NULL AUTO_INCREMENT", "AUTO_INCREMENT = 7"],
+        tolerate_failures=True,
+    ))
+    assert ok, message
+    assert len(failed) == 1 and "auto column" in failed[0]

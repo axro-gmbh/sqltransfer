@@ -1638,13 +1638,28 @@ async def main(page: ft.Page) -> None:
                             # a key on its column. A failure here must not be published,
                             # so the run stops and the table is not swapped.
                             before_swap, after_swap = source_definitions.get(final_name, ([], []))
-                            if before_swap:
+                            # AUTO_INCREMENT needs a key on its column. When the index
+                            # step could not build it, that clause fails and is reported,
+                            # rather than costing the whole transfer.
+                            columns = [c for c in before_swap if "AUTO_INCREMENT" not in c]
+                            increments = [c for c in before_swap if "AUTO_INCREMENT" in c]
+                            if columns:
                                 def_applied, _failed, def_error = await transfer_service.apply_definition_clauses(
-                                    dst, temp_name, before_swap
+                                    dst, temp_name, columns
                                 )
                                 if not def_applied:
                                     fail(f"Could not restore the definition of {final_name}: {def_error}")
                                     return
+                            if increments:
+                                inc_ok, inc_failed, inc_error = await transfer_service.apply_definition_clauses(
+                                    dst, temp_name, increments, tolerate_failures=True
+                                )
+                                if not inc_ok:
+                                    log.append(f"AUTO_INCREMENT of {final_name} not restored: {inc_error}", "WARN")
+                                for failure in inc_failed:
+                                    log.append(f"AUTO_INCREMENT of {final_name} not restored: {failure}", "WARN")
+                                    notes.append(f"auto_increment_failed={final_name}")
+                            if before_swap:
                                 log.append(f"Restored {len(before_swap)} definition detail(s) for {final_name}")
                                 notes.append(f"definition={final_name}")
                             if after_swap:
