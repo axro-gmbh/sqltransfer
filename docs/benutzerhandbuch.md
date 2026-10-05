@@ -174,7 +174,7 @@ Rechts stehen die letzten 20 Läufe mit Status, Quelle, Ziel, Umfang, Zeilenzahl
 
 Scheitert dabei ein Schritt, bricht der Lauf ab und es wird **nicht** getauscht. Lieber die alte Tabelle als eine halb hergestellte.
 
-Grundlage ist das `SHOW CREATE TABLE` der Quelle, also das, was der Server selbst als Definition ausgibt. Prüfbedingungen werden nach dem Tausch gesetzt, weil ihre Namen in MySQL der Datenbank gehören und die alte Tabelle sie bis dahin hält. Eine Bedingung, die sich nicht anwenden lässt, wird gemeldet und kostet nicht die ganze Tabelle.
+Grundlage ist das `SHOW CREATE TABLE` der Quelle, also das, was der Server selbst als Definition ausgibt. Prüfbedingungen werden nach dem Tausch gesetzt, weil ihre Namen in MySQL der Datenbank gehören und die alte Tabelle sie bis dahin hält. Eine Bedingung, die sich nicht anwenden lässt, wird gemeldet und kostet nicht die ganze Tabelle. Das gilt für jedes Detail: Was der Server nicht zurücknimmt (etwa einen binären Standardwert, den er selbst anders ausgibt, als er ihn annimmt), steht mit Klausel und Grund im Protokoll, alles andere an der Tabelle wird trotzdem gesetzt.
 
 Nicht eingeholt werden: Trigger, Views, Partitionierung und Spaltenkommentare. **Das Ganze gilt nur für MySQL nach MySQL.** Bei einer PostgreSQL-Quelle oder einem PostgreSQL-Ziel bleibt es beim bisherigen Verhalten, die Kopie verliert diese Eigenschaften und das Protokoll sagt es.
 

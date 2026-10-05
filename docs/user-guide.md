@@ -174,7 +174,7 @@ On the right are the last 20 runs with status, source, destination, scope, row c
 
 If one of those steps fails, the run stops and nothing is swapped. The old table is better than a half-restored one.
 
-The source of truth is the source's own `SHOW CREATE TABLE`, the definition as the server states it. Check constraints are applied after the swap, because in MySQL their names belong to the database and the outgoing table holds them until then. One that cannot be applied is reported and does not cost the table.
+The source of truth is the source's own `SHOW CREATE TABLE`, the definition as the server states it. Check constraints are applied after the swap, because in MySQL their names belong to the database and the outgoing table holds them until then. One that cannot be applied is reported and does not cost the table. That holds for every detail: whatever the server will not take back (a binary default, for instance, which it writes differently from how it accepts it) goes into the log with its clause and the reason, and the table's other details are still applied.
 
 Not carried over: triggers, views, partitioning and column comments. **All of this is MySQL to MySQL only.** With a PostgreSQL source or destination the previous behaviour stands: the copy loses these properties and the log says so.
 
