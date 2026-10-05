@@ -97,3 +97,33 @@ def test_checks_are_separate_because_their_names_are_unique_per_database():
 def test_indexes_and_keys_are_left_to_the_index_step():
     before, after = parse_mysql_table_definition(HOSTILE_DDL)
     assert not [clause for clause in before + after if "KEY" in clause]
+
+
+# A binary default MySQL writes back as a quoted string of raw bytes, not as hex.
+# Seen on a Shopware copy: category.cms_page_version_id, binary(16) NOT NULL, whose
+# clause came back as DEFAULT ' © ãéjKÂ¾KÙÎu,4%' and was refused with error 1067,
+# because those characters re-encoded are more than the 16 bytes the column holds.
+BINARY_DEFAULT_BYTES = bytes([0x20, 0xC2, 0xA9, 0x20, 0xE3, 0xA9, 0x6A, 0x4B,
+                              0x41, 0xBE, 0x4B, 0xD9, 0xCE, 0x75, 0x2C, 0x34])
+BINARY_DDL = (
+    "CREATE TABLE `category` (\n"
+    "  `id` binary(16) NOT NULL,\n"
+    "  `cms_page_version_id` binary(16) NOT NULL DEFAULT '"
+    + BINARY_DEFAULT_BYTES.decode("latin-1")
+    + "',\n"
+    "  `name` varchar(255) DEFAULT 'Kategorie',\n"
+    "  PRIMARY KEY (`id`)\n"
+    ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"
+)
+
+
+def test_a_binary_default_becomes_a_hex_literal():
+    before, _after = parse_mysql_table_definition(BINARY_DDL, codec="latin-1")
+    erwartet = "MODIFY COLUMN `cms_page_version_id` binary(16) NOT NULL DEFAULT 0x" + BINARY_DEFAULT_BYTES.hex().upper()
+    assert erwartet in before, before
+
+
+def test_a_text_default_keeps_its_quotes():
+    # Only binary columns get the hex treatment; a string default stays a string.
+    before, _after = parse_mysql_table_definition(BINARY_DDL, codec="latin-1")
+    assert "MODIFY COLUMN `name` varchar(255) DEFAULT 'Kategorie'" in before, before

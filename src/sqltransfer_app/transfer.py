@@ -314,7 +314,51 @@ def _json_paths_sync(
     return nodes
 
 
-def parse_mysql_table_definition(ddl: str) -> tuple[list[str], list[str]]:
+_MYSQL_ESCAPES = {"0": "\0", "n": "\n", "r": "\r", "t": "\t", "b": "\b",
+                  "Z": "\x1a", "\\": "\\", "'": "'", '"': '"'}
+
+_BINARY_TYPES = re.compile(r"^(binary|varbinary|tinyblob|blob|mediumblob|longblob)\b", re.IGNORECASE)
+
+
+def _mysql_unescape(literal: str) -> str:
+    """Turn the escapes SHOW CREATE TABLE writes back into the characters they stand for."""
+    out: list[str] = []
+    index = 0
+    while index < len(literal):
+        char = literal[index]
+        if char == "\\" and index + 1 < len(literal):
+            nxt = literal[index + 1]
+            out.append(_MYSQL_ESCAPES.get(nxt, nxt))
+            index += 2
+            continue
+        if char == "'" and literal[index + 1: index + 2] == "'":
+            out.append("'")
+            index += 2
+            continue
+        out.append(char)
+        index += 1
+    return "".join(out)
+
+
+def _hex_binary_default(line: str, codec: str) -> str:
+    """Rewrite a binary column's quoted default as a hex literal, or leave the line alone.
+
+    MySQL writes such a default as a string of raw bytes. Those characters sent back as
+    text are more bytes than the column holds, and the server refuses the column with
+    error 1067 (seen on category.cms_page_version_id of a Shopware database). Hex says
+    exactly the bytes that were there.
+    """
+    match = re.match(r"^(`[^`]+`\s+)(\S+)(.*?)\s+DEFAULT\s+'(.*)'(\s*)$", line, re.DOTALL)
+    if not match or not _BINARY_TYPES.match(match.group(2)):
+        return line
+    try:
+        raw = _mysql_unescape(match.group(4)).encode(codec)
+    except (UnicodeEncodeError, LookupError):
+        return line
+    return f"{match.group(1)}{match.group(2)}{match.group(3)} DEFAULT 0x{raw.hex().upper()}"
+
+
+def parse_mysql_table_definition(ddl: str, codec: str = "utf-8") -> tuple[list[str], list[str]]:
     """Clauses that put a table's definition back, taken from its own DDL.
 
     Returns (before the swap, after the swap). The source of truth is
@@ -351,7 +395,7 @@ def parse_mysql_table_definition(ddl: str) -> tuple[list[str], list[str]]:
             position = f" AFTER {previous_column}" if previous_column else " FIRST"
             before.append(f"ADD COLUMN {line}{position}")
         elif generated or carries_default or auto:
-            before.append(f"MODIFY COLUMN {line}")
+            before.append(f"MODIFY COLUMN {_hex_binary_default(line, codec)}")
         auto_increment_column = auto_increment_column or auto
         previous_column = name
 
@@ -413,7 +457,8 @@ def _table_definitions_sync(
                     if not interesting:
                         continue
                     cur.execute(f"SHOW CREATE TABLE {_quote_mysql_ident(schema)}.{_quote_mysql_ident(bare)}")
-                    before, after = parse_mysql_table_definition(_coerce_sql_text(cur.fetchone()[1]))
+                    ddl, codec = _coerce_sql_text_with_codec(cur.fetchone()[1])
+                    before, after = parse_mysql_table_definition(ddl, codec=codec)
                 except Exception as exc:  # noqa: BLE001
                     problems.append(f"{bare}: {exc}")
                     continue
@@ -2314,6 +2359,21 @@ def _ensure_empty_mysql_table_from_source_sync(
                     )
     finally:
         dst_conn.close()
+
+
+def _coerce_sql_text_with_codec(value: object) -> tuple[str, str]:
+    """The DDL as text, plus the codec it was read with.
+
+    The codec is what turns a binary default back into the exact bytes it stood for,
+    so it has to travel with the text.
+    """
+    if isinstance(value, (bytes, bytearray)):
+        raw = bytes(value)
+        try:
+            return raw.decode("utf-8"), "utf-8"
+        except UnicodeDecodeError:
+            return raw.decode("latin-1"), "latin-1"
+    return _coerce_sql_text(value), "utf-8"
 
 
 def _coerce_sql_text(value: object) -> str:

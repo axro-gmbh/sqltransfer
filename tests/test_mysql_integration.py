@@ -913,10 +913,10 @@ def test_one_unreadable_table_does_not_cost_the_others_their_definitions(databas
 
     echt = transfer_module.parse_mysql_table_definition
 
-    def kaputt(ddl: str):
+    def kaputt(ddl: str, codec: str = "utf-8"):
         if "`sperrig`" in ddl:
             raise UnicodeDecodeError("utf-8", b"\xa9", 0, 1, "invalid start byte")
-        return echt(ddl)
+        return echt(ddl, codec=codec)
 
     monkeypatch.setattr(transfer_module, "parse_mysql_table_definition", kaputt)
 
@@ -956,3 +956,43 @@ def test_leftover_temp_tables_can_be_dropped(databases):
             assert cur.fetchall() == ()
     finally:
         conn.close()
+
+
+def test_a_binary_default_is_restored_as_the_same_bytes(databases):
+    """The hex clause the parser builds has to be accepted and byte-exact.
+
+    The quoted form in the fixture is what a Shopware server returned for
+    category.cms_page_version_id; this server writes hex, so the parser is fed the
+    customer's form and only the applying is measured here.
+    """
+    from sqltransfer_app.transfer import parse_mysql_table_definition
+
+    roh = bytes([0x20, 0xC2, 0xA9, 0x20, 0xE3, 0xA9, 0x6A, 0x4B,
+                 0x41, 0xBE, 0x4B, 0xD9, 0xCE, 0x75, 0x2C, 0x34])
+    ddl = (
+        "CREATE TABLE `kategorie` (\n"
+        "  `id` binary(16) NOT NULL,\n"
+        "  `cms_page_version_id` binary(16) NOT NULL DEFAULT '" + roh.decode("latin-1") + "',\n"
+        "  PRIMARY KEY (`id`)\n"
+        ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"
+    )
+    before, _after = parse_mysql_table_definition(ddl, codec="latin-1")
+
+    _exec(DST_DB, "CREATE TABLE kategorie (id BINARY(16) NOT NULL PRIMARY KEY, "
+                  "cms_page_version_id BINARY(16) NOT NULL)")
+    ok, failed, error = asyncio.run(
+        _service().apply_definition_clauses(_profile("local", DST_DB), "kategorie", before)
+    )
+    assert ok, error
+    assert failed == []
+
+    # What counts is the value a row gets when it leaves the column out.
+    conn = pymysql.connect(**_conn_args(), database=DST_DB, autocommit=True)
+    try:
+        with conn.cursor() as cur:
+            cur.execute("INSERT INTO kategorie (id) VALUES (0x0102030405060708090A0B0C0D0E0F10)")
+            cur.execute("SELECT HEX(cms_page_version_id) FROM kategorie")
+            gespeichert = cur.fetchone()[0]
+    finally:
+        conn.close()
+    assert str(gespeichert).upper() == roh.hex().upper(), gespeichert
