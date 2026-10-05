@@ -157,12 +157,28 @@ def _run_table_like_the_app(table: str) -> None:
         temp = service.build_mysql_temp_name(table)
         result = await service.transfer_single_table(src, dst, table, dest_table=temp)
         assert result.status == "success", result.message
+        ok, has_inbound, message = await service.mysql_table_has_inbound_fk(dst, table)
+        assert ok, message
+        if has_inbound:
+            # in-place: the rows are replaced and the table keeps standing, so its
+            # definition has to be compared against the source's and fixed.
+            replaced, message = await service.mysql_replace_final_from_temp(dst, temp_table=temp, final_table=table)
+            assert replaced, message
+            ok, definitions, message = await service.table_definitions(src, [table])
+            assert ok, message
+            before_swap, after_swap = definitions.get(table, ([], []))
+            if before_swap:
+                ok, _failed, message = await service.apply_definition_clauses(dst, table, before_swap)
+                assert ok, message
+            if after_swap:
+                await service.apply_definition_clauses(dst, table, after_swap, True)
+            return
         ok, _applied, failed, message = await service.mysql_apply_index_clauses(
             dst, target_table=temp, clauses=source_indexes.get(table, {})
         )
         assert ok and not failed, message or failed
         # The definition comes after the indexes and before the swap, as in the app.
-        ok, definitions, message = await service.source_table_definitions(src, [table])
+        ok, definitions, message = await service.table_definitions(src, [table])
         assert ok, message
         before_swap, after_swap = definitions.get(table, ([], []))
         if before_swap:
@@ -682,7 +698,7 @@ def test_table_definitions_are_read_for_every_table_in_scope(databases):
           "INSERT INTO def_a (id, zeit, geprueft) VALUES (1,'2026-01-01 10:00:00',3)")
 
     ok, definitions, message = asyncio.run(
-        service.source_table_definitions(src, [f"{SRC_DB}.def_a", f"{SRC_DB}.def_b"])
+        service.table_definitions(src, [f"{SRC_DB}.def_a", f"{SRC_DB}.def_b"])
     )
     assert ok, message
     assert "def_b" not in definitions                 # nothing to restore there
@@ -793,3 +809,28 @@ def test_in_place_replace_keeps_columns_with_a_function_default(databases):
     assert str(row[1]) == "2026-06-06 09:00:00", "a function default does not make a column generated"
     assert str(row[2]) == "2026-06-07 10:00:00"
     assert str(row[3]) == "2026-06-06", "the real generated column is recomputed by the database"
+
+
+def test_a_table_with_inbound_fk_gets_its_definition_back_too(databases):
+    # The in-place path replaces rows and keeps the table, so a destination created by
+    # an older version keeps its plain columns forever unless the definition is checked.
+    _exec(SRC_DB, "DROP TABLE IF EXISTS kind", "DROP TABLE IF EXISTS eltern",
+          """CREATE TABLE eltern (
+               id INT PRIMARY KEY,
+               zeit DATETIME NOT NULL,
+               tag DATE AS (CAST(zeit AS DATE)) STORED,
+               betrag DECIMAL(10,2) DEFAULT 1.00)""",
+          "CREATE TABLE kind (id INT PRIMARY KEY, eltern_id INT, CONSTRAINT fk_k FOREIGN KEY (eltern_id) REFERENCES eltern(id))",
+          "INSERT INTO eltern (id, zeit) VALUES (1,'2026-01-01 10:00:00')")
+    # the destination as an older version left it: plain columns, and a table pointing at it
+    _exec(DST_DB, "DROP TABLE IF EXISTS kind", "DROP TABLE IF EXISTS eltern",
+          "CREATE TABLE eltern (id INT PRIMARY KEY, zeit DATETIME NOT NULL, tag DATE, betrag DECIMAL(10,2))",
+          "CREATE TABLE kind (id INT PRIMARY KEY, eltern_id INT, CONSTRAINT fk_k FOREIGN KEY (eltern_id) REFERENCES eltern(id))",
+          "INSERT INTO eltern VALUES (9,'2020-01-01 08:00:00','2020-01-01',5.00)")
+
+    _run_table_like_the_app("eltern")
+
+    assert _normalised_ddl(DST_DB, "eltern") == _normalised_ddl(SRC_DB, "eltern")
+    _exec(DST_DB, "INSERT INTO eltern (id, zeit) VALUES (2,'2026-02-02 11:00:00')")
+    row = _rows(DST_DB, "SELECT tag, betrag FROM eltern WHERE id = 2")[0]
+    assert str(row[0]) == "2026-02-02" and float(row[1]) == 1.00

@@ -292,6 +292,6 @@ def test_definitions_are_not_carried_from_a_postgresql_source(databases):
     # MySQL destination cannot run, the app says so and leaves the table alone.
     service = _service()
     src = _profile("remote", SRC_DB, "off")
-    ok, definitions, message = asyncio.run(service.source_table_definitions(src, [f"{SRC_DB}.egal"]))
+    ok, definitions, message = asyncio.run(service.table_definitions(src, [f"{SRC_DB}.egal"]))
     assert ok and definitions == {}
     assert "MySQL source" in message

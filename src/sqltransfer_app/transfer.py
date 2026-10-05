@@ -1237,13 +1237,16 @@ class TransferService:
             if endpoint and endpoint.tunnel:
                 self.tunnel_manager.close_tunnel(endpoint.tunnel)
 
-    async def source_table_definitions(
+    async def table_definitions(
         self, source: DBProfile, tables: list[str]
     ) -> tuple[bool, dict[str, tuple[list[str], list[str]]], str]:
-        """What has to be put back per table: (clauses before the swap, clauses after it).
+        """What a table's definition needs, per table: (before the swap, after it).
+
+        Reads from whichever MySQL profile it is given, source or destination: the
+        in-place path compares the two to see whether the copy is still current.
 
         MySQL only: the DDL of one dialect is not the DDL of the other, so another
-        source type yields nothing rather than clauses the destination cannot run.
+        type yields nothing rather than clauses the destination cannot run.
         """
         if source.db_type != "mysql":
             return True, {}, "Definitions are only carried over from a MySQL source"

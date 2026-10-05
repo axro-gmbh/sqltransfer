@@ -518,7 +518,7 @@ async def main() -> int:
         order.append("swap")
         return True, ""
 
-    app_module.TransferService.source_table_definitions = _async(
+    app_module.TransferService.table_definitions = _async(
         (True, {"kunde": (["AUTO_INCREMENT = 7"], ["ADD CONSTRAINT `c` CHECK ((1 = 1))"])}, "")
     )
     app_module.TransferService.apply_definition_clauses = record_definition

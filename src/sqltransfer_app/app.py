@@ -1460,7 +1460,7 @@ async def main(page: ft.Page) -> None:
                 # apitap carries columns, types and the primary key; what governs
                 # writing (generated columns, defaults, AUTO_INCREMENT, checks) has to
                 # be put back on the temp table before it is swapped in.
-                def_ok, source_definitions, def_msg = await transfer_service.source_table_definitions(
+                def_ok, source_definitions, def_msg = await transfer_service.table_definitions(
                     src, scoped_tables
                 )
                 if not def_ok:
@@ -1582,6 +1582,45 @@ async def main(page: ft.Page) -> None:
                                 return
                             log.append(f"In-place replace done for {final_name}: {replace_msg}")
                             notes.append(f"inplace={final_name}")
+
+                            # This table was never replaced, so it still carries whatever
+                            # definition it had, possibly from a run of an older version
+                            # that dropped the generated columns. Compare and fix.
+                            wanted_before, wanted_after = source_definitions.get(final_name, ([], []))
+                            if wanted_before or wanted_after:
+                                have_ok, have, have_msg = await transfer_service.table_definitions(
+                                    dst, [final_name]
+                                )
+                                have_before, _have_after = have.get(final_name, ([], [])) if have_ok else ([], [])
+                                if not have_ok:
+                                    log.append(
+                                        f"Could not read the current definition of {final_name}: {have_msg}", "WARN"
+                                    )
+                                elif wanted_before and wanted_before != have_before:
+                                    def_ok, _failed, def_err = await transfer_service.apply_definition_clauses(
+                                        dst, final_name, wanted_before
+                                    )
+                                    if not def_ok:
+                                        fail(f"Could not restore the definition of {final_name}: {def_err}")
+                                        return
+                                    log.append(f"Restored {len(wanted_before)} definition detail(s) for {final_name}")
+                                    notes.append(f"definition={final_name}")
+                                if wanted_after:
+                                    # Constraints the table already carries come back as
+                                    # a duplicate-name error; that one is not a finding.
+                                    chk_ok, chk_failed, chk_err = await transfer_service.apply_definition_clauses(
+                                        dst, final_name, wanted_after, tolerate_failures=True
+                                    )
+                                    if not chk_ok:
+                                        log.append(
+                                            f"Check constraints of {final_name} could not be restored: {chk_err}",
+                                            "WARN",
+                                        )
+                                    for failure in chk_failed:
+                                        if "Duplicate check constraint" in failure:
+                                            continue
+                                        log.append(f"Check constraint not restored on {final_name}: {failure}", "WARN")
+                                        notes.append(f"check_failed={final_name}")
                             # The table stays in place; this repairs indexes an earlier swap removed.
                             await apply_source_indexes(final_name, final_name)
                         else:
