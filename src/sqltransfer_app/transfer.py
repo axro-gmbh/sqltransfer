@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from typing import Any, Literal
 from urllib.parse import quote_plus, urlencode
 
-from .anonymize import Column, TablePlan, update_statement
+from .anonymize import Column, JsonNode, TablePlan, mysql_json_path, update_statement
 from .models import DBProfile, SSHProfile, TransferResult
 from .secrets import SecretStore
 from .storage import Storage
@@ -143,9 +143,433 @@ def _report_failure_text(report: object) -> str | None:
     return None
 
 
+def group_generated_columns_by_table(rows: list[tuple[str, str]]) -> dict[str, list[str]]:
+    """(table, column) rows into {table: [column, ...]}, order preserved."""
+    grouped: dict[str, list[str]] = {}
+    for table, column in rows:
+        grouped.setdefault(str(table), []).append(str(column))
+    return grouped
+
+
+_GENERATED_COLUMNS_SQL = {
+    "mysql": (
+        "SELECT table_name, column_name FROM information_schema.columns "
+        "WHERE table_schema = %s AND extra LIKE '%%GENERATED%%' ORDER BY table_name, ordinal_position"
+    ),
+    "postgres": (
+        "SELECT table_name, column_name FROM information_schema.columns "
+        "WHERE table_schema = %s AND is_generated = 'ALWAYS' ORDER BY table_name, ordinal_position"
+    ),
+}
+
+
+def _generated_columns_sync(
+    host: str,
+    port: int,
+    database: str,
+    username: str,
+    password: str,
+    db_type: str,
+    schemas: list[str],
+    *,
+    tls: TlsSettings,
+) -> dict[str, list[str]]:
+    """Every generated column of the given schemas, in one round trip."""
+    rows: list[tuple[str, str]] = []
+    if db_type == "mysql":
+        conn = _mysql_connect(tls, host=host, port=port, user=username, password=password,
+                              database=database, connect_timeout=5, autocommit=True)
+    else:
+        conn = _pg_connect(tls, host=host, port=port, user=username, password=password,
+                           dbname=database, connect_timeout=5, autocommit=True)
+    try:
+        with conn.cursor() as cur:
+            for schema in schemas:
+                cur.execute(_GENERATED_COLUMNS_SQL[db_type], (schema,))
+                rows.extend((str(r[0]), str(r[1])) for r in cur.fetchall())
+    finally:
+        conn.close()
+    return group_generated_columns_by_table(rows)
+
+
+# Escaping a key for a MySQL JSON path, done by the server so the key never travels
+# through the statement text: backslash first, then the quote, both with a backslash.
+_JSON_LEVEL_BATCH = 25  # parents per discovery statement
+
+_MYSQL_KEY_ESCAPE = r"""REPLACE(REPLACE(jt.k, '\\', '\\\\'), '"', '\\"')"""
+
+
+def _json_paths_sync(
+    host: str,
+    port: int,
+    database: str,
+    username: str,
+    password: str,
+    db_type: str,
+    table: str,
+    column: str,
+    max_depth: int,
+    *,
+    tls: TlsSettings,
+) -> list[Column]:
+    """Discover the key paths of a JSON column, one query per level over all rows.
+
+    Returns JsonNode-shaped data: every path seen, with every JSON type observed for
+    it. Row-by-row inspection would mean a query per row; this is a query per level.
+    """
+    if db_type == "mysql":
+        conn = _mysql_connect(tls, host=host, port=port, user=username, password=password,
+                              database=database, connect_timeout=5, read_timeout=600, autocommit=True)
+    else:
+        conn = _pg_connect(tls, host=host, port=port, user=username, password=password,
+                           dbname=database, connect_timeout=5, autocommit=True)
+    quote = _quote_mysql_ident if db_type == "mysql" else _quote_pg_ident
+    quoted_table = ".".join(quote(part.strip('`"')) for part in table.split("."))
+    quoted_column = quote(column)
+    nodes: list[JsonNode] = []
+    try:
+        with conn.cursor() as cur:
+            if db_type == "mysql":
+                cur.execute(
+                    f"SELECT COUNT(*) FROM {quoted_table} WHERE {quoted_column} IS NOT NULL "
+                    f"AND NOT JSON_VALID({quoted_column})"
+                )
+                if int(cur.fetchone()[0]):
+                    raise ValueError(f"{table}.{column} does not hold valid JSON in every row")
+            else:
+                cur.execute(
+                    f"SELECT COUNT(*) FROM {quoted_table} WHERE {quoted_column} IS NOT NULL "
+                    f"AND pg_input_is_valid({quoted_column}::text, 'jsonb') IS NOT TRUE"
+                )
+                if int(cur.fetchone()[0]):
+                    raise ValueError(f"{table}.{column} does not hold valid JSON in every row")
+
+            # What the whole value is: an array or a scalar is reported rather than
+            # quietly yielding no keys at all.
+            if db_type == "mysql":
+                cur.execute(
+                    f"SELECT DISTINCT JSON_TYPE({quoted_column}) FROM {quoted_table} "
+                    f"WHERE {quoted_column} IS NOT NULL"
+                )
+            else:
+                cur.execute(
+                    f"SELECT DISTINCT jsonb_typeof({quoted_column}::jsonb) FROM {quoted_table} "
+                    f"WHERE {quoted_column} IS NOT NULL"
+                )
+            root_types = {str(row[0] or "NULL").upper() for row in cur.fetchall()}
+            if root_types and "OBJECT" not in root_types:
+                return [JsonNode(path=(), types=frozenset(root_types))]
+
+            parents: list[tuple[str, ...]] = [()]
+            for _depth in range(max_depth):
+                next_parents: list[tuple[str, ...]] = []
+                seen: dict[tuple[str, ...], set[str]] = {}
+                # One statement per batch of parents rather than per parent: a
+                # document with 40 objects on one level used to cost 40 round trips.
+                for chunk_start in range(0, len(parents), _JSON_LEVEL_BATCH):
+                    chunk = parents[chunk_start:chunk_start + _JSON_LEVEL_BATCH]
+                    branches, args = [], []
+                    for index, parent in enumerate(chunk):
+                        if db_type == "mysql":
+                            branches.append(
+                                f"SELECT DISTINCT {index} AS parent_index, "
+                                f"CAST(jt.k AS CHAR CHARACTER SET utf8mb4) COLLATE utf8mb4_bin AS k, "
+                                f"JSON_TYPE(JSON_EXTRACT(t.{quoted_column}, CONCAT(%s, '.\"', "
+                                f"{_MYSQL_KEY_ESCAPE}, '\"'))) AS t "
+                                f"FROM {quoted_table} t, JSON_TABLE(JSON_KEYS(t.{quoted_column}, %s), "
+                                f"'$[*]' COLUMNS (k VARCHAR(1024) CHARACTER SET utf8mb4 "
+                                f"COLLATE utf8mb4_bin PATH '$')) jt WHERE t.{quoted_column} IS NOT NULL"
+                            )
+                            args += [mysql_json_path(parent), mysql_json_path(parent)]
+                        else:
+                            at_parent = f"t.{quoted_column}::jsonb" + (" #> %s" if parent else "")
+                            branches.append(
+                                f"SELECT DISTINCT {index} AS parent_index, k, "
+                                f"jsonb_typeof(({at_parent}) -> k) AS t "
+                                f"FROM {quoted_table} t, LATERAL jsonb_object_keys({at_parent}) k "
+                                f"WHERE t.{quoted_column} IS NOT NULL "
+                                f"AND jsonb_typeof({at_parent}) = 'object'"
+                            )
+                            args += [list(parent)] * (3 if parent else 0)
+                    cur.execute(" UNION ALL ".join(branches), args)
+                    for parent_index, key, json_type in cur.fetchall():
+                        parent = chunk[int(parent_index)]
+                        if key is None:
+                            seen.setdefault((*parent, "?"), set()).add("UNREADABLE")
+                            continue
+                        seen.setdefault((*parent, str(key)), set()).add(str(json_type or "NULL").upper())
+
+                for path, types in seen.items():
+                    nodes.append(JsonNode(path=path, types=frozenset(types)))
+                    if "OBJECT" in types:
+                        next_parents.append(path)
+                parents = next_parents
+                if not parents:
+                    break
+            # Whatever is still waiting here sits deeper than max_depth.
+            for parent in parents:
+                nodes.append(JsonNode(path=parent, types=frozenset({"TOO_DEEP"})))
+    finally:
+        conn.close()
+    return nodes
+
+
+_MYSQL_ESCAPES = {"0": "\0", "n": "\n", "r": "\r", "t": "\t", "b": "\b",
+                  "Z": "\x1a", "\\": "\\", "'": "'", '"': '"'}
+
+_BINARY_TYPES = re.compile(r"^(binary|varbinary|tinyblob|blob|mediumblob|longblob)\b", re.IGNORECASE)
+
+
+def _mysql_unescape(literal: str) -> str:
+    """Turn the escapes SHOW CREATE TABLE writes back into the characters they stand for."""
+    out: list[str] = []
+    index = 0
+    while index < len(literal):
+        char = literal[index]
+        if char == "\\" and index + 1 < len(literal):
+            nxt = literal[index + 1]
+            out.append(_MYSQL_ESCAPES.get(nxt, nxt))
+            index += 2
+            continue
+        if char == "'" and literal[index + 1: index + 2] == "'":
+            out.append("'")
+            index += 2
+            continue
+        out.append(char)
+        index += 1
+    return "".join(out)
+
+
+def _hex_binary_default(line: str, codec: str) -> str:
+    """Rewrite a binary column's quoted default as a hex literal, or leave the line alone.
+
+    MySQL writes such a default as a string of raw bytes. Those characters sent back as
+    text are more bytes than the column holds, and the server refuses the column with
+    error 1067 (seen on category.cms_page_version_id of a Shopware database). Hex says
+    exactly the bytes that were there.
+    """
+    match = re.match(r"^(`[^`]+`\s+)(\S+)(.*?)\s+DEFAULT\s+'(.*)'(\s*)$", line, re.DOTALL)
+    if not match or not _BINARY_TYPES.match(match.group(2)):
+        return line
+    try:
+        raw = _mysql_unescape(match.group(4)).encode(codec)
+    except (UnicodeEncodeError, LookupError):
+        return line
+    return f"{match.group(1)}{match.group(2)}{match.group(3)} DEFAULT 0x{raw.hex().upper()}"
+
+
+def parse_mysql_table_definition(ddl: str, codec: str = "utf-8") -> tuple[list[str], list[str]]:
+    """Clauses that put a table's definition back, taken from its own DDL.
+
+    Returns (before the swap, after the swap). The source of truth is
+    `SHOW CREATE TABLE`, because that is re-executable: information_schema hands back
+    expressions with escaped quotes and defaults without their brackets, neither of
+    which a server accepts.
+
+    Only the columns that carry something apitap drops are touched: a generated
+    expression, a default, or AUTO_INCREMENT. Indexes belong to the index step, and
+    check constraints go after the swap, because their names are unique per database
+    and the outgoing table still holds them.
+    """
+    body = ddl[ddl.index("(\n") + 2: ddl.rindex("\n)")].split("\n")
+    before: list[str] = []
+    after: list[str] = []
+    auto_increment_column = False
+    previous_column: str | None = None
+
+    for raw in body:
+        line = raw.strip().rstrip(",")
+        if line.startswith("CONSTRAINT ") and " CHECK " in line:
+            after.append(f"ADD {line}")
+            continue
+        if not line.startswith("`"):
+            continue  # PRIMARY KEY, KEY, UNIQUE KEY: the index step owns those
+        name = line[: line.index("`", 1) + 1]
+        carries_default = " DEFAULT " in line and not line.endswith(" DEFAULT NULL")
+        generated = "GENERATED ALWAYS AS" in line
+        auto = "AUTO_INCREMENT" in line
+        if generated and line.rstrip().endswith("VIRTUAL"):
+            # MySQL refuses to change the STORED status of a column (error 3106), so
+            # a virtual column is rebuilt where it stood.
+            before.append(f"DROP COLUMN {name}")
+            position = f" AFTER {previous_column}" if previous_column else " FIRST"
+            before.append(f"ADD COLUMN {line}{position}")
+        elif generated or carries_default or auto:
+            before.append(f"MODIFY COLUMN {_hex_binary_default(line, codec)}")
+        auto_increment_column = auto_increment_column or auto
+        previous_column = name
+
+    if auto_increment_column:
+        match = re.search(r"AUTO_INCREMENT=(\d+)", ddl)
+        if match:
+            before.append(f"AUTO_INCREMENT = {int(match.group(1))}")
+    return before, after
+
+
+def _table_definitions_sync(
+    host: str,
+    port: int,
+    database: str,
+    username: str,
+    password: str,
+    tables: list[str],
+    *,
+    tls: TlsSettings,
+) -> tuple[dict[str, tuple[list[str], list[str]]], list[str]]:
+    """Read every table's own DDL and turn it into clauses; returns (clauses, problems).
+
+    One SHOW CREATE TABLE per table that carries something apitap drops; which tables
+    those are is answered from information_schema first, so a plain schema costs one
+    cheap query per table and nothing else.
+
+    A table that cannot be read is named in the problems and skipped. It used to take
+    every other table's definition with it: one customer table returned bytes that are
+    not UTF-8, and the whole run ended up without a single generated column.
+    """
+    conn = _mysql_connect(tls, host=host, port=port, user=username, password=password,
+                          database=database, connect_timeout=5, read_timeout=600, autocommit=True)
+    definitions: dict[str, tuple[list[str], list[str]]] = {}
+    problems: list[str] = []
+    try:
+        with conn.cursor() as cur:
+            # MySQL writes the DDL in the table's own charset, not the connection's, so
+            # pymysql's own decoding can fail on it. Taking the bytes ourselves lets the
+            # latin-1 fallback in _coerce_sql_text do its work.
+            cur.execute("SET SESSION character_set_results = binary")
+            for table in tables:
+                schema = table.rpartition(".")[0].strip('`"') or database
+                bare = table.rpartition(".")[2].strip('`"')
+                try:
+                    cur.execute(
+                        "SELECT 1 FROM information_schema.columns WHERE table_schema = %s AND table_name = %s "
+                        "AND (generation_expression <> '' OR extra LIKE '%%auto_increment%%' "
+                        "OR column_default IS NOT NULL) LIMIT 1",
+                        (schema, bare),
+                    )
+                    interesting = cur.fetchone() is not None
+                    if not interesting:
+                        cur.execute(
+                            "SELECT 1 FROM information_schema.table_constraints WHERE table_schema = %s "
+                            "AND table_name = %s AND constraint_type = 'CHECK' LIMIT 1",
+                            (schema, bare),
+                        )
+                        interesting = cur.fetchone() is not None
+                    if not interesting:
+                        continue
+                    cur.execute(f"SHOW CREATE TABLE {_quote_mysql_ident(schema)}.{_quote_mysql_ident(bare)}")
+                    ddl, codec = _coerce_sql_text_with_codec(cur.fetchone()[1])
+                    before, after = parse_mysql_table_definition(ddl, codec=codec)
+                except Exception as exc:  # noqa: BLE001
+                    problems.append(f"{bare}: {exc}")
+                    continue
+                if before or after:
+                    definitions[bare] = (before, after)
+    finally:
+        conn.close()
+    return definitions, problems
+
+
+def _drop_mysql_tables_sync(
+    host: str,
+    port: int,
+    database: str,
+    username: str,
+    password: str,
+    tables: list[str],
+    *,
+    tls: TlsSettings,
+) -> int:
+    """Returns how many of the tables were actually there."""
+    conn = _mysql_connect(tls, host=host, port=port, user=username, password=password,
+                          database=database, connect_timeout=5, read_timeout=600, autocommit=True)
+    dropped = 0
+    try:
+        with conn.cursor() as cur:
+            for table in tables:
+                cur.execute(
+                    "SELECT 1 FROM information_schema.tables WHERE table_schema = DATABASE() "
+                    "AND table_name = %s LIMIT 1",
+                    (table,),
+                )
+                if cur.fetchone() is None:
+                    continue
+                cur.execute(f"DROP TABLE {_quote_mysql_ident(table)}")
+                dropped += 1
+    finally:
+        conn.close()
+    return dropped
+
+
+def _apply_definition_clauses_sync(
+    host: str,
+    port: int,
+    database: str,
+    username: str,
+    password: str,
+    table: str,
+    clauses: list[str],
+    tolerate_failures: bool,
+    *,
+    tls: TlsSettings,
+) -> list[str]:
+    """Run the clauses in order; returns the ones that failed when that is tolerated."""
+    quoted = ".".join(_quote_mysql_ident(part.strip('`"')) for part in table.split("."))
+    conn = _mysql_connect(tls, host=host, port=port, user=username, password=password,
+                          database=database, connect_timeout=5,
+                          # MODIFY COLUMN on a generated column rebuilds the table, like an index build.
+                          read_timeout=3600, write_timeout=3600, autocommit=True)
+    failed: list[str] = []
+    try:
+        with conn.cursor() as cur:
+            for clause in clauses:
+                try:
+                    cur.execute(f"ALTER TABLE {quoted} {clause}")
+                except Exception as exc:  # noqa: BLE001
+                    if not tolerate_failures:
+                        raise
+                    failed.append(f"{clause}: {exc}")
+    finally:
+        conn.close()
+    return failed
+
+
+def mysql_column_is_generated(extra: str | None) -> bool:
+    """Whether information_schema's `extra` describes a generated column.
+
+    MySQL writes DEFAULT_GENERATED there for a column with a function default, which
+    is an ordinary column holding ordinary data. Matching on "GENERATED" alone dropped
+    those columns from the in-place copy without a word.
+    """
+    text = str(extra or "").upper()
+    return "STORED GENERATED" in text or "VIRTUAL GENERATED" in text
+
+
+def build_mysql_insert_columns(
+    final_columns: list[tuple[str, bool]], temp_columns: list[str]
+) -> list[str]:
+    """Which columns an INSERT .. SELECT may carry: (name, is generated) for the
+    destination, plain names for the temp table.
+
+    MySQL refuses a value for a generated column (error 3105), and "SELECT *"
+    supplies one for every column the temp table has, so a Shopware order table
+    with its generated order_date could never be replaced in place.
+    """
+    available = {name.lower() for name in temp_columns}
+    usable = [name for name, generated in final_columns if not generated and name.lower() in available]
+    if not usable:
+        raise ValueError("no columns to copy: every column is generated or missing in the temp table")
+    return usable
+
+
+# PostgreSQL has no `extra` column; MySQL has no `is_generated`.
 _COLUMNS_SQL = (
-    "SELECT column_name, data_type, character_maximum_length FROM information_schema.columns "
-    "WHERE table_schema = %s AND table_name = %s ORDER BY ordinal_position"
+    "SELECT column_name, data_type, character_maximum_length, is_generated "
+    "FROM information_schema.columns WHERE table_schema = %s AND table_name = %s ORDER BY ordinal_position"
+)
+
+_MYSQL_COLUMNS_SQL = (
+    "SELECT column_name, data_type, character_maximum_length, extra "
+    "FROM information_schema.columns WHERE table_schema = %s AND table_name = %s ORDER BY ordinal_position"
 )
 
 
@@ -168,9 +592,20 @@ def _table_columns_sync(
                            dbname=database, connect_timeout=5, autocommit=True)
     try:
         with conn.cursor() as cur:
-            cur.execute(_COLUMNS_SQL, (schema, name))
-            columns = [Column(str(row[0]), str(row[1]), int(row[2]) if row[2] is not None else None)
-                       for row in cur.fetchall()]
+            # MySQL marks a generated column in `extra`, PostgreSQL in `is_generated`.
+            cur.execute(_MYSQL_COLUMNS_SQL if db_type == "mysql" else _COLUMNS_SQL, (schema, name))
+            columns = [
+                Column(
+                    str(row[0]),
+                    str(row[1]),
+                    int(row[2]) if row[2] is not None else None,
+                    # MySQL puts it in `extra`, PostgreSQL in `is_generated`; both land in row[3].
+                    generated=mysql_column_is_generated(row[3])
+                    if db_type == "mysql"
+                    else str(row[3] or "").upper() == "ALWAYS",
+                )
+                for row in cur.fetchall()
+            ]
         if not columns:
             # Empty means "this table is not visible from here", never "it has no
             # columns". Treating it as nothing to do let a run report success while
@@ -716,6 +1151,33 @@ class TransferService:
             if endpoint and endpoint.tunnel:
                 self.tunnel_manager.close_tunnel(endpoint.tunnel)
 
+    async def mysql_drop_tables(
+        self, destination: DBProfile, tables: list[str]
+    ) -> tuple[bool, int, str]:
+        """Drop the given tables, ignoring the ones that are not there.
+
+        Used to take a run's own temp tables with it when it fails: they are useless
+        to anyone and used to pile up in the destination with every failed run.
+        """
+        if destination.db_type != "mysql":
+            return True, 0, ""
+        endpoint: ResolvedEndpoint | None = None
+        try:
+            endpoint = self._resolve_profile(destination)
+            host = endpoint.tunnel.local_host if endpoint.tunnel else destination.host
+            port = endpoint.tunnel.local_port if endpoint.tunnel else destination.port
+            password = self.secret_store.get_secret(destination.password_secret_key) or ""
+            dropped = await asyncio.to_thread(
+                _drop_mysql_tables_sync, host, port, destination.database, destination.username,
+                password, tables, tls=endpoint.tls,
+            )
+            return True, dropped, ""
+        except Exception as exc:  # noqa: BLE001
+            return False, 0, str(exc)
+        finally:
+            if endpoint and endpoint.tunnel:
+                self.tunnel_manager.close_tunnel(endpoint.tunnel)
+
     async def mysql_empty_table(self, destination: DBProfile, table: str) -> tuple[bool, int, str]:
         """Clear a destination table whose source is empty: (ok, rows deleted, error).
 
@@ -864,6 +1326,123 @@ class TransferService:
                 self.tunnel_manager.close_tunnel(endpoint.tunnel)
 
 
+    async def source_generated_columns(
+        self, source: DBProfile, tables: list[str]
+    ) -> tuple[bool, dict[str, list[str]], str]:
+        """Which source columns the database computes, for every table in scope.
+
+        A table apitap creates or that gets swapped in keeps the values but loses
+        the expression behind them, so the copy never recomputes. One round trip
+        for the whole run, like the index read.
+        """
+        schemas = sorted({table.rpartition(".")[0].strip("`\"") or source.database for table in tables})
+        endpoint: ResolvedEndpoint | None = None
+        try:
+            endpoint = self._resolve_profile(source)
+            host = endpoint.tunnel.local_host if endpoint.tunnel else source.host
+            port = endpoint.tunnel.local_port if endpoint.tunnel else source.port
+            password = self.secret_store.get_secret(source.password_secret_key) or ""
+            grouped = await asyncio.to_thread(
+                _generated_columns_sync, host, port, source.database, source.username, password,
+                source.db_type, schemas, tls=endpoint.tls,
+            )
+            return True, grouped, ""
+        except Exception as exc:  # noqa: BLE001
+            return False, {}, str(exc)
+        finally:
+            if endpoint and endpoint.tunnel:
+                self.tunnel_manager.close_tunnel(endpoint.tunnel)
+
+    async def table_definitions(
+        self, source: DBProfile, tables: list[str]
+    ) -> tuple[bool, dict[str, tuple[list[str], list[str]]], str]:
+        """What a table's definition needs, per table: (before the swap, after it).
+
+        Reads from whichever MySQL profile it is given, source or destination: the
+        in-place path compares the two to see whether the copy is still current.
+
+        MySQL only: the DDL of one dialect is not the DDL of the other, so another
+        type yields nothing rather than clauses the destination cannot run.
+        """
+        if source.db_type != "mysql":
+            return True, {}, "Definitions are only carried over from a MySQL source"
+        endpoint: ResolvedEndpoint | None = None
+        try:
+            endpoint = self._resolve_profile(source)
+            host = endpoint.tunnel.local_host if endpoint.tunnel else source.host
+            port = endpoint.tunnel.local_port if endpoint.tunnel else source.port
+            password = self.secret_store.get_secret(source.password_secret_key) or ""
+            definitions, problems = await asyncio.to_thread(
+                _table_definitions_sync, host, port, source.database, source.username, password,
+                tables, tls=endpoint.tls,
+            )
+            if problems:
+                return True, definitions, (
+                    f"{len(problems)} table(s) kept their old definition, their DDL could not be read: "
+                    + "; ".join(problems)
+                )
+            return True, definitions, ""
+        except Exception as exc:  # noqa: BLE001
+            return False, {}, str(exc)
+        finally:
+            if endpoint and endpoint.tunnel:
+                self.tunnel_manager.close_tunnel(endpoint.tunnel)
+
+    async def apply_definition_clauses(
+        self, destination: DBProfile, table: str, clauses: list[str], tolerate_failures: bool = False
+    ) -> tuple[bool, list[str], str]:
+        """Put part of a definition back: (ok, failed clauses, error).
+
+        With tolerate_failures the clauses run one by one and the ones that do not apply
+        are reported instead of stopping the run. Check constraints need that: one
+        referring to a column apitap did not carry must not cost the whole table.
+        """
+        if not clauses:
+            return True, [], ""
+        if destination.db_type != "mysql":
+            return True, [], "Destination is not MySQL"
+        endpoint: ResolvedEndpoint | None = None
+        try:
+            endpoint = self._resolve_profile(destination)
+            host = endpoint.tunnel.local_host if endpoint.tunnel else destination.host
+            port = endpoint.tunnel.local_port if endpoint.tunnel else destination.port
+            password = self.secret_store.get_secret(destination.password_secret_key) or ""
+            failed = await asyncio.to_thread(
+                _apply_definition_clauses_sync, host, port, destination.database, destination.username,
+                password, table, clauses, tolerate_failures, tls=endpoint.tls,
+            )
+            return True, failed, ""
+        except Exception as exc:  # noqa: BLE001
+            return False, [], str(exc)
+        finally:
+            if endpoint and endpoint.tunnel:
+                self.tunnel_manager.close_tunnel(endpoint.tunnel)
+
+    async def json_paths(
+        self, profile: DBProfile, table: str, column: str, max_depth: int = 4
+    ) -> tuple[bool, list[JsonNode], str]:
+        """Key paths inside a JSON column: (ok, nodes, error).
+
+        A column that does not hold valid JSON is an error for that column, not for
+        the run: the caller reports it and leaves the column alone.
+        """
+        endpoint: ResolvedEndpoint | None = None
+        try:
+            endpoint = self._resolve_profile(profile)
+            host = endpoint.tunnel.local_host if endpoint.tunnel else profile.host
+            port = endpoint.tunnel.local_port if endpoint.tunnel else profile.port
+            password = self.secret_store.get_secret(profile.password_secret_key) or ""
+            nodes = await asyncio.to_thread(
+                _json_paths_sync, host, port, profile.database, profile.username, password,
+                profile.db_type, table, column, max_depth, tls=endpoint.tls,
+            )
+            return True, nodes, ""
+        except Exception as exc:  # noqa: BLE001
+            return False, [], str(exc)
+        finally:
+            if endpoint and endpoint.tunnel:
+                self.tunnel_manager.close_tunnel(endpoint.tunnel)
+
     async def table_columns(self, profile: DBProfile, table: str) -> tuple[bool, list[Column], str]:
         """Column names and types of one destination table: (ok, columns, error)."""
         endpoint: ResolvedEndpoint | None = None
@@ -962,6 +1541,10 @@ def _list_tables_sync(
         write_timeout=8,
         autocommit=True,
     )
+    # The scope names its own database; the profile's is only the fallback. Everything
+    # after the listing (indexes, definitions) reads the schema off the table name, so
+    # a bare name from the wrong database would silently restore nothing.
+    schema = (schema_hint or "").strip().strip('`"') or database
     try:
         with conn.cursor() as cur:
             cur.execute(
@@ -973,11 +1556,14 @@ def _list_tables_sync(
                 ORDER BY table_name
                 LIMIT %s
                 """,
-                (database, limit),
+                (schema, limit),
             )
-            return [str(row[0]) for row in cur.fetchall()]
+            names = [str(row[0]) for row in cur.fetchall()]
     finally:
         conn.close()
+    if schema == database:
+        return names
+    return [f"{schema}.{name}" for name in names]
 
 
 def _quote_mysql_ident(name: str) -> str:
@@ -1476,9 +2062,24 @@ def _mysql_replace_final_from_temp_sync(
                 cur.execute("SET SESSION net_read_timeout=600")
                 cur.execute("SET SESSION net_write_timeout=600")
                 cur.execute("SET FOREIGN_KEY_CHECKS=0")
+                cur.execute(
+                    "SELECT column_name, extra FROM information_schema.columns "
+                    "WHERE table_schema = DATABASE() AND table_name = %s ORDER BY ordinal_position",
+                    (final_table,),
+                )
+                final_columns = [(str(r[0]), mysql_column_is_generated(r[1])) for r in cur.fetchall()]
+                cur.execute(
+                    "SELECT column_name FROM information_schema.columns "
+                    "WHERE table_schema = DATABASE() AND table_name = %s",
+                    (temp_table,),
+                )
+                temp_columns = [str(r[0]) for r in cur.fetchall()]
+                names = build_mysql_insert_columns(final_columns, temp_columns)
+                column_list = ", ".join(_quote_mysql_ident(name) for name in names)
                 cur.execute(f"DELETE FROM {_quote_mysql_ident(final_table)}")
                 cur.execute(
-                    f"INSERT INTO {_quote_mysql_ident(final_table)} SELECT * FROM {_quote_mysql_ident(temp_table)}"
+                    f"INSERT INTO {_quote_mysql_ident(final_table)} ({column_list}) "
+                    f"SELECT {column_list} FROM {_quote_mysql_ident(temp_table)}"
                 )
                 cur.execute(f"DROP TABLE {_quote_mysql_ident(temp_table)}")
                 cur.execute("SET FOREIGN_KEY_CHECKS=1")
@@ -1758,6 +2359,21 @@ def _ensure_empty_mysql_table_from_source_sync(
                     )
     finally:
         dst_conn.close()
+
+
+def _coerce_sql_text_with_codec(value: object) -> tuple[str, str]:
+    """The DDL as text, plus the codec it was read with.
+
+    The codec is what turns a binary default back into the exact bytes it stood for,
+    so it has to travel with the text.
+    """
+    if isinstance(value, (bytes, bytearray)):
+        raw = bytes(value)
+        try:
+            return raw.decode("utf-8"), "utf-8"
+        except UnicodeDecodeError:
+            return raw.decode("latin-1"), "latin-1"
+    return _coerce_sql_text(value), "utf-8"
 
 
 def _coerce_sql_text(value: object) -> str:

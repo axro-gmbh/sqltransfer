@@ -136,6 +136,10 @@ Im Bereich **Transfer** steht der Schalter **Anonymize personal data**. Er ist a
 
 **Gleicher Wert ergibt immer denselben Ersatz.** Eine Adresse, die in zwei Tabellen steht, wird in beiden gleich ersetzt, Verknüpfungen bleiben also heil. Eindeutig bleiben allerdings nur die Arten, deren Ersatz den Hash enthält: **E-Mail** und **Generic text**. Namen, Orte und Straßen stammen aus einer Liste und wiederholen sich; auf einer UNIQUE-Spalte nimm deshalb E-Mail oder Generic text. Dafür sorgt ein Zufallswert im Schlüsselbund, der deinen Rechner nie verlässt. `NULL` bleibt `NULL`, Leeres bleibt leer.
 
+**Auch in JSON wird ersetzt.** Spalten vom Typ `json` werden automatisch durchsucht. Liegt das JSON in einer Textspalte (bei Shopware der Normalfall, etwa `custom_fields`), legst du dafür eine Regel mit der Art **Look inside the JSON** an. Darin greifen deine übrigen Regeln auf die **Schlüsselnamen**: `*mail*` trifft dann den Schlüssel `email` genauso wie eine Spalte `email`. Die Struktur bleibt, nur die Werte ändern sich, und Schlüssel ohne Regel bleiben unberührt.
+
+Drei Grenzen dabei: Werte in **Listen** (`{"positionen":[{"email":...}]}`) werden gemeldet, aber nicht ersetzt. Verschachtelung wird bis zur **vierten Ebene** verfolgt. Und Werte, die **keine Zeichenkette** sind (eine Telefonnummer als Zahl), bleiben stehen, damit die Anwendung keinen anderen Typ zurückbekommt. Alle drei Fälle stehen als WARN im Protokoll.
+
 **Vorher sehen, was passiert:** **Preview plan** listet die betroffenen Spalten, bevor eine Zeile kopiert wird. Nach dem Lauf steht im Protokoll, was ersetzt wurde. Spalten, die nach Personendaten aussehen, aber keine Regel haben, erscheinen als WARN mit Begründung.
 
 **Grenzen, die du kennen solltest:**
@@ -165,6 +169,14 @@ Rechts stehen die letzten 20 Läufe mit Status, Quelle, Ziel, Umfang, Zeilenzahl
 ## Wichtig zu wissen
 
 **Die Zieltabelle wird ersetzt, nicht ergänzt.** Eine Übertragung überschreibt die Tabelle im Ziel. Sie hängt keine Zeilen an und gleicht nichts ab. Deshalb gilt: Ziel ist deine lokale Entwicklungsdatenbank, niemals etwas, dessen Inhalt jemand braucht.
+
+**Die Tabellendefinition wird wiederhergestellt.** Legt die App eine Tabelle neu an oder tauscht sie aus, bringt apitap nur Spalten, Typen und Primärschlüssel mit. Die App setzt danach wieder, was zum Schreiben gehört: **berechnete Spalten** samt ihrer Formel, **Standardwerte**, **CHECK-Bedingungen** und **AUTO_INCREMENT** samt Zählerstand, dazu wie bisher Indizes und Fremdschlüssel. Eine Kopie verhält sich beim Schreiben also wie das Original: `order_date` rechnet wieder mit, ein Einfügen ohne Spalte nimmt den Standardwert, und eine verletzte Bedingung wird abgelehnt.
+
+Scheitert dabei ein Schritt, bricht der Lauf ab und es wird **nicht** getauscht. Lieber die alte Tabelle als eine halb hergestellte.
+
+Grundlage ist das `SHOW CREATE TABLE` der Quelle, also das, was der Server selbst als Definition ausgibt. Prüfbedingungen werden nach dem Tausch gesetzt, weil ihre Namen in MySQL der Datenbank gehören und die alte Tabelle sie bis dahin hält. Eine Bedingung, die sich nicht anwenden lässt, wird gemeldet und kostet nicht die ganze Tabelle. Das gilt für jedes Detail: Was der Server nicht zurücknimmt (etwa einen binären Standardwert, den er selbst anders ausgibt, als er ihn annimmt), steht mit Klausel und Grund im Protokoll, alles andere an der Tabelle wird trotzdem gesetzt.
+
+Nicht eingeholt werden: Trigger, Views, Partitionierung und Spaltenkommentare. **Das Ganze gilt nur für MySQL nach MySQL.** Bei einer PostgreSQL-Quelle oder einem PostgreSQL-Ziel bleibt es beim bisherigen Verhalten, die Kopie verliert diese Eigenschaften und das Protokoll sagt es.
 
 **Sonderbehandlung bei MySQL als Ziel.** Die App überträgt jede Tabelle zuerst in eine Zwischentabelle und tauscht sie am Ende in einem Schritt aus, sodass niemand eine halb gefüllte Tabelle sieht. Verweisen andere Tabellen per Fremdschlüssel auf die Zieltabelle, tauscht die App sie nicht aus, sondern ersetzt nur die Daten darin, denn ein Austausch würde diese Verweise brechen. Das taucht im Protokoll als WARN auf. Das ist kein Fehler, sondern der Hinweis, dass ein Umweg genommen wurde.
 

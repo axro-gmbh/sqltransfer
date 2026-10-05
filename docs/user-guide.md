@@ -136,6 +136,10 @@ The **Transfer** section has a switch, **Anonymize personal data**. It is on as 
 
 **The same value always yields the same replacement.** An address appearing in two tables is replaced identically in both, so joins keep working. Uniqueness, however, only holds for the kinds whose replacement carries the hash: **e-mail** and **generic text**. Names, cities and streets come from a list and repeat, so on a `UNIQUE` column pick e-mail or generic text. A random value in the Keychain, which never leaves your machine, makes those replacements unguessable. `NULL` stays `NULL`, empty stays empty.
 
+**JSON is rewritten too.** Columns of type `json` are searched automatically. When the JSON sits in a text column (the normal case in Shopware, `custom_fields` for example), add a rule with the kind **Look inside the JSON**. Your other rules then apply to the **key names**: `*mail*` covers the key `email` just as it covers a column `email`. The structure stays, only values change, and keys without a rule are left alone.
+
+Three limits: values inside **arrays** (`{"positions":[{"email":...}]}`) are reported but not replaced. Nesting is followed to the **fourth level**. And values that are **not strings** (a phone number stored as a number) stay as they are, so the application does not read back a different type. All three appear as WARN in the log.
+
 **See it before it happens:** **Preview plan** lists the affected columns before a single row is copied. After the run the log says what was replaced. Columns that look personal but have no rule appear as WARN, with the reason.
 
 **Limits worth knowing:**
@@ -165,6 +169,14 @@ On the right are the last 20 runs with status, source, destination, scope, row c
 ## Worth knowing
 
 **The destination table is replaced, not added to.** A transfer overwrites the table at the destination. It does not append rows and does not merge anything. So the destination is your local development database, never something whose content anyone depends on.
+
+**The table definition is restored.** When the app creates a table or swaps one in, apitap brings columns, types and the primary key only. The app then puts back what governs writing: **generated columns** with their expression, **defaults**, **CHECK constraints** and **AUTO_INCREMENT** with its counter, on top of the indexes and foreign keys it already restored. Writing against the copy therefore behaves like writing against the original: `order_date` follows along again, an insert without the column takes the default, and a violated constraint is refused.
+
+If one of those steps fails, the run stops and nothing is swapped. The old table is better than a half-restored one.
+
+The source of truth is the source's own `SHOW CREATE TABLE`, the definition as the server states it. Check constraints are applied after the swap, because in MySQL their names belong to the database and the outgoing table holds them until then. One that cannot be applied is reported and does not cost the table. That holds for every detail: whatever the server will not take back (a binary default, for instance, which it writes differently from how it accepts it) goes into the log with its clause and the reason, and the table's other details are still applied.
+
+Not carried over: triggers, views, partitioning and column comments. **All of this is MySQL to MySQL only.** With a PostgreSQL source or destination the previous behaviour stands: the copy loses these properties and the log says so.
 
 **Special handling with MySQL as destination.** The app copies every table into a temporary table first and swaps it in one step at the end, so nobody sees a half filled table. When other tables reference the destination table by a foreign key, the app does not swap it but replaces the rows in place instead, because a swap would break those references. That shows up as WARN in the log. It is not an error, it says a detour was taken.
 

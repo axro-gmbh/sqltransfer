@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 import socket
@@ -10,7 +11,8 @@ from uuid import uuid4
 import flet as ft
 
 from . import __version__, ui
-from .anonymize import KINDS, Rule, plan_table
+
+from .anonymize import KINDS, JsonTarget, Rule, json_path_text, plan_json_column, plan_table
 from .models import DBProfile, SSHProfile, TransferResult
 from .profiles import (
     DestinationWarning,
@@ -123,24 +125,37 @@ async def main(page: ft.Page) -> None:
 
     def confirm(title: str, message: str, confirm_label: str, on_confirm) -> None:
         def close(_: object = None) -> None:
-            page.pop_dialog()
+            dismiss(question)
 
         def accept(_: object = None) -> None:
-            page.pop_dialog()
+            dismiss(question)
             on_confirm()
 
-        page.show_dialog(
-            ft.AlertDialog(
-                modal=True,
-                title=ft.Text(title),
-                content=ft.Text(message),
-                actions=[
-                    ft.TextButton("Cancel", on_click=close),
-                    ft.FilledButton(confirm_label, on_click=accept),
-                ],
-                actions_alignment=ft.MainAxisAlignment.END,
-            )
+        question = ft.AlertDialog(
+            modal=True,
+            title=ft.Row(
+                [ft.Icon(ft.Icons.WARNING_AMBER_ROUNDED, color=ft.Colors.ERROR), ft.Text(title)],
+                spacing=8,
+            ),
+            content=ft.Column(
+                [ft.Text(line, size=13) for line in lines],
+                spacing=6,
+                tight=True,
+                width=460,
+            ),
+            actions=[
+                ft.TextButton("Cancel", on_click=lambda _: settle(False)),
+                ft.FilledButton(
+                    confirm_label,
+                    icon=ft.Icons.WARNING_AMBER_ROUNDED,
+                    style=ft.ButtonStyle(bgcolor=ft.Colors.ERROR, color=ft.Colors.ON_ERROR),
+                    on_click=lambda _: settle(True),
+                ),
+            ],
+            actions_alignment=ft.MainAxisAlignment.END,
+            on_dismiss=lambda _: settle(False),
         )
+        page.show_dialog(question)
 
     async def copy_text_task(text: str) -> None:
         # Clipboard().set is a coroutine; without await nothing reaches the clipboard.
@@ -158,6 +173,24 @@ async def main(page: ft.Page) -> None:
         page.run_task(copy_text_task, text)
 
     log = ui.LogPanel(on_copy=copy_to_clipboard, height=280)
+
+    # The dialog this session opened last. Flet keeps snack bars and alert dialogs
+    # on one stack and pop_dialog() closes the topmost open one, so a message that
+    # appeared over the dialog (a connection test, say) would swallow the close and
+    # leave the form standing.
+    open_dialogs: dict[str, ft.AlertDialog | None] = {"current": None}
+
+    def show_form_dialog(dialog: ft.AlertDialog) -> None:
+        open_dialogs["current"] = dialog
+        page.show_dialog(dialog)
+
+    def dismiss(dialog: ft.AlertDialog | None) -> None:
+        if dialog is None or not getattr(dialog, "open", False):
+            return
+        dialog.open = False
+        page.update()  # the dialog itself may not be mounted yet in a test harness
+        if open_dialogs.get("current") is dialog:
+            open_dialogs["current"] = None
 
     # ------------------------------------------------------------------ controls
 
@@ -393,7 +426,11 @@ async def main(page: ft.Page) -> None:
 
     def refresh_ssh_options() -> None:
         profiles = storage.list_ssh_profiles()
-        db_ssh_profile.options = [ft.dropdown.Option(str(p.id), p.name) for p in profiles]
+        # The empty entry is what makes a pick undoable: a Flet dropdown has no
+        # other way back to "nothing selected".
+        db_ssh_profile.options = [ft.dropdown.Option("", "No tunnel")] + [
+            ft.dropdown.Option(str(p.id), p.name) for p in profiles
+        ]
         shown = filter_ssh_profiles(profiles, ssh_search.value)
         ssh_rows.height = _list_height(len(shown), 4, 56)
         ssh_rows.controls = [
@@ -496,13 +533,14 @@ async def main(page: ft.Page) -> None:
         rule_pattern.value = rule.pattern if rule else ""
         rule_kind.value = rule.kind if rule else KINDS[0][0]
         rule_enabled.value = rule.enabled if rule else True
-        page.show_dialog(build_rule_dialog())
+        show_form_dialog(build_rule_dialog())
         page.update()
 
     def save_rule(_: object) -> None:
         if not require((rule_pattern, "column pattern")):
             return
         try:
+            saved_dialog = open_dialogs.get("current")
             storage.save_anonymization_rule(
                 Rule(
                     id=rule_form_state["id"],
@@ -511,7 +549,7 @@ async def main(page: ft.Page) -> None:
                     enabled=bool(rule_enabled.value),
                 )
             )
-            page.pop_dialog()
+            dismiss(saved_dialog)
             refresh_rules()
             notify_ok(f"Saved rule '{rule_pattern.value.strip()}'")
             page.update()
@@ -521,7 +559,7 @@ async def main(page: ft.Page) -> None:
             page.update()
         except ProfileGone:
             notify_error("That rule was deleted meanwhile")
-            page.pop_dialog()
+            dismiss(open_dialogs.get("current"))
             refresh_rules()
             page.update()
         except Exception as exc:  # noqa: BLE001
@@ -635,6 +673,17 @@ async def main(page: ft.Page) -> None:
             return False
         return True
 
+    def sync_tunnel_fields() -> None:
+        """The SSH pick follows the checkbox: no tunnel, no profile, and no leftover."""
+        if not db_use_ssh.value:
+            db_ssh_profile.value = ""
+            db_ssh_profile.error_text = None
+        db_ssh_profile.disabled = not db_use_ssh.value
+
+    def on_tunnel_toggle(_: object) -> None:
+        sync_tunnel_fields()
+        page.update()
+
     def open_ssh_dialog(profile_id: int | None = None) -> None:
         profile = storage.get_ssh_profile(profile_id) if profile_id else None
         if profile_id and profile is None:
@@ -652,7 +701,7 @@ async def main(page: ft.Page) -> None:
         ssh_key.value = profile.private_key_path if profile else ""
         ssh_passphrase.value = ""
         ssh_passphrase.helper = "Leave empty to keep the stored one" if profile else "Only for an encrypted key"
-        page.show_dialog(build_ssh_dialog())
+        show_form_dialog(build_ssh_dialog())
         page.update()
 
     def ask_delete_ssh(profile_id: int, name: str) -> None:
@@ -693,11 +742,12 @@ async def main(page: ft.Page) -> None:
         db_password.value = ""
         db_password.helper = "Leave empty to keep the stored one" if profile else "Stored in the macOS Keychain"
         db_use_ssh.value = bool(profile.use_ssh) if profile else False
-        db_ssh_profile.value = str(profile.ssh_profile_id) if (profile and profile.ssh_profile_id) else None
+        db_ssh_profile.value = str(profile.ssh_profile_id) if (profile and profile.ssh_profile_id) else ""
+        sync_tunnel_fields()
         db_tls_mode.value = (profile.tls_mode or "auto") if profile else "auto"
         db_tls_ca.value = (profile.tls_ca_path or "") if profile else ""
         db_tls_ca.error = None
-        page.show_dialog(build_db_dialog())
+        show_form_dialog(build_db_dialog())
         page.update()
 
     def ask_delete_db(profile_id: int, name: str) -> None:
@@ -728,6 +778,7 @@ async def main(page: ft.Page) -> None:
                 passphrase_key = passphrase_key or _new_secret_key("ssh", profile_name, "passphrase")
                 secrets.set_secret(passphrase_key, ssh_passphrase.value)
 
+            saved_dialog = open_dialogs.get("current")
             storage.save_ssh_profile(
                 SSHProfile(
                     id=ssh_form_state["id"],
@@ -739,7 +790,7 @@ async def main(page: ft.Page) -> None:
                     passphrase_secret_key=passphrase_key,
                 )
             )
-            page.pop_dialog()
+            dismiss(saved_dialog)
             refresh_ssh_options()
             refresh_db_options()
             notify_ok(f"Saved SSH profile '{profile_name}'")
@@ -750,7 +801,7 @@ async def main(page: ft.Page) -> None:
             page.update()
         except ProfileGone:
             notify_error("That SSH profile was deleted meanwhile")
-            page.pop_dialog()
+            dismiss(open_dialogs.get("current"))
             refresh_ssh_options()
             page.update()
         except Exception as exc:  # noqa: BLE001
@@ -775,6 +826,7 @@ async def main(page: ft.Page) -> None:
                 password_secret_key = password_secret_key or _new_secret_key("db", profile_name, "password")
                 secrets.set_secret(password_secret_key, db_password.value)
 
+            saved_dialog = open_dialogs.get("current")
             storage.save_db_profile(
                 DBProfile(
                     id=db_form_state["id"],
@@ -791,7 +843,7 @@ async def main(page: ft.Page) -> None:
                     tls_ca_path=form_ca_path(),
                 )
             )
-            page.pop_dialog()
+            dismiss(saved_dialog)
             refresh_db_options()
             notify_ok(f"Saved database profile '{profile_name}'")
             page.update()
@@ -801,7 +853,7 @@ async def main(page: ft.Page) -> None:
             page.update()
         except ProfileGone:
             notify_error("That database profile was deleted meanwhile")
-            page.pop_dialog()
+            dismiss(open_dialogs.get("current"))
             refresh_db_options()
             page.update()
         except Exception as exc:  # noqa: BLE001
@@ -1123,18 +1175,38 @@ async def main(page: ft.Page) -> None:
             log.append(f"Could not read columns of {label}: {message}", "ERROR")
             return False
         plan = plan_table(table, columns, rules)
+
+        # A JSON column is looked into: its paths are discovered in the database and
+        # planned like columns, so the structure survives and only values change.
+        json_targets: list[JsonTarget] = []
+        json_skipped: list[tuple[str, str]] = []
+        for column, column_type in plan.json_columns:
+            ok, nodes, message = await transfer_service.json_paths(profile, table, column)
+            if not ok:
+                # One unreadable column must not stop a transfer; say so and move on.
+                log.append(f"{label}.{column} was not searched: {message}", "WARN")
+                continue
+            found, skipped_paths, _descend = plan_json_column(column, nodes, rules)
+            json_targets += [replace(target, column_type=column_type) for target in found]
+            json_skipped += list(skipped_paths)
+        plan = replace(plan, json_targets=tuple(json_targets), skipped=plan.skipped + tuple(json_skipped))
+
         for column, reason in plan.skipped:
-            log.append(f"{label}.{column} looks personal but was not anonymized: {reason}", "WARN")
-        if not plan.targets:
+            log.append(f"{label}.{column} was not anonymized: {reason}", "WARN")
+        if not plan.targets and not plan.json_targets:
             return True
         started = time.monotonic()
         ok, affected, message = await transfer_service.anonymize_table(profile, plan)
         if not ok:
             log.append(f"Anonymizing {label} failed: {message}", "ERROR")
             return False
-        names = ", ".join(column for column, _kind, _length in plan.targets)
+        names = ", ".join(
+            [column for column, _kind, _length in plan.targets]
+            + [json_path_text(t.column, t.path) for t in plan.json_targets]
+        )
         log.append(
-            f"Anonymized {label}: {names} ({len(plan.targets)} columns, {ui.format_rows(affected)} rows, "
+            f"Anonymized {label}: {names} ({len(plan.targets) + len(plan.json_targets)} values, "
+            f"{ui.format_rows(affected)} rows, "
             f"{ui.format_duration(int((time.monotonic() - started) * 1000))})"
         )
         return True
@@ -1144,12 +1216,11 @@ async def main(page: ft.Page) -> None:
         answer: asyncio.Future[bool] = asyncio.get_running_loop().create_future()
 
         def settle(value: bool) -> None:
-            page.pop_dialog()
+            dismiss(question)
             if not answer.done():
                 answer.set_result(value)
 
-        page.show_dialog(
-            ft.AlertDialog(
+        question = ft.AlertDialog(
                 modal=True,
                 title=ft.Row(
                     [ft.Icon(ft.Icons.WARNING_AMBER_ROUNDED, color=ft.Colors.ERROR), ft.Text(title)],
@@ -1170,10 +1241,10 @@ async def main(page: ft.Page) -> None:
                         on_click=lambda _: settle(True),
                     ),
                 ],
-                actions_alignment=ft.MainAxisAlignment.END,
-                on_dismiss=lambda _: settle(False),
-            )
+            actions_alignment=ft.MainAxisAlignment.END,
+            on_dismiss=lambda _: settle(False),
         )
+        page.show_dialog(question)
         page.update()
         return await answer
 
@@ -1272,10 +1343,22 @@ async def main(page: ft.Page) -> None:
                     log.append(f"Could not read columns of {table}: {message}", "WARN")
                     continue
                 table_plan = plan_table(table, columns, rules)
-                if table_plan.targets:
-                    log.append(f"Would anonymize {table}: " + ", ".join(c for c, _k, _l in table_plan.targets))
-                for column, reason in table_plan.skipped:
-                    log.append(f"{table}.{column} looks personal but has no rule: {reason}", "WARN")
+                would = [c for c, _k, _l in table_plan.targets]
+                reported = list(table_plan.skipped)
+                # The same look into the JSON columns the run will take, so the
+                # preview does not stay silent about the paths it would rewrite.
+                for column, _column_type in table_plan.json_columns:
+                    ok, nodes, message = await transfer_service.json_paths(src, table, column)
+                    if not ok:
+                        log.append(f"{table}.{column} could not be searched: {message}", "WARN")
+                        continue
+                    found, skipped_paths, _descend = plan_json_column(column, nodes, rules)
+                    would += [json_path_text(t.column, t.path) for t in found]
+                    reported += list(skipped_paths)
+                if would:
+                    log.append(f"Would anonymize {table}: " + ", ".join(would))
+                for column, reason in reported:
+                    log.append(f"{table}.{column} was not anonymized: {reason}", "WARN")
             if len(scoped_tables) > 20:
                 log.append(f"({len(scoped_tables) - 20} further tables not checked in the preview)")
 
@@ -1338,6 +1421,10 @@ async def main(page: ft.Page) -> None:
             )
             refresh_run_history()
 
+        # Temp tables this run created and has not got rid of yet. A failing run takes
+        # them with it instead of leaving them in the destination for good.
+        open_temp_tables: list[str] = []
+
         try:
             if dst.db_type == "mysql":
                 scope_ok, scoped_tables, scoped_msg = await _scope_tables_for_check(src, mode, scope)
@@ -1356,6 +1443,43 @@ async def main(page: ft.Page) -> None:
 
                 # apitap creates tables with columns and primary key only; the other
                 # indexes come from the source, read once for the whole run.
+                # A created or swapped table keeps the values of a generated column
+                # but loses the expression behind them, so it never recomputes.
+                gen_ok, source_generated, gen_msg = await transfer_service.source_generated_columns(
+                    src, scoped_tables
+                )
+                if not gen_ok:
+                    log.append(f"Could not read the generated columns of the source: {gen_msg}", "WARN")
+                    source_generated = {}
+
+                def warn_generated(table: str) -> None:
+                    columns = source_generated.get(table, [])
+                    if columns:
+                        log.append(
+                            f"{table}: {', '.join(columns)} are generated in the source. The copy keeps the "
+                            "values from this transfer and will not recompute them.",
+                            "WARN",
+                        )
+
+                # apitap carries columns, types and the primary key; what governs
+                # writing (generated columns, defaults, AUTO_INCREMENT, checks) has to
+                # be put back on the temp table before it is swapped in.
+                def_ok, source_definitions, def_msg = await transfer_service.table_definitions(
+                    src, scoped_tables
+                )
+                if not def_ok:
+                    # Carrying on would hand back a copy that looks finished and is
+                    # missing every generated column, default and check.
+                    fail(f"Could not read the table definitions of the source: {def_msg}")
+                    return
+                elif def_msg:
+                    log.append(def_msg, "WARN")
+                elif source_definitions:
+                    log.append(f"Read the definition of {len(source_definitions)} source table(s)")
+                # Check constraints wait for the swap: their names are unique per
+                # database and the outgoing table still holds them.
+                deferred_checks: dict[str, list[str]] = {}
+
                 source_indexes: dict[str, dict[str, str]] = {}
                 if src.db_type == "mysql":
                     idx_ok, source_indexes, idx_msg = await transfer_service.mysql_source_index_clauses(
@@ -1433,6 +1557,8 @@ async def main(page: ft.Page) -> None:
                         f"rows={item_result.rows}, ms={item_result.elapsed_ms}"
                     )
 
+                    open_temp_tables.append(temp_name)
+
                     temp_exists, temp_err = await transfer_service.mysql_table_exists(dst, temp_name)
                     if temp_err:
                         fail(f"Could not verify temp table for {final_name}: {temp_err}")
@@ -1462,8 +1588,57 @@ async def main(page: ft.Page) -> None:
                             if not replaced:
                                 fail(f"In-place replace failed for {final_name}: {replace_msg}")
                                 return
+                            if temp_name in open_temp_tables:
+                                open_temp_tables.remove(temp_name)
                             log.append(f"In-place replace done for {final_name}: {replace_msg}")
                             notes.append(f"inplace={final_name}")
+
+                            # This table was never replaced, so it still carries whatever
+                            # definition it had, possibly from a run of an older version
+                            # that dropped the generated columns. Compare and fix.
+                            wanted_before, wanted_after = source_definitions.get(final_name, ([], []))
+                            if wanted_before or wanted_after:
+                                have_ok, have, have_msg = await transfer_service.table_definitions(
+                                    dst, [final_name]
+                                )
+                                have_before, _have_after = have.get(final_name, ([], [])) if have_ok else ([], [])
+                                if not have_ok:
+                                    log.append(
+                                        f"Could not read the current definition of {final_name}: {have_msg}", "WARN"
+                                    )
+                                elif wanted_before and wanted_before != have_before:
+                                    def_ok, def_failed, def_err = await transfer_service.apply_definition_clauses(
+                                        dst, final_name, wanted_before, tolerate_failures=True
+                                    )
+                                    if not def_ok:
+                                        fail(f"Could not restore the definition of {final_name}: {def_err}")
+                                        return
+                                    for failure in def_failed:
+                                        log.append(
+                                            f"Definition detail not restored on {final_name}: {failure}", "WARN"
+                                        )
+                                        notes.append(f"definition_failed={final_name}")
+                                    log.append(
+                                        f"Restored {len(wanted_before) - len(def_failed)} "
+                                        f"definition detail(s) for {final_name}"
+                                    )
+                                    notes.append(f"definition={final_name}")
+                                if wanted_after:
+                                    # Constraints the table already carries come back as
+                                    # a duplicate-name error; that one is not a finding.
+                                    chk_ok, chk_failed, chk_err = await transfer_service.apply_definition_clauses(
+                                        dst, final_name, wanted_after, tolerate_failures=True
+                                    )
+                                    if not chk_ok:
+                                        log.append(
+                                            f"Check constraints of {final_name} could not be restored: {chk_err}",
+                                            "WARN",
+                                        )
+                                    for failure in chk_failed:
+                                        if "Duplicate check constraint" in failure:
+                                            continue
+                                        log.append(f"Check constraint not restored on {final_name}: {failure}", "WARN")
+                                        notes.append(f"check_failed={final_name}")
                             # The table stays in place; this repairs indexes an earlier swap removed.
                             await apply_source_indexes(final_name, final_name)
                         else:
@@ -1476,14 +1651,60 @@ async def main(page: ft.Page) -> None:
                             # Index the temp table before the swap, so the table that gets
                             # published is complete from its first moment.
                             await apply_source_indexes(temp_name, final_name)
+
+                            # The definition comes after the indexes: AUTO_INCREMENT needs
+                            # a key on its column. A failure here must not be published,
+                            # so the run stops and the table is not swapped.
+                            before_swap, after_swap = source_definitions.get(final_name, ([], []))
+                            # AUTO_INCREMENT needs a key on its column. When the index
+                            # step could not build it, that clause fails and is reported,
+                            # rather than costing the whole transfer.
+                            columns = [c for c in before_swap if "AUTO_INCREMENT" not in c]
+                            increments = [c for c in before_swap if "AUTO_INCREMENT" in c]
+                            inc_failed_names: list[str] = []
+                            definition_failures = 0
+                            if columns:
+                                # One column MySQL will not take back (a binary default,
+                                # for instance) must not cost the table every other
+                                # detail, nor the developer the whole copy.
+                                def_applied, def_failed, def_error = await transfer_service.apply_definition_clauses(
+                                    dst, temp_name, columns, tolerate_failures=True
+                                )
+                                if not def_applied:
+                                    fail(f"Could not restore the definition of {final_name}: {def_error}")
+                                    return
+                                definition_failures = len(def_failed)
+                                for failure in def_failed:
+                                    log.append(f"Definition detail not restored on {final_name}: {failure}", "WARN")
+                                    notes.append(f"definition_failed={final_name}")
+                            if increments:
+                                inc_ok, inc_failed, inc_error = await transfer_service.apply_definition_clauses(
+                                    dst, temp_name, increments, tolerate_failures=True
+                                )
+                                if not inc_ok:
+                                    log.append(f"AUTO_INCREMENT of {final_name} not restored: {inc_error}", "WARN")
+                                inc_failed_names = list(inc_failed)
+                                for failure in inc_failed:
+                                    log.append(f"AUTO_INCREMENT of {final_name} not restored: {failure}", "WARN")
+                                    notes.append(f"auto_increment_failed={final_name}")
+                            if before_swap:
+                                restored = len(before_swap) - definition_failures - len(inc_failed_names)
+                                log.append(f"Restored {restored} definition detail(s) for {final_name}")
+                                notes.append(f"definition={final_name}")
+                            if after_swap:
+                                deferred_checks[final_name] = after_swap
                             swapped, swap_msg = await transfer_service.mysql_swap_temp_to_final(
                                 dst, temp_table=temp_name, final_table=final_name
                             )
+                            if swapped and temp_name in open_temp_tables:
+                                open_temp_tables.remove(temp_name)
                             if not swapped:
                                 fail(f"Swap failed for {final_name}: {swap_msg}")
                                 return
                             log.append(f"Swapped {temp_name} into {final_name}")
                             notes.append(f"swapped={final_name}")
+                            if final_name not in source_definitions:
+                                warn_generated(final_name)
                     else:
                         final_exists, final_err = await transfer_service.mysql_table_exists(dst, final_name)
                         if final_err:
@@ -1580,6 +1801,27 @@ async def main(page: ft.Page) -> None:
                     notes.append("fk_second_pass=ok")
                     log.append("Deferred foreign keys applied")
 
+                # Check constraints come after the swap for the same reason the foreign
+                # keys do: their names belong to the database, not to the table, so the
+                # outgoing table has to be gone first. One that cannot apply is reported
+                # and the rest still get their turn.
+                for table, check_clauses in deferred_checks.items():
+                    if table not in landed_tables:
+                        continue
+                    chk_ok, chk_failed, chk_err = await transfer_service.apply_definition_clauses(
+                        dst, table, check_clauses, tolerate_failures=True
+                    )
+                    if not chk_ok:
+                        log.append(f"Check constraints of {table} could not be restored: {chk_err}", "WARN")
+                        notes.append(f"check_restore_error={table}")
+                        continue
+                    for failure in chk_failed:
+                        log.append(f"Check constraint not restored on {table}: {failure}", "WARN")
+                        notes.append(f"check_failed={table}")
+                    applied = len(check_clauses) - len(chk_failed)
+                    if applied:
+                        notes.append(f"checks_restored={table}")
+
                 # Restore the foreign keys the swap dropped. Runs after a cancel too:
                 # the tables copied so far lost their keys either way. Keys that
                 # already exist (in-place tables, the deferred pass above) are skipped.
@@ -1624,17 +1866,35 @@ async def main(page: ft.Page) -> None:
                         "already be in the destination and are NOT anonymized",
                         "ERROR",
                     )
-                if result.status == "success" and anonymize_switch.value:
+                if result.status == "success":
                     scope_ok, scoped_tables, scoped_msg = await _scope_tables_for_check(src, mode, scope)
                     if not scope_ok:
-                        fail(f"Transfer done, but the tables to anonymize could not be listed: {scoped_msg}")
+                        fail(f"Transfer done, but the tables could not be listed: {scoped_msg}")
                         return
-                    set_progress(label="Anonymizing")
-                    page.update()
+
+                    # apitap writes the destination table itself here, so a generated
+                    # column arrives as a plain one: right now, but never recomputed.
+                    gen_ok, source_generated, gen_msg = await transfer_service.source_generated_columns(
+                        src, scoped_tables
+                    )
+                    if not gen_ok:
+                        log.append(f"Could not read the generated columns of the source: {gen_msg}", "WARN")
                     for table in scoped_tables:
-                        if not await anonymize_step(dst, table, table):
-                            fail(f"Anonymization failed for {table}; its data in the destination is still real")
-                            return
+                        columns = source_generated.get(table) or source_generated.get(table.rpartition(".")[2])
+                        if columns:
+                            log.append(
+                                f"{table}: {', '.join(columns)} are generated in the source. The copy keeps "
+                                "the values from this transfer and will not recompute them.",
+                                "WARN",
+                            )
+
+                    if anonymize_switch.value:
+                        set_progress(label="Anonymizing")
+                        page.update()
+                        for table in scoped_tables:
+                            if not await anonymize_step(dst, table, table):
+                                fail(f"Anonymization failed for {table}; its data in the destination is still real")
+                                return
 
             store_run(result)
             log.append(f"Summary: {result.message}", "INFO" if result.status != "failed" else "ERROR")
@@ -1657,6 +1917,15 @@ async def main(page: ft.Page) -> None:
             page.update()
         except Exception as exc:  # noqa: BLE001
             fail(f"Unhandled error: {exc}")
+        finally:
+            if open_temp_tables:
+                gone_ok, gone, gone_err = await transfer_service.mysql_drop_tables(dst, open_temp_tables)
+                if not gone_ok:
+                    log.append(f"Temp table(s) of this run could not be removed: {gone_err}", "WARN")
+                elif gone:
+                    log.append(f"Removed {gone} temp table(s) this run had left over")
+                open_temp_tables.clear()
+                page.update()
 
     # ------------------------------------------------------------------ wiring
 
@@ -1681,6 +1950,7 @@ async def main(page: ft.Page) -> None:
     db_save_button.on_click = save_db_profile
     ssh_new_button.on_click = lambda _: open_ssh_dialog(None)
     rules_new_button.on_click = lambda _: open_rule_dialog(None)
+    db_use_ssh.on_change = on_tunnel_toggle
     rule_save_button.on_click = save_rule
     db_new_button.on_click = lambda _: open_db_dialog(None)
 
@@ -1774,7 +2044,7 @@ async def main(page: ft.Page) -> None:
     )
 
     def close_dialog(_: object = None) -> None:
-        page.pop_dialog()
+        dismiss(open_dialogs.get("current"))
         page.update()
 
     def dialog(title: ft.Text, body: list[ft.Control], save_button: ft.Control) -> ft.AlertDialog:

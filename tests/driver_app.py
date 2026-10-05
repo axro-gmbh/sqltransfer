@@ -23,7 +23,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 import flet as ft
 
 from sqltransfer_app import app as app_module
-from sqltransfer_app.anonymize import Column
+from sqltransfer_app.anonymize import Column, JsonNode
 from sqltransfer_app.models import TransferResult
 
 FAILURES: list[str] = []
@@ -73,22 +73,28 @@ class FakePage:
         pass
 
     def show_dialog(self, dialog):
+        # Flet keeps snack bars and alert dialogs on one stack, so the driver does too:
+        # popping "the top one" can hit a snack bar that opened over a dialog.
+        dialog.open = True
+        self.dialogs.append(dialog)
         if isinstance(dialog, ft.SnackBar):
             self.snacks.append(text_of(dialog))
         else:
-            self.dialogs.append(dialog)
             self.seen_dialogs.append(dialog)
 
     def pop_dialog(self, *_a):
-        if self.dialogs:
-            self.dialogs.pop()
+        for dialog in reversed(self.dialogs):
+            if dialog.open:
+                dialog.open = False
+                return dialog
+        return None
 
     def run_task(self, coro_fn, *args):
         self.tasks.append(asyncio.ensure_future(coro_fn(*args)))
 
     @property
     def dialog(self):
-        return self.dialogs[-1] if self.dialogs else None
+        return next((d for d in reversed(self.dialogs) if d.open and not isinstance(d, ft.SnackBar)), None)
 
 
 def walk(node, seen=None):
@@ -393,6 +399,151 @@ async def main() -> int:
     await asyncio.sleep(0.2)
     log = log_text(root).lower()
     check("not anonymized" in log or "still real" in log, f"the log warns about the real data: {log[-200:]}")
+
+    print("\n9e. A swapped table warns about the generated columns it loses")
+    app_module.TransferService.mysql_table_has_inbound_fk = _async((True, False, ""))
+    app_module.TransferService.mysql_swap_temp_to_final = _async((True, ""))
+    app_module.TransferService.mysql_apply_index_clauses = _async((True, [], ""))
+    app_module.TransferService.anonymize_table = _async((True, 0, ""))
+    app_module.TransferService.source_generated_columns = _async((True, {"kunde": ["voller_name", "umsatz_brutto"]}, ""))
+    destination.value = next(o.key for o in destination.options if o.text == "local-shop-renamed")
+    fire(destination, "on_select")
+    find(root, ft.Dropdown, label="Table").value = "shop.kunde"
+    click(button(root, "Run transfer"))
+    await asyncio.sleep(0.2)
+    log = log_text(root)
+    check("voller_name" in log and "umsatz_brutto" in log, f"the lost columns are named: {log[-200:]}")
+    check("recompute" in log.lower() or "static" in log.lower(), "it says what that means")
+
+    print("\n9f. A PostgreSQL destination warns about generated columns too")
+
+    async def pg_ok(*_a, **_k):
+        return TransferResult(status="success", rows=3, elapsed_ms=4, parallel=1, message="ok")
+
+    app_module.TransferService.transfer_scope = pg_ok
+    app_module.TransferService.source_generated_columns = _async((True, {"public.kunde": ["voller_name"]}, ""))
+    destination.value = next(o.key for o in destination.options if o.text == "pg-local")
+    fire(destination, "on_select")
+    find(root, ft.Dropdown, label="Table").value = "public.kunde"
+    click(button(root, "Run transfer"))
+    await asyncio.sleep(0.2)
+    log = log_text(root)
+    check("voller_name" in log, f"the PostgreSQL path names them too: {log[-160:]}")
+
+    print("\n9g. A message on top of the dialog does not steal the close")
+    click(button(root, "New database profile"))
+    dialog = page.dialog
+    for label, value in (("Profile name", "mit-meldung"), ("DB host", "127.0.0.1"),
+                         ("Database name", "shop"), ("DB username", "root")):
+        find(dialog, ft.TextField, label=label).value = value
+    # what "Test connection" leaves behind: a snack bar above the open dialog
+    page.show_dialog(ft.SnackBar(content=ft.Text("Connection ok")))
+    click(button(dialog, "Save"))
+    check(dialog.open is False, "the profile dialog closed")
+    check(page.dialog is None, "no dialog is left open")
+    check(any("mit-meldung" in row for row in rows_of(db_rows)), "and the profile was saved")
+
+    print("\n9h. An SSH profile can be taken off a database profile again")
+    click(button(root, "New SSH profile"))
+    dialog = page.dialog
+    for label, value in (("Profile name", "jump"), ("SSH host", "jump.example.com"),
+                         ("SSH username", "deploy"), ("Private key path", "~/.ssh/id_ed25519")):
+        find(dialog, ft.TextField, label=label).value = value
+    click(button(dialog, "Save"))
+    check(page.dialog is None, "the SSH profile is saved")
+
+    click(button(root, "New database profile"))
+    dialog = page.dialog
+    for label, value in (("Profile name", "mit-tunnel"), ("DB host", "10.0.0.5"),
+                         ("Database name", "shop"), ("DB username", "reader")):
+        find(dialog, ft.TextField, label=label).value = value
+    tunnel_box = find(dialog, ft.Checkbox, label="Use SSH tunnel")
+    ssh_pick = find(dialog, ft.Dropdown, label="SSH profile")
+    tunnel_box.value = True
+    fire(tunnel_box, "on_change")
+    ssh_pick.value = next(o.key for o in ssh_pick.options if o.key)
+    click(button(dialog, "Save"))
+
+    click([c for c in walk(db_rows) if isinstance(c, ft.IconButton) and c.tooltip == "Edit"][
+        [r.split()[0] for r in rows_of(db_rows)].index("mit-tunnel")])
+    dialog = page.dialog
+    ssh_pick = find(dialog, ft.Dropdown, label="SSH profile")
+    tunnel_box = find(dialog, ft.Checkbox, label="Use SSH tunnel")
+    check(any(not o.key for o in ssh_pick.options), "the dropdown offers an empty entry")
+    tunnel_box.value = False
+    fire(tunnel_box, "on_change")
+    check(ssh_pick.value in (None, "") and ssh_pick.disabled, "unticking clears and locks the pick")
+    click(button(dialog, "Save"))
+    row = [r for r in rows_of(db_rows) if "mit-tunnel" in r][0]
+    check("SSH" not in row, f"the profile no longer uses a tunnel: {row}")
+
+    print("\n9i. A JSON column is looked into, not overwritten")
+    app_module.TransferService.json_paths = _async(
+        (True, [JsonNode(("email",), frozenset({"STRING"})), JsonNode(("positionen",), frozenset({"ARRAY"}))], "")
+    )
+    app_module.TransferService.table_columns = _async((True, [Column("custom_fields", "json")], ""))
+    app_module.TransferService.mysql_table_has_inbound_fk = _async((True, False, ""))
+    captured: list = []
+
+    async def record_plan(_self, _profile, plan):
+        captured.append(plan)
+        return True, 1, ""
+
+    app_module.TransferService.anonymize_table = record_plan
+    destination.value = next(o.key for o in destination.options if o.text == "local-shop-renamed")
+    fire(destination, "on_select")
+    find(root, ft.Dropdown, label="Table").value = "shop.kunde"
+    click(button(root, "Run transfer"))
+    await asyncio.sleep(0.2)
+    check(captured and captured[-1].json_targets, f"the plan carries a JSON target: {captured[-1:]}")
+    check(captured[-1].targets == (), "and does not replace the column as a whole")
+    log = log_text(root)
+    check('custom_fields$."email"' in log, f"the log names the path: {log[-200:]}")
+    check("array, not followed" in log, "and reports the array it left alone")
+
+    click(button(root, "Preview plan"))
+    await asyncio.sleep(0.2)
+    preview = log_text(root)
+    check('custom_fields$."email"' in preview and "Would anonymize" in preview,
+          f"the preview names the JSON path too: {preview[-200:]}")
+
+    print("\n9j. The table definition is restored before the swap")
+    order: list[str] = []
+
+    async def record_definition(_self, _dst, table, clauses, tolerate_failures=False):
+        # three calls now: the strict column clauses, the tolerant AUTO_INCREMENT one
+        # before the swap, and the check constraints after it
+        kind = "definition" if not tolerate_failures else ("auto" if "AUTO_INCREMENT" in clauses[0] else "checks")
+        order.append(f"{kind}:{table}")
+        return True, [], ""
+
+    async def record_swap(_self, _dst, temp_table, final_table):
+        order.append("swap")
+        return True, ""
+
+    app_module.TransferService.table_definitions = _async(
+        (True, {"kunde": (["MODIFY COLUMN `n` int DEFAULT '1'", "AUTO_INCREMENT = 7"],
+                          ["ADD CONSTRAINT `c` CHECK ((1 = 1))"])}, "")
+    )
+    app_module.TransferService.apply_definition_clauses = record_definition
+    app_module.TransferService.mysql_swap_temp_to_final = record_swap
+    app_module.TransferService.json_paths = _async((True, [], ""))
+    click(button(root, "Run transfer"))
+    await asyncio.sleep(0.2)
+    check(order[:3] == [f"definition:{order[0].split(':', 1)[1]}", f"auto:{order[1].split(':', 1)[1]}", "swap"],
+          f"columns, then AUTO_INCREMENT, then the swap: {order}")
+    check(order[-1].startswith("checks:"), f"and the check constraints after it: {order}")
+
+    async def failing_definition(_self, _dst, _table, _clauses, tolerate_failures=False):
+        return False, [], "Unknown column 'weg' in generated column"
+
+    app_module.TransferService.apply_definition_clauses = failing_definition
+    order.clear()
+    click(button(root, "Run transfer"))
+    await asyncio.sleep(0.2)
+    status_after = find(root, ft.Text, size=13, expand=True).value
+    check("swap" not in order, f"a failed restore stops the swap: {order}")
+    check("failed" in status_after.lower(), f"and the run reports failure: {status_after!r}")
 
     print("\n10. Every wired handler is an event its control really has")
     dead = []
