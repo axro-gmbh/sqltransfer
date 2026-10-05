@@ -1464,8 +1464,10 @@ async def main(page: ft.Page) -> None:
                     src, scoped_tables
                 )
                 if not def_ok:
-                    log.append(f"Could not read the table definitions of the source: {def_msg}", "WARN")
-                    source_definitions = {}
+                    # Carrying on would hand back a copy that looks finished and is
+                    # missing every generated column, default and check.
+                    fail(f"Could not read the table definitions of the source: {def_msg}")
+                    return
                 elif def_msg:
                     log.append(def_msg, "WARN")
                 elif source_definitions:
