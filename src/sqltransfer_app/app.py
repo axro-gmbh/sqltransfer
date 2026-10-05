@@ -1599,13 +1599,21 @@ async def main(page: ft.Page) -> None:
                                         f"Could not read the current definition of {final_name}: {have_msg}", "WARN"
                                     )
                                 elif wanted_before and wanted_before != have_before:
-                                    def_ok, _failed, def_err = await transfer_service.apply_definition_clauses(
-                                        dst, final_name, wanted_before
+                                    def_ok, def_failed, def_err = await transfer_service.apply_definition_clauses(
+                                        dst, final_name, wanted_before, tolerate_failures=True
                                     )
                                     if not def_ok:
                                         fail(f"Could not restore the definition of {final_name}: {def_err}")
                                         return
-                                    log.append(f"Restored {len(wanted_before)} definition detail(s) for {final_name}")
+                                    for failure in def_failed:
+                                        log.append(
+                                            f"Definition detail not restored on {final_name}: {failure}", "WARN"
+                                        )
+                                        notes.append(f"definition_failed={final_name}")
+                                    log.append(
+                                        f"Restored {len(wanted_before) - len(def_failed)} "
+                                        f"definition detail(s) for {final_name}"
+                                    )
                                     notes.append(f"definition={final_name}")
                                 if wanted_after:
                                     # Constraints the table already carries come back as
@@ -1645,24 +1653,35 @@ async def main(page: ft.Page) -> None:
                             # rather than costing the whole transfer.
                             columns = [c for c in before_swap if "AUTO_INCREMENT" not in c]
                             increments = [c for c in before_swap if "AUTO_INCREMENT" in c]
+                            inc_failed_names: list[str] = []
+                            definition_failures = 0
                             if columns:
-                                def_applied, _failed, def_error = await transfer_service.apply_definition_clauses(
-                                    dst, temp_name, columns
+                                # One column MySQL will not take back (a binary default,
+                                # for instance) must not cost the table every other
+                                # detail, nor the developer the whole copy.
+                                def_applied, def_failed, def_error = await transfer_service.apply_definition_clauses(
+                                    dst, temp_name, columns, tolerate_failures=True
                                 )
                                 if not def_applied:
                                     fail(f"Could not restore the definition of {final_name}: {def_error}")
                                     return
+                                definition_failures = len(def_failed)
+                                for failure in def_failed:
+                                    log.append(f"Definition detail not restored on {final_name}: {failure}", "WARN")
+                                    notes.append(f"definition_failed={final_name}")
                             if increments:
                                 inc_ok, inc_failed, inc_error = await transfer_service.apply_definition_clauses(
                                     dst, temp_name, increments, tolerate_failures=True
                                 )
                                 if not inc_ok:
                                     log.append(f"AUTO_INCREMENT of {final_name} not restored: {inc_error}", "WARN")
+                                inc_failed_names = list(inc_failed)
                                 for failure in inc_failed:
                                     log.append(f"AUTO_INCREMENT of {final_name} not restored: {failure}", "WARN")
                                     notes.append(f"auto_increment_failed={final_name}")
                             if before_swap:
-                                log.append(f"Restored {len(before_swap)} definition detail(s) for {final_name}")
+                                restored = len(before_swap) - definition_failures - len(inc_failed_names)
+                                log.append(f"Restored {restored} definition detail(s) for {final_name}")
                                 notes.append(f"definition={final_name}")
                             if after_swap:
                                 deferred_checks[final_name] = after_swap

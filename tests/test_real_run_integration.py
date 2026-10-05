@@ -171,3 +171,35 @@ def test_a_failed_definition_read_stops_the_run(databases, monkeypatch):
     status = asyncio.run(_run_whole_database(page))
     assert "failed" in status.lower(), status
     assert "information_schema timed out" in log_text(page.controls)
+
+
+def test_one_impossible_clause_does_not_cost_the_rest_of_the_definition(databases, monkeypatch):
+    """Real finding from a Shopware copy: category.cms_page_version_id is binary(16)
+    with a default MySQL will not take back, and that one column used to fail the whole
+    run, leaving the developer without a copy at all."""
+    _sql(SRC_DB, "CREATE TABLE neu (id INT PRIMARY KEY, zeit DATETIME NOT NULL, "
+                 "tag DATE AS (CAST(zeit AS DATE)) STORED)",
+         "INSERT INTO neu (id, zeit) VALUES (1,'2026-01-01 10:00:00')")
+
+    tmp = Path(tempfile.mkdtemp(prefix="sqlt-real-"))
+    monkeypatch.setattr(app_module, "_app_data_dir", lambda: tmp)
+    SharedSecrets.store = {}
+    monkeypatch.setattr(app_module, "SecretStore", SharedSecrets)
+
+    async def definitions(self, source, tables):
+        return True, {"neu": ([
+            "MODIFY COLUMN `zeit` datetime NOT NULL DEFAULT 'kein datum'",
+            "MODIFY COLUMN `tag` date GENERATED ALWAYS AS (cast(`zeit` as date)) STORED",
+        ], [])}, ""
+
+    monkeypatch.setattr(app_module.TransferService, "table_definitions", definitions)
+
+    page = FakePage()
+    status = asyncio.run(_run_whole_database(page))
+    assert "Done" in status, f"{status} | {log_text(page.controls)[-400:]}"
+
+    text = log_text(page.controls)
+    assert "`zeit`" in text and "not restored" in text, text[-500:]
+
+    ddl = _sql(DST_DB, "SHOW CREATE TABLE neu")[0][1]
+    assert "GENERATED ALWAYS AS (cast(`zeit` as date)) STORED" in ddl, ddl
