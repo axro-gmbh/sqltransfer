@@ -444,6 +444,17 @@ def _apply_definition_clauses_sync(
     return failed
 
 
+def mysql_column_is_generated(extra: str | None) -> bool:
+    """Whether information_schema's `extra` describes a generated column.
+
+    MySQL writes DEFAULT_GENERATED there for a column with a function default, which
+    is an ordinary column holding ordinary data. Matching on "GENERATED" alone dropped
+    those columns from the in-place copy without a word.
+    """
+    text = str(extra or "").upper()
+    return "STORED GENERATED" in text or "VIRTUAL GENERATED" in text
+
+
 def build_mysql_insert_columns(
     final_columns: list[tuple[str, bool]], temp_columns: list[str]
 ) -> list[str]:
@@ -500,7 +511,7 @@ def _table_columns_sync(
                     str(row[1]),
                     int(row[2]) if row[2] is not None else None,
                     # MySQL puts it in `extra`, PostgreSQL in `is_generated`; both land in row[3].
-                    generated=("GENERATED" in str(row[3] or "").upper())
+                    generated=mysql_column_is_generated(row[3])
                     if db_type == "mysql"
                     else str(row[3] or "").upper() == "ALWAYS",
                 )
@@ -1925,7 +1936,7 @@ def _mysql_replace_final_from_temp_sync(
                     "WHERE table_schema = DATABASE() AND table_name = %s ORDER BY ordinal_position",
                     (final_table,),
                 )
-                final_columns = [(str(r[0]), "GENERATED" in str(r[1] or "").upper()) for r in cur.fetchall()]
+                final_columns = [(str(r[0]), mysql_column_is_generated(r[1])) for r in cur.fetchall()]
                 cur.execute(
                     "SELECT column_name FROM information_schema.columns "
                     "WHERE table_schema = DATABASE() AND table_name = %s",

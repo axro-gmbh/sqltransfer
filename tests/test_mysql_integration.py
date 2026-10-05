@@ -771,3 +771,25 @@ def test_the_copy_carries_a_hostile_source_definition(databases):
         _exec(DST_DB, "INSERT INTO schwierig (id, coll, zeit, geprueft) VALUES (3,'d','2026-03-03 12:00:00',0)")
     with pytest.raises(Exception):
         _exec(DST_DB, "INSERT INTO schwierig (id, wort, coll, zeit, geprueft) VALUES (4,'bad','d','2026-03-03 12:00:00',1)")
+
+
+def test_in_place_replace_keeps_columns_with_a_function_default(databases):
+    # DEFAULT_GENERATED sits in the same information_schema column as STORED GENERATED.
+    # Reading it as "generated" dropped created_at-style columns from the copy without
+    # a word, and a table made only of such columns failed with "no columns to copy".
+    service = _service()
+    dst = _profile("local", DST_DB)
+    _exec(DST_DB, "DROP TABLE IF EXISTS fn_tmp", "DROP TABLE IF EXISTS fn",
+          "CREATE TABLE fn (id INT PRIMARY KEY, angelegt DATETIME DEFAULT CURRENT_TIMESTAMP,"
+          " geaendert DATETIME DEFAULT (NOW()), tag DATE AS (CAST(angelegt AS DATE)) STORED)",
+          "INSERT INTO fn (id, angelegt, geaendert) VALUES (1,'2020-01-01 08:00:00','2020-01-01 08:00:00')",
+          "CREATE TABLE fn_tmp (id INT PRIMARY KEY, angelegt DATETIME, geaendert DATETIME, tag DATE)",
+          "INSERT INTO fn_tmp VALUES (2,'2026-06-06 09:00:00','2026-06-07 10:00:00','2026-06-06')")
+
+    ok, message = asyncio.run(service.mysql_replace_final_from_temp(dst, temp_table="fn_tmp", final_table="fn"))
+    assert ok, message
+    row = _rows(DST_DB, "SELECT id, angelegt, geaendert, tag FROM fn")[0]
+    assert row[0] == 2
+    assert str(row[1]) == "2026-06-06 09:00:00", "a function default does not make a column generated"
+    assert str(row[2]) == "2026-06-07 10:00:00"
+    assert str(row[3]) == "2026-06-06", "the real generated column is recomputed by the database"
