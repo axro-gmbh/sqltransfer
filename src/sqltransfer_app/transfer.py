@@ -371,44 +371,57 @@ def _table_definitions_sync(
     tables: list[str],
     *,
     tls: TlsSettings,
-) -> dict[str, tuple[list[str], list[str]]]:
-    """Read every table's own DDL and turn it into clauses.
+) -> tuple[dict[str, tuple[list[str], list[str]]], list[str]]:
+    """Read every table's own DDL and turn it into clauses; returns (clauses, problems).
 
     One SHOW CREATE TABLE per table that carries something apitap drops; which tables
     those are is answered from information_schema first, so a plain schema costs one
     cheap query per table and nothing else.
+
+    A table that cannot be read is named in the problems and skipped. It used to take
+    every other table's definition with it: one customer table returned bytes that are
+    not UTF-8, and the whole run ended up without a single generated column.
     """
     conn = _mysql_connect(tls, host=host, port=port, user=username, password=password,
                           database=database, connect_timeout=5, read_timeout=600, autocommit=True)
     definitions: dict[str, tuple[list[str], list[str]]] = {}
+    problems: list[str] = []
     try:
         with conn.cursor() as cur:
+            # MySQL writes the DDL in the table's own charset, not the connection's, so
+            # pymysql's own decoding can fail on it. Taking the bytes ourselves lets the
+            # latin-1 fallback in _coerce_sql_text do its work.
+            cur.execute("SET SESSION character_set_results = binary")
             for table in tables:
                 schema = table.rpartition(".")[0].strip('`"') or database
                 bare = table.rpartition(".")[2].strip('`"')
-                cur.execute(
-                    "SELECT 1 FROM information_schema.columns WHERE table_schema = %s AND table_name = %s "
-                    "AND (generation_expression <> '' OR extra LIKE '%%auto_increment%%' "
-                    "OR column_default IS NOT NULL) LIMIT 1",
-                    (schema, bare),
-                )
-                interesting = cur.fetchone() is not None
-                if not interesting:
+                try:
                     cur.execute(
-                        "SELECT 1 FROM information_schema.table_constraints WHERE table_schema = %s "
-                        "AND table_name = %s AND constraint_type = 'CHECK' LIMIT 1",
+                        "SELECT 1 FROM information_schema.columns WHERE table_schema = %s AND table_name = %s "
+                        "AND (generation_expression <> '' OR extra LIKE '%%auto_increment%%' "
+                        "OR column_default IS NOT NULL) LIMIT 1",
                         (schema, bare),
                     )
                     interesting = cur.fetchone() is not None
-                if not interesting:
+                    if not interesting:
+                        cur.execute(
+                            "SELECT 1 FROM information_schema.table_constraints WHERE table_schema = %s "
+                            "AND table_name = %s AND constraint_type = 'CHECK' LIMIT 1",
+                            (schema, bare),
+                        )
+                        interesting = cur.fetchone() is not None
+                    if not interesting:
+                        continue
+                    cur.execute(f"SHOW CREATE TABLE {_quote_mysql_ident(schema)}.{_quote_mysql_ident(bare)}")
+                    before, after = parse_mysql_table_definition(_coerce_sql_text(cur.fetchone()[1]))
+                except Exception as exc:  # noqa: BLE001
+                    problems.append(f"{bare}: {exc}")
                     continue
-                cur.execute(f"SHOW CREATE TABLE {_quote_mysql_ident(schema)}.{_quote_mysql_ident(bare)}")
-                before, after = parse_mysql_table_definition(cur.fetchone()[1])
                 if before or after:
                     definitions[bare] = (before, after)
     finally:
         conn.close()
-    return definitions
+    return definitions, problems
 
 
 def _apply_definition_clauses_sync(
@@ -1256,10 +1269,15 @@ class TransferService:
             host = endpoint.tunnel.local_host if endpoint.tunnel else source.host
             port = endpoint.tunnel.local_port if endpoint.tunnel else source.port
             password = self.secret_store.get_secret(source.password_secret_key) or ""
-            definitions = await asyncio.to_thread(
+            definitions, problems = await asyncio.to_thread(
                 _table_definitions_sync, host, port, source.database, source.username, password,
                 tables, tls=endpoint.tls,
             )
+            if problems:
+                return True, definitions, (
+                    f"{len(problems)} table(s) kept their old definition, their DDL could not be read: "
+                    + "; ".join(problems)
+                )
             return True, definitions, ""
         except Exception as exc:  # noqa: BLE001
             return False, {}, str(exc)

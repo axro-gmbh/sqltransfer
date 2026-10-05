@@ -896,3 +896,44 @@ def test_the_scope_database_decides_which_tables_are_listed(databases):
     ok, tables, message = asyncio.run(service.list_tables(_profile("remote", DST_DB), schema_hint=SRC_DB))
     assert ok, message
     assert f"{SRC_DB}.items" in tables, tables
+
+
+def test_one_unreadable_table_does_not_cost_the_others_their_definitions(databases, monkeypatch):
+    """A table whose DDL cannot be read is named and skipped, the run goes on.
+
+    Real finding: one table in a customer database returned bytes that are not UTF-8
+    ('utf-8' codec can't decode byte 0xa9), and that one table silently cost every
+    other table its generated columns, defaults and checks.
+    """
+    _exec(SRC_DB,
+          "CREATE TABLE zaehler (id INT PRIMARY KEY, lauf INT NOT NULL AUTO_INCREMENT, UNIQUE KEY u (lauf))",
+          "CREATE TABLE sperrig (id INT PRIMARY KEY, lauf INT NOT NULL AUTO_INCREMENT, UNIQUE KEY u (lauf))")
+
+    from sqltransfer_app import transfer as transfer_module
+
+    echt = transfer_module.parse_mysql_table_definition
+
+    def kaputt(ddl: str):
+        if "`sperrig`" in ddl:
+            raise UnicodeDecodeError("utf-8", b"\xa9", 0, 1, "invalid start byte")
+        return echt(ddl)
+
+    monkeypatch.setattr(transfer_module, "parse_mysql_table_definition", kaputt)
+
+    ok, definitions, message = asyncio.run(
+        _service().table_definitions(_profile("remote", SRC_DB), ["sperrig", "zaehler"])
+    )
+    assert ok, message
+    assert "zaehler" in definitions, "the readable table must keep its definition"
+    assert "sperrig" in message and "0xa9" in message, message
+
+
+def test_a_definition_in_a_charset_the_connection_cannot_decode_is_still_read(databases):
+    """MySQL writes the DDL in the table's own charset, not the connection's."""
+    _exec(SRC_DB, "CREATE TABLE marke (id INT PRIMARY KEY, zeichen VARCHAR(20) CHARACTER SET latin1 "
+                   "DEFAULT _latin1 0xA9, lauf INT NOT NULL AUTO_INCREMENT, UNIQUE KEY u (lauf)) DEFAULT CHARSET=latin1")
+
+    ok, definitions, message = asyncio.run(_service().table_definitions(_profile("remote", SRC_DB), ["marke"]))
+    assert ok, message
+    before, _after = definitions["marke"]
+    assert any("`zeichen`" in clause for clause in before), before
