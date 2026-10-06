@@ -1006,7 +1006,7 @@ def test_an_empty_listing_says_which_schema_it_read(databases):
     )
     assert ok, message
     assert tables == []
-    assert "gibt_es_nicht" in message and "Schema or database" in message, message
+    assert "gibt_es_nicht" in message and "Source schema hint" in message, message
 
     ok, tables, message = asyncio.run(service.list_tables(_profile("remote", SRC_DB)))
     assert ok and tables, message

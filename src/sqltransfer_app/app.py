@@ -343,7 +343,14 @@ async def main(page: ft.Page) -> None:
     check_all_button = ft.TextButton("Select all")
     clear_checked_button = ft.TextButton("Clear")
 
-    source_schema_hint = ft.TextField(label="Source schema hint", value="public", col={"sm": 6, "md": 4})
+    source_schema_hint = ft.TextField(
+        label="Source schema hint",
+        # Empty on purpose: a filled field overrides the profile's database, and a
+        # PostgreSQL default like "public" would send a MySQL run looking for a schema
+        # of that name and come back with nothing.
+        helper="Empty: the profile's database (MySQL) or public (PostgreSQL)",
+        col={"sm": 6, "md": 4},
+    )
     transfer_parallel = ft.TextField(
         label="Parallel pipes",
         hint_text="auto",

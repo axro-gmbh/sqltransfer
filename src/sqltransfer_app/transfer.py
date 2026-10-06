@@ -1320,8 +1320,8 @@ class TransferService:
             where = f"'{schema}' on {source.host}"
             if not rows:
                 return True, [], (
-                    f"No tables found in {where}. The field 'Schema or database' decides "
-                    "which one is read and overrides the profile."
+                    f"No tables found in {where}. The field 'Source schema hint' decides "
+                    "which schema is read and overrides the profile's database."
                 )
             return True, rows, f"Loaded {len(rows)} table(s) from {where}"
         except Exception as exc:  # noqa: BLE001
