@@ -115,6 +115,12 @@ For the first two, press **Load tables** first so the app reads the table list f
 
 ### 3. Look at the preview
 
+**After the import: your admin account.** Copying the `user` table brings the source's accounts into the destination and your local one is gone. Create it again, or you cannot get into the administration:
+
+```
+bin/console user:create --admin your-name
+```
+
 **Preview plan** transfers nothing yet. It shows in the log what would happen: source, destination, scope, parallelism, and whether any special handling applies. For larger transfers it is always worth a look.
 
 ### 4. Start and follow along
@@ -135,6 +141,8 @@ The **Transfer** section has a switch, **Anonymize personal data**. It is on as 
 **Rules on column names decide what is replaced.** They live under **Profiles → Anonymization rules**, seeded with German and English defaults (e-mail, first and last name, phone, street, city, postcode). A pattern like `*mail*` covers `email`, `Email` and `kunde_email`. **New rule** adds one, the pencil edits, the bin deletes, and a rule can be disabled without losing it.
 
 **The same value always yields the same replacement.** An address appearing in two tables is replaced identically in both, so joins keep working. Uniqueness, however, only holds for the kinds whose replacement carries the hash: **e-mail** and **generic text**. Names, cities and streets come from a list and repeat, so on a `UNIQUE` column pick e-mail or generic text. A random value in the Keychain, which never leaves your machine, makes those replacements unguessable. `NULL` stays `NULL`, empty stays empty.
+
+**Values that have to keep their shape: the "Keep values matching" field.** Some applications read meaning from the shape of a value. At Axro, the AxroCustomer plugin recognises a debtor by its e-mail having the form `121550927552002@axro.de`, the ERP number at the company domain. Replace that address and the administration loses the contacts tab, the debtor header and "login as customer", with no error anywhere. So put a regular expression over the **value** into the rule, here `^[0-9]+@axro\.`: whatever matches is left as it is, everything else is replaced. An employee address like `first.last@axro.de` does not match and is still anonymized, because there is a person in it.
 
 **JSON is rewritten too.** Columns of type `json` are searched automatically. When the JSON sits in a text column (the normal case in Shopware, `custom_fields` for example), add a rule with the kind **Look inside the JSON**. Your other rules then apply to the **key names**: `*mail*` covers the key `email` just as it covers a column `email`. The structure stays, only values change, and keys without a rule are left alone.
 
@@ -181,6 +189,8 @@ Not carried over: triggers, views, partitioning and column comments. **All of th
 **Special handling with MySQL as destination.** The app copies every table into a temporary table first and swaps it in one step at the end, so nobody sees a half filled table. When other tables reference the destination table by a foreign key, the app does not swap it but replaces the rows in place instead, because a swap would break those references. That shows up as WARN in the log. It is not an error, it says a detour was taken.
 
 **Indexes are copied from the source.** For MySQL to MySQL the app creates the same indexes at the destination as in the source, including UNIQUE, FULLTEXT and prefix indexes. This happens before the swap, so the table is fully indexed from the first moment. On large tables it costs noticeable time, and the log then says "Building … index(es)". When the source is PostgreSQL, the destination table only gets its primary key.
+
+**When a column does not come along.** A table other tables point at is not swapped; its rows are replaced in place. If apitap did not bring one of its columns, the row goes in without it and the column keeps its default, which for a nullable foreign key means NULL in every row. The log now names that case with table and column as a WARN. When you see such a line, compare that column against the source before you work with the copy.
 
 **Foreign keys are copied too**, including rules such as `ON DELETE CASCADE`. They are created at the end of the run, once every table is there, shown as "Restoring foreign keys" in the log. The existing rows are not checked while doing so, exactly like a database import: tables from a live source are copied minutes apart and therefore do not always match row for row. Foreign keys pointing into another schema are not copied, and the log names them as WARN.
 

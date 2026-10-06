@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 import time
 from dataclasses import replace
 from datetime import datetime, timezone
@@ -285,6 +286,11 @@ async def main(page: ft.Page) -> None:
         options=[ft.dropdown.Option(key, label) for key, label in KINDS],
         col={"sm": 12, "md": 6},
     )
+    rule_exception = ft.TextField(
+        label="Keep values matching",
+        helper=r"Regular expression over the value, e.g. ^[0-9]+@axro\.",
+        col={"sm": 12, "md": 6},
+    )
     rule_enabled = ft.Checkbox(label="Enabled", value=True)
     rule_save_button = ft.FilledButton("Save", icon=ft.Icons.SAVE_OUTLINED)
     rule_dialog_title = ft.Text("New rule", size=17, weight=ft.FontWeight.BOLD)
@@ -343,7 +349,14 @@ async def main(page: ft.Page) -> None:
     check_all_button = ft.TextButton("Select all")
     clear_checked_button = ft.TextButton("Clear")
 
-    source_schema_hint = ft.TextField(label="Source schema hint", value="public", col={"sm": 6, "md": 4})
+    source_schema_hint = ft.TextField(
+        label="Source schema hint",
+        # Empty on purpose: a filled field overrides the profile's database, and a
+        # PostgreSQL default like "public" would send a MySQL run looking for a schema
+        # of that name and come back with nothing.
+        helper="Empty: the profile's database (MySQL) or public (PostgreSQL)",
+        col={"sm": 6, "md": 4},
+    )
     transfer_parallel = ft.TextField(
         label="Parallel pipes",
         hint_text="auto",
@@ -527,18 +540,30 @@ async def main(page: ft.Page) -> None:
             refresh_rules()
             page.update()
             return
-        clear_errors(rule_pattern)
+        clear_errors(rule_pattern, rule_exception)
         rule_form_state["id"] = rule.id if rule else None
         rule_dialog_title.value = f"Edit rule '{rule.pattern}'" if rule else "New rule"
         rule_pattern.value = rule.pattern if rule else ""
         rule_kind.value = rule.kind if rule else KINDS[0][0]
         rule_enabled.value = rule.enabled if rule else True
+        rule_exception.value = (rule.exception if rule and rule.exception else "")
         show_form_dialog(build_rule_dialog())
         page.update()
 
     def save_rule(_: object) -> None:
         if not require((rule_pattern, "column pattern")):
             return
+        muster = rule_exception.value.strip() if rule_exception.value else ""
+        if muster:
+            try:
+                re.compile(muster)
+            except re.error as exc:
+                # Caught here rather than by the server mid-transfer, where it would
+                # abort a run that has already written.
+                rule_exception.error = f"Not a regular expression: {exc}"
+                notify_error(str(rule_exception.error))
+                page.update()
+                return
         try:
             saved_dialog = open_dialogs.get("current")
             storage.save_anonymization_rule(
@@ -547,6 +572,7 @@ async def main(page: ft.Page) -> None:
                     pattern=rule_pattern.value.strip(),
                     kind=rule_kind.value,
                     enabled=bool(rule_enabled.value),
+                    exception=muster or None,
                 )
             )
             dismiss(saved_dialog)
@@ -925,7 +951,7 @@ async def main(page: ft.Page) -> None:
         )
         set_status(f"Database test: {'ok' if ok else 'failed'}", "ok" if ok else "error")
         set_progress()
-        log.replace(message)
+        log.replace(message, None if ok else "ERROR")
         notify(message, "ok" if ok else "error")
         db_test_form_button.disabled = False
         page.update()
@@ -959,7 +985,7 @@ async def main(page: ft.Page) -> None:
         )
         set_status(f"Tunnel test: {'ok' if ok else 'failed'}", "ok" if ok else "error")
         set_progress()
-        log.replace(message)
+        log.replace(message, None if ok else "ERROR")
         notify(message, "ok" if ok else "error")
         db_test_tunnel_button.disabled = False
         page.update()
@@ -971,7 +997,7 @@ async def main(page: ft.Page) -> None:
         if not key_path.exists():
             ssh_key.error = "File not found"
             set_status("SSH test: failed", "error")
-            log.replace(f"Missing SSH key file: {key_path}")
+            log.replace(f"Missing SSH key file: {key_path}", "ERROR")
             notify_error(f"SSH key file not found: {key_path}")
             page.update()
             return
@@ -1034,7 +1060,7 @@ async def main(page: ft.Page) -> None:
         page.update()
         ok, message = await transfer_service.test_profile_connection(profile)
         set_status(f"{label.capitalize()} test: {'ok' if ok else 'failed'}", "ok" if ok else "error")
-        log.replace(message)
+        log.replace(message, None if ok else "ERROR")
         notify(message, "ok" if ok else "error")
         set_running(False)
         page.update()
@@ -1098,8 +1124,16 @@ async def main(page: ft.Page) -> None:
             table_checks.controls = [
                 ft.Checkbox(label=name, value=False, on_change=on_check_change) for name in tables
             ]
-            set_status(f"{len(tables)} tables loaded", "ok")
-            log.append(message)
+            if tables:
+                set_status(f"{len(tables)} tables loaded", "ok")
+                log.append(message)
+            else:
+                # Not an error, but not a success either: the connection worked and the
+                # schema that was read holds nothing. Which schema that was is in the
+                # message, because the field overrides the profile.
+                set_status("No tables found", "error")
+                log.append(message, "WARN")
+                notify_error(message)
         else:
             single_table.options = []
             single_table.value = None
@@ -1201,7 +1235,7 @@ async def main(page: ft.Page) -> None:
             log.append(f"Anonymizing {label} failed: {message}", "ERROR")
             return False
         names = ", ".join(
-            [column for column, _kind, _length in plan.targets]
+            [column for column, *_rest in plan.targets]
             + [json_path_text(t.column, t.path) for t in plan.json_targets]
         )
         log.append(
@@ -1343,7 +1377,7 @@ async def main(page: ft.Page) -> None:
                     log.append(f"Could not read columns of {table}: {message}", "WARN")
                     continue
                 table_plan = plan_table(table, columns, rules)
-                would = [c for c, _k, _l in table_plan.targets]
+                would = [c for c, *_rest in table_plan.targets]
                 reported = list(table_plan.skipped)
                 # The same look into the JSON columns the run will take, so the
                 # preview does not stay silent about the paths it would rewrite.
@@ -1582,7 +1616,7 @@ async def main(page: ft.Page) -> None:
                             if not await anonymize_step(dst, temp_name, final_name):
                                 fail(f"Anonymization failed for {final_name}; its data was not replaced")
                                 return
-                            replaced, replace_msg = await transfer_service.mysql_replace_final_from_temp(
+                            replaced, replace_msg, lost_columns = await transfer_service.mysql_replace_final_from_temp(
                                 dst, temp_table=temp_name, final_table=final_name
                             )
                             if not replaced:
@@ -1590,7 +1624,16 @@ async def main(page: ft.Page) -> None:
                                 return
                             if temp_name in open_temp_tables:
                                 open_temp_tables.remove(temp_name)
-                            log.append(f"In-place replace done for {final_name}: {replace_msg}")
+                            for column in lost_columns:
+                                # The row went in without it, so it carries the column's
+                                # default now: NULL for a nullable foreign key.
+                                log.append(
+                                    f"{final_name}.{column} was not carried over and keeps its default; "
+                                    "apitap did not bring that column",
+                                    "WARN",
+                                )
+                                notes.append(f"column_lost={final_name}.{column}")
+                            log.append(f"In-place replace done for {final_name}: {replace_msg}", "INFO")
                             notes.append(f"inplace={final_name}")
 
                             # This table was never replaced, so it still carries whatever
@@ -2101,9 +2144,12 @@ async def main(page: ft.Page) -> None:
             rule_dialog_title,
             [
                 ui.field_row(rule_pattern, rule_kind),
+                ui.field_row(rule_exception),
                 ft.Text(
                     "The pattern is matched against column names, ignoring case. Only text columns are "
-                    "rewritten; the log reports anything that looks personal and was left alone.",
+                    "rewritten; the log reports anything that looks personal and was left alone. A value "
+                    "matching \"Keep values matching\" is left as it is, for the cases where an application "
+                    "reads meaning from the shape of a value.",
                     size=11,
                     color=ft.Colors.ON_SURFACE_VARIANT,
                 ),

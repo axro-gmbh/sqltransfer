@@ -561,6 +561,19 @@ def build_mysql_insert_columns(
     return usable
 
 
+def mysql_dropped_insert_columns(
+    final_columns: list[tuple[str, bool]], temp_columns: list[str]
+) -> list[str]:
+    """Destination columns the INSERT cannot carry, because the temp table lacks them.
+
+    Such a column keeps its default on every row, which for a nullable foreign key means
+    NULL everywhere. That used to happen silently; it is reported now. A generated column
+    is not among them, leaving those out is the point.
+    """
+    available = {name.lower() for name in temp_columns}
+    return [name for name, generated in final_columns if not generated and name.lower() not in available]
+
+
 # PostgreSQL has no `extra` column; MySQL has no `is_generated`.
 _COLUMNS_SQL = (
     "SELECT column_name, data_type, character_maximum_length, is_generated "
@@ -866,11 +879,17 @@ class TransferService:
         *,
         temp_table: str,
         final_table: str,
-    ) -> tuple[bool, str]:
+    ) -> tuple[bool, str, list[str]]:
+        """(ok, message, columns the INSERT could not carry).
+
+        A column the temp table lacks keeps its default on every row; the caller has to
+        be able to say which one, rather than hand back a copy with a silently empty
+        column.
+        """
         endpoint: ResolvedEndpoint | None = None
         try:
             if destination.db_type != "mysql":
-                return False, "Destination is not MySQL"
+                return False, "Destination is not MySQL", []
             endpoint = self._resolve_profile(destination)
             host = endpoint.tunnel.local_host if endpoint.tunnel else destination.host
             port = endpoint.tunnel.local_port if endpoint.tunnel else destination.port
@@ -952,16 +971,22 @@ class TransferService:
         *,
         temp_table: str,
         final_table: str,
-    ) -> tuple[bool, str]:
+    ) -> tuple[bool, str, list[str]]:
+        """(ok, message, columns the INSERT could not carry).
+
+        A column the temp table lacks keeps its default on every row; the caller has to
+        be able to say which one, rather than hand back a copy with a silently empty
+        column.
+        """
         endpoint: ResolvedEndpoint | None = None
         try:
             if destination.db_type != "mysql":
-                return False, "Destination is not MySQL"
+                return False, "Destination is not MySQL", []
             endpoint = self._resolve_profile(destination)
             host = endpoint.tunnel.local_host if endpoint.tunnel else destination.host
             port = endpoint.tunnel.local_port if endpoint.tunnel else destination.port
             password = self.secret_store.get_secret(destination.password_secret_key) or ""
-            result = await asyncio.to_thread(
+            message, dropped = await asyncio.to_thread(
                 _mysql_replace_final_from_temp_sync,
                 host,
                 port,
@@ -972,9 +997,9 @@ class TransferService:
                 final_table,
                 tls=endpoint.tls,
             )
-            return True, result
+            return True, message, dropped
         except Exception as exc:  # noqa: BLE001
-            return False, str(exc)
+            return False, str(exc), []
         finally:
             if endpoint and endpoint.tunnel:
                 self.tunnel_manager.close_tunnel(endpoint.tunnel)
@@ -1316,9 +1341,14 @@ class TransferService:
                 limit,
                 tls=endpoint.tls,
             )
+            schema = resolve_table_schema(source.db_type, schema_hint, source.database)
+            where = f"'{schema}' on {source.host}"
             if not rows:
-                return True, [], "No tables found"
-            return True, rows, f"Loaded {len(rows)} table(s)"
+                return True, [], (
+                    f"No tables found in {where}. The field 'Source schema hint' decides "
+                    "which schema is read and overrides the profile's database."
+                )
+            return True, rows, f"Loaded {len(rows)} table(s) from {where}"
         except Exception as exc:  # noqa: BLE001
             return False, [], f"Load tables failed: {exc}"
         finally:
@@ -1488,6 +1518,21 @@ class TransferService:
             if endpoint and endpoint.tunnel:
                 self.tunnel_manager.close_tunnel(endpoint.tunnel)
 
+def resolve_table_schema(db_type: str, schema_hint: str | None, database: str | None) -> str:
+    """Which schema a listing reads: the field if it is filled, else the profile.
+
+    The field wins because a whole-database scope names its own database. It is also the
+    reason a listing can come back empty although the profile is fine: the field still
+    held the name from an earlier run against another server.
+    """
+    hint = (schema_hint or "").strip().strip('`"')
+    if hint:
+        return hint
+    if db_type == "postgres":
+        return "public"
+    return (database or "").strip()
+
+
 def _list_tables_sync(
     db_type: str,
     host: str,
@@ -1503,7 +1548,7 @@ def _list_tables_sync(
     if db_type == "postgres":
         import psycopg
 
-        schema = (schema_hint or "public").strip() or "public"
+        schema = resolve_table_schema("postgres", schema_hint, database)
         conn = _pg_connect(tls,
             host=host,
             port=port,
@@ -1544,7 +1589,7 @@ def _list_tables_sync(
     # The scope names its own database; the profile's is only the fallback. Everything
     # after the listing (indexes, definitions) reads the schema off the table name, so
     # a bare name from the wrong database would silently restore nothing.
-    schema = (schema_hint or "").strip().strip('`"') or database
+    schema = resolve_table_schema("mysql", schema_hint, database)
     try:
         with conn.cursor() as cur:
             cur.execute(
@@ -2075,6 +2120,7 @@ def _mysql_replace_final_from_temp_sync(
                 )
                 temp_columns = [str(r[0]) for r in cur.fetchall()]
                 names = build_mysql_insert_columns(final_columns, temp_columns)
+                dropped = mysql_dropped_insert_columns(final_columns, temp_columns)
                 column_list = ", ".join(_quote_mysql_ident(name) for name in names)
                 cur.execute(f"DELETE FROM {_quote_mysql_ident(final_table)}")
                 cur.execute(
@@ -2083,7 +2129,8 @@ def _mysql_replace_final_from_temp_sync(
                 )
                 cur.execute(f"DROP TABLE {_quote_mysql_ident(temp_table)}")
                 cur.execute("SET FOREIGN_KEY_CHECKS=1")
-                return f"Replaced data in {final_table} from {temp_table} (in-place, FK-safe)"
+                message = f"Replaced data in {final_table} from {temp_table} (in-place, FK-safe)"
+                return message, dropped
         except Exception as exc:  # noqa: BLE001
             last_exc = exc
             msg = str(exc).lower()

@@ -52,3 +52,31 @@ def test_summarize_notes_counts_instead_of_listing_every_table():
 
 def test_summarize_notes_handles_empty_input():
     assert summarize_notes([]) == ""
+
+
+# --- which schema a listing reads ------------------------------------------
+
+
+def test_the_schema_field_wins_over_the_profile():
+    """Real confusion: the field still said 'shopware' from a local run while the
+    profile pointed at the production server, whose schema is 'sw6'. The listing came
+    back empty and said nothing about where it had looked."""
+    from sqltransfer_app.transfer import resolve_table_schema
+
+    assert resolve_table_schema("mysql", "shopware", "sw6") == "shopware"
+    assert resolve_table_schema("mysql", "  shopware  ", "sw6") == "shopware"
+    assert resolve_table_schema("mysql", "`sw6`", "sw6") == "sw6"
+
+
+def test_without_a_field_the_profile_decides():
+    from sqltransfer_app.transfer import resolve_table_schema
+
+    assert resolve_table_schema("mysql", None, "sw6") == "sw6"
+    assert resolve_table_schema("mysql", "", "sw6") == "sw6"
+
+
+def test_postgresql_falls_back_to_public():
+    from sqltransfer_app.transfer import resolve_table_schema
+
+    assert resolve_table_schema("postgres", None, "ediapi") == "public"
+    assert resolve_table_schema("postgres", "sales", "ediapi") == "sales"
