@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 import time
 from dataclasses import replace
 from datetime import datetime, timezone
@@ -285,6 +286,11 @@ async def main(page: ft.Page) -> None:
         options=[ft.dropdown.Option(key, label) for key, label in KINDS],
         col={"sm": 12, "md": 6},
     )
+    rule_exception = ft.TextField(
+        label="Keep values matching",
+        helper=r"Regular expression over the value, e.g. ^[0-9]+@axro\.",
+        col={"sm": 12, "md": 6},
+    )
     rule_enabled = ft.Checkbox(label="Enabled", value=True)
     rule_save_button = ft.FilledButton("Save", icon=ft.Icons.SAVE_OUTLINED)
     rule_dialog_title = ft.Text("New rule", size=17, weight=ft.FontWeight.BOLD)
@@ -534,18 +540,30 @@ async def main(page: ft.Page) -> None:
             refresh_rules()
             page.update()
             return
-        clear_errors(rule_pattern)
+        clear_errors(rule_pattern, rule_exception)
         rule_form_state["id"] = rule.id if rule else None
         rule_dialog_title.value = f"Edit rule '{rule.pattern}'" if rule else "New rule"
         rule_pattern.value = rule.pattern if rule else ""
         rule_kind.value = rule.kind if rule else KINDS[0][0]
         rule_enabled.value = rule.enabled if rule else True
+        rule_exception.value = (rule.exception if rule and rule.exception else "")
         show_form_dialog(build_rule_dialog())
         page.update()
 
     def save_rule(_: object) -> None:
         if not require((rule_pattern, "column pattern")):
             return
+        muster = rule_exception.value.strip() if rule_exception.value else ""
+        if muster:
+            try:
+                re.compile(muster)
+            except re.error as exc:
+                # Caught here rather than by the server mid-transfer, where it would
+                # abort a run that has already written.
+                rule_exception.error = f"Not a regular expression: {exc}"
+                notify_error(str(rule_exception.error))
+                page.update()
+                return
         try:
             saved_dialog = open_dialogs.get("current")
             storage.save_anonymization_rule(
@@ -554,6 +572,7 @@ async def main(page: ft.Page) -> None:
                     pattern=rule_pattern.value.strip(),
                     kind=rule_kind.value,
                     enabled=bool(rule_enabled.value),
+                    exception=muster or None,
                 )
             )
             dismiss(saved_dialog)
@@ -1216,7 +1235,7 @@ async def main(page: ft.Page) -> None:
             log.append(f"Anonymizing {label} failed: {message}", "ERROR")
             return False
         names = ", ".join(
-            [column for column, _kind, _length in plan.targets]
+            [column for column, *_rest in plan.targets]
             + [json_path_text(t.column, t.path) for t in plan.json_targets]
         )
         log.append(
@@ -1358,7 +1377,7 @@ async def main(page: ft.Page) -> None:
                     log.append(f"Could not read columns of {table}: {message}", "WARN")
                     continue
                 table_plan = plan_table(table, columns, rules)
-                would = [c for c, _k, _l in table_plan.targets]
+                would = [c for c, *_rest in table_plan.targets]
                 reported = list(table_plan.skipped)
                 # The same look into the JSON columns the run will take, so the
                 # preview does not stay silent about the paths it would rewrite.
@@ -2125,9 +2144,12 @@ async def main(page: ft.Page) -> None:
             rule_dialog_title,
             [
                 ui.field_row(rule_pattern, rule_kind),
+                ui.field_row(rule_exception),
                 ft.Text(
                     "The pattern is matched against column names, ignoring case. Only text columns are "
-                    "rewritten; the log reports anything that looks personal and was left alone.",
+                    "rewritten; the log reports anything that looks personal and was left alone. A value "
+                    "matching \"Keep values matching\" is left as it is, for the cases where an application "
+                    "reads meaning from the shape of a value.",
                     size=11,
                     color=ft.Colors.ON_SURFACE_VARIANT,
                 ),

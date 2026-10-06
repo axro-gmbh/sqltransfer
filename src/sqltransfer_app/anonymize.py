@@ -73,6 +73,12 @@ class Rule:
     pattern: str
     kind: str
     enabled: bool = True
+    # A regular expression over the VALUE: what matches it keeps its value. Anonymizing
+    # destroys the shape of a value, and an application may read meaning from that shape
+    # (AxroCustomer decides whether a customer is a debtor by matching its e-mail against
+    # ^[0-9]+@axro\., the customer number at the company domain). The exception keeps
+    # those and replaces everything else.
+    exception: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -88,7 +94,8 @@ class TablePlan:
     """What happens to one table: what gets rewritten, and what was left alone and why."""
 
     table: str
-    targets: tuple[tuple[str, str, int | None], ...]  # (column, kind, max length)
+    # (column, kind, max length, exception pattern)
+    targets: tuple[tuple[str, str, int | None, str | None], ...]
     skipped: tuple[tuple[str, str], ...]  # (column, reason)
     json_targets: tuple["JsonTarget", ...] = ()  # values to rewrite inside JSON columns
     json_columns: tuple[tuple[str, str], ...] = ()  # (column, data type) to look into
@@ -145,7 +152,7 @@ def plan_table(table: str, columns: Sequence[Column], rules: Sequence[Rule]) -> 
             # and an UPDATE on it fails with "not allowed".
             skipped.append((column.name, "generated column, the database computes it"))
         elif rule and data_type in TEXT_TYPES:
-            targets.append((column.name, rule.kind, column.max_length))
+            targets.append((column.name, rule.kind, column.max_length, rule.exception))
         elif rule:
             skipped.append((column.name, f"not a text column ({data_type})"))
         elif looks_personal(column.name):
@@ -176,6 +183,7 @@ def _quote_table(table: str, db_type: str) -> str:
 # turned into placeholders, in order, at the end.
 SALT_TOKEN = "{{SALT}}"
 PATH_TOKEN = "{{PATH}}"
+KEEP_TOKEN = "{{KEEP}}"
 
 
 def _hash(column: str, db_type: str) -> str:
@@ -300,25 +308,25 @@ def _json_assignment(column: str, targets: list["JsonTarget"], db_type: str) -> 
     return f"{quoted} = {expression}", path_values
 
 
-def _bind(sql: str, salt: str, path_values: list) -> tuple[str, list]:
-    """Turn the markers into placeholders, collecting the parameters in their order."""
+def _bind(sql: str, salt: str, path_values: list, keep_values: list | None = None) -> tuple[str, list]:
+    """Turn the markers into placeholders, collecting the parameters in their order.
+
+    Whichever marker comes first in the statement is bound first, so the parameters
+    arrive in the order the server reads them. No value is ever built into the text.
+    """
     params: list = []
-    paths = iter(path_values)
+    sources = {PATH_TOKEN: iter(path_values), KEEP_TOKEN: iter(keep_values or [])}
     out: list[str] = []
     rest = sql
     while rest:
-        salt_at, path_at = rest.find(SALT_TOKEN), rest.find(PATH_TOKEN)
-        if salt_at < 0 and path_at < 0:
+        found = [(rest.find(token), token) for token in (SALT_TOKEN, PATH_TOKEN, KEEP_TOKEN)]
+        at, token = min(((at, token) for at, token in found if at >= 0), default=(-1, ""))
+        if at < 0:
             out.append(rest)
             break
-        if path_at < 0 or (0 <= salt_at < path_at):
-            out.append(rest[:salt_at] + "%s")
-            params.append(salt)
-            rest = rest[salt_at + len(SALT_TOKEN):]
-        else:
-            out.append(rest[:path_at] + "%s")
-            params.append(next(paths))
-            rest = rest[path_at + len(PATH_TOKEN):]
+        out.append(rest[:at] + "%s")
+        params.append(salt if token == SALT_TOKEN else next(sources[token]))
+        rest = rest[at + len(token):]
     return "".join(out), params
 
 
@@ -330,16 +338,24 @@ def update_statement(plan: TablePlan, db_type: str, salt: str) -> tuple[str, lis
     if not plan.targets and not plan.json_targets:
         return None
     assignments = []
-    for column, kind, max_length in plan.targets:
+    keep_values: list[str] = []
+    for column, kind, max_length, exception in plan.targets:
         quoted = _quote(column, db_type)
         replacement = _replacement(kind, quoted, db_type)
         if max_length:
             # A fake e-mail address needs 31 characters; a real ort VARCHAR(10)
             # would otherwise abort the whole transfer with "data too long".
             replacement = f"LEFT({replacement}, {int(max_length)})"
+        keep = ""
+        if exception:
+            # Checked before the replacement, so a value the application reads meaning
+            # from stays exactly as it was.
+            operator = "REGEXP" if db_type == "mysql" else "~"
+            keep = f"WHEN {quoted} {operator} {KEEP_TOKEN} THEN {quoted} "
+            keep_values.append(exception)
         assignments.append(
             f"{quoted} = CASE WHEN {quoted} IS NULL THEN NULL WHEN {quoted} = '' THEN '' "
-            f"ELSE {replacement} END"
+            f"{keep}ELSE {replacement} END"
         )
     by_column: dict[str, list[JsonTarget]] = {}
     for target in plan.json_targets:
@@ -351,7 +367,7 @@ def update_statement(plan: TablePlan, db_type: str, salt: str) -> tuple[str, lis
         path_values += values
 
     sql = f"UPDATE {_quote_table(plan.table, db_type)} SET " + ", ".join(assignments)
-    return _bind(sql, salt, path_values)
+    return _bind(sql, salt, path_values, keep_values)
 
 
 @dataclass(frozen=True, slots=True)

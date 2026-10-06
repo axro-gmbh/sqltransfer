@@ -9,8 +9,8 @@ from sqltransfer_app.anonymize import TablePlan, update_statement
 
 
 def _plan(*targets: tuple, table: str = "kunde") -> TablePlan:
-    """Targets may be given as (column, kind) or (column, kind, max length)."""
-    full = tuple(t if len(t) == 3 else (*t, None) for t in targets)
+    """Targets may be given short; the missing max length and exception default to None."""
+    full = tuple(t + (None,) * (4 - len(t)) for t in targets)
     return TablePlan(table=table, targets=full, skipped=())
 
 
@@ -99,3 +99,43 @@ def test_a_short_column_cuts_the_replacement_instead_of_overflowing(db_type):
 def test_a_column_without_a_length_is_not_cut(db_type):
     sql, _ = update_statement(_plan(("beschreibung", "text")), db_type, "s")
     assert "LEFT(" not in sql
+
+
+
+# An exception keeps values whose shape an application reads meaning from. Real case:
+# AxroCustomer decides whether a customer is a debtor by matching the e-mail against
+# ^[0-9]+@axro\. (customer number at the company domain). Replacing it took the
+# contacts tab, the debtor header and "login as customer" with it, without any error.
+AUSNAHME = r"^[0-9]+@axro\."
+
+
+@pytest.mark.parametrize("db_type,operator", [("mysql", "REGEXP"), ("postgres", "~")])
+def test_an_exception_keeps_the_matching_value(db_type, operator):
+    sql, params = update_statement(
+        _plan(("email", "email", 190, AUSNAHME)), db_type, "pepper"
+    )
+    assert f"THEN `email` " in sql or f'THEN "email" ' in sql
+    assert operator in sql
+    assert AUSNAHME in params, params
+    assert AUSNAHME not in sql, "the pattern is a parameter, never statement text"
+
+
+def test_the_exception_is_checked_before_the_replacement():
+    sql, _ = update_statement(_plan(("email", "email", None, AUSNAHME)), "mysql", "s")
+    assert sql.index("REGEXP") < sql.index("ELSE"), sql
+
+
+def test_a_column_without_an_exception_is_unchanged():
+    mit, _ = update_statement(_plan(("email", "email")), "mysql", "s")
+    assert "REGEXP" not in mit
+
+
+@pytest.mark.parametrize("db_type", ["mysql", "postgres"])
+def test_salt_and_exception_keep_their_order_as_parameters(db_type):
+    sql, params = update_statement(
+        _plan(("email", "email", None, AUSNAHME), ("ort", "city")), db_type, "pepper"
+    )
+    # One parameter per placeholder, in the order the statement reads them.
+    assert len(params) == sql.count("%s")
+    assert params.count(AUSNAHME) == 1
+    assert params[0] == AUSNAHME or params[1] == AUSNAHME, params

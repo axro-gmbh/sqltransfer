@@ -67,10 +67,11 @@ class Storage:
                 );
 
                 CREATE TABLE IF NOT EXISTS anonymization_rules (
-                    id      INTEGER PRIMARY KEY AUTOINCREMENT,
-                    pattern TEXT    NOT NULL UNIQUE,
-                    kind    TEXT    NOT NULL,
-                    enabled INTEGER NOT NULL DEFAULT 1
+                    id        INTEGER PRIMARY KEY AUTOINCREMENT,
+                    pattern   TEXT    NOT NULL UNIQUE,
+                    kind      TEXT    NOT NULL,
+                    enabled   INTEGER NOT NULL DEFAULT 1,
+                    exception TEXT
                 );
 
                 CREATE TABLE IF NOT EXISTS schema_marks (
@@ -116,6 +117,11 @@ class Storage:
             conn.execute("ALTER TABLE db_profiles ADD COLUMN tls_ca_path TEXT")
         if "role" in profile_cols:
             self._drop_role_column(conn)
+
+        rule_cols = {row["name"] for row in conn.execute("PRAGMA table_info(anonymization_rules)").fetchall()}
+        if "exception" not in rule_cols:
+            # Written before the exception existed; an empty one changes nothing.
+            conn.execute("ALTER TABLE anonymization_rules ADD COLUMN exception TEXT")
 
         # Seed the rules once. A mark rather than "is the table empty", so a user
         # who deletes every rule does not get them all back on the next start.
@@ -382,9 +388,17 @@ class Storage:
 
     def list_anonymization_rules(self) -> List[Rule]:
         with self._connect() as conn:
-            rows = conn.execute("SELECT id, pattern, kind, enabled FROM anonymization_rules ORDER BY id").fetchall()
+            rows = conn.execute(
+                "SELECT id, pattern, kind, enabled, exception FROM anonymization_rules ORDER BY id"
+            ).fetchall()
         return [
-            Rule(id=int(r["id"]), pattern=str(r["pattern"]), kind=str(r["kind"]), enabled=bool(r["enabled"]))
+            Rule(
+                id=int(r["id"]),
+                pattern=str(r["pattern"]),
+                kind=str(r["kind"]),
+                enabled=bool(r["enabled"]),
+                exception=str(r["exception"]) if r["exception"] else None,
+            )
             for r in rows
         ]
 
@@ -393,19 +407,20 @@ class Storage:
 
         Same contract as the profiles: a name, here a pattern, belongs to one row.
         """
-        values = (rule.pattern, rule.kind, 1 if rule.enabled else 0)
+        values = (rule.pattern, rule.kind, 1 if rule.enabled else 0, rule.exception or None)
         with self._connect() as conn:
             if rule.id is None:
                 try:
                     cur = conn.execute(
-                        "INSERT INTO anonymization_rules(pattern, kind, enabled) VALUES (?, ?, ?)", values
+                        "INSERT INTO anonymization_rules(pattern, kind, enabled, exception) VALUES (?, ?, ?, ?)", values
                     )
                 except sqlite3.IntegrityError as exc:
                     raise DuplicateProfileName(rule.pattern) from exc
                 return int(cur.lastrowid)
             try:
                 cur = conn.execute(
-                    "UPDATE anonymization_rules SET pattern=?, kind=?, enabled=? WHERE id=?", (*values, rule.id)
+                    "UPDATE anonymization_rules SET pattern=?, kind=?, enabled=?, exception=? WHERE id=?",
+                    (*values, rule.id),
                 )
             except sqlite3.IntegrityError as exc:
                 raise DuplicateProfileName(rule.pattern) from exc

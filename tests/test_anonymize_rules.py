@@ -37,7 +37,9 @@ def test_plan_lists_targets_and_leaves_the_rest_alone():
     ]
     plan = plan_table("kunde", columns, _rules())
     assert plan == TablePlan(
-        table="kunde", targets=(("email", "email", 190), ("vorname", "firstname", None)), skipped=()
+        table="kunde",
+        targets=(("email", "email", 190, None), ("vorname", "firstname", None, None)),
+        skipped=(),
     )
 
 
@@ -117,3 +119,17 @@ def test_a_json_column_without_a_rule_is_still_looked_into():
 
     plan = plan_table("kunde", [Column("payload", "jsonb")], [Rule(id=1, pattern="*mail*", kind="email")])
     assert plan.json_columns == (("payload", "jsonb"),)
+
+
+def test_the_plan_carries_the_exception_of_its_rule():
+    from sqltransfer_app.anonymize import Column, Rule, plan_table
+
+    plan = plan_table(
+        "kunde",
+        [Column("email", "varchar", 190), Column("ort", "varchar", 60)],
+        [Rule(id=1, pattern="*mail*", kind="email", exception=r"^[0-9]+@axro\."),
+         Rule(id=2, pattern="ort", kind="city")],
+    )
+    nach_spalte = {t[0]: t for t in plan.targets}
+    assert nach_spalte["email"][3] == r"^[0-9]+@axro\."
+    assert nach_spalte["ort"][3] is None
