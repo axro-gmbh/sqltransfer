@@ -343,7 +343,14 @@ async def main(page: ft.Page) -> None:
     check_all_button = ft.TextButton("Select all")
     clear_checked_button = ft.TextButton("Clear")
 
-    source_schema_hint = ft.TextField(label="Source schema hint", value="public", col={"sm": 6, "md": 4})
+    source_schema_hint = ft.TextField(
+        label="Source schema hint",
+        # Empty on purpose: a filled field overrides the profile's database, and a
+        # PostgreSQL default like "public" would send a MySQL run looking for a schema
+        # of that name and come back with nothing.
+        helper="Empty: the profile's database (MySQL) or public (PostgreSQL)",
+        col={"sm": 6, "md": 4},
+    )
     transfer_parallel = ft.TextField(
         label="Parallel pipes",
         hint_text="auto",
@@ -1098,8 +1105,16 @@ async def main(page: ft.Page) -> None:
             table_checks.controls = [
                 ft.Checkbox(label=name, value=False, on_change=on_check_change) for name in tables
             ]
-            set_status(f"{len(tables)} tables loaded", "ok")
-            log.append(message)
+            if tables:
+                set_status(f"{len(tables)} tables loaded", "ok")
+                log.append(message)
+            else:
+                # Not an error, but not a success either: the connection worked and the
+                # schema that was read holds nothing. Which schema that was is in the
+                # message, because the field overrides the profile.
+                set_status("No tables found", "error")
+                log.append(message, "WARN")
+                notify_error(message)
         else:
             single_table.options = []
             single_table.value = None
