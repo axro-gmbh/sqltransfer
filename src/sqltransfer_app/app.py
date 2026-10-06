@@ -1597,7 +1597,7 @@ async def main(page: ft.Page) -> None:
                             if not await anonymize_step(dst, temp_name, final_name):
                                 fail(f"Anonymization failed for {final_name}; its data was not replaced")
                                 return
-                            replaced, replace_msg = await transfer_service.mysql_replace_final_from_temp(
+                            replaced, replace_msg, lost_columns = await transfer_service.mysql_replace_final_from_temp(
                                 dst, temp_table=temp_name, final_table=final_name
                             )
                             if not replaced:
@@ -1605,7 +1605,16 @@ async def main(page: ft.Page) -> None:
                                 return
                             if temp_name in open_temp_tables:
                                 open_temp_tables.remove(temp_name)
-                            log.append(f"In-place replace done for {final_name}: {replace_msg}")
+                            for column in lost_columns:
+                                # The row went in without it, so it carries the column's
+                                # default now: NULL for a nullable foreign key.
+                                log.append(
+                                    f"{final_name}.{column} was not carried over and keeps its default; "
+                                    "apitap did not bring that column",
+                                    "WARN",
+                                )
+                                notes.append(f"column_lost={final_name}.{column}")
+                            log.append(f"In-place replace done for {final_name}: {replace_msg}", "INFO")
                             notes.append(f"inplace={final_name}")
 
                             # This table was never replaced, so it still carries whatever

@@ -162,7 +162,7 @@ def _run_table_like_the_app(table: str) -> None:
         if has_inbound:
             # in-place: the rows are replaced and the table keeps standing, so its
             # definition has to be compared against the source's and fixed.
-            replaced, message = await service.mysql_replace_final_from_temp(dst, temp_table=temp, final_table=table)
+            replaced, message, _lost = await service.mysql_replace_final_from_temp(dst, temp_table=temp, final_table=table)
             assert replaced, message
             ok, definitions, message = await service.table_definitions(src, [table])
             assert ok, message
@@ -519,7 +519,7 @@ def test_in_place_replace_survives_generated_columns(databases):
           " order_date DATE, tax_status VARCHAR(32))",
           "INSERT INTO gen_tmp VALUES (2,'neu@axro.de','2026-02-02 11:00:00','2026-02-02','t-2')")
 
-    ok, message = asyncio.run(service.mysql_replace_final_from_temp(dst, temp_table="gen_tmp", final_table="gen"))
+    ok, message, _lost = asyncio.run(service.mysql_replace_final_from_temp(dst, temp_table="gen_tmp", final_table="gen"))
     assert ok, message
     rows = _rows(DST_DB, "SELECT id, email, order_date, tax_status FROM gen")
     assert len(rows) == 1 and rows[0][0] == 2
@@ -802,7 +802,7 @@ def test_in_place_replace_keeps_columns_with_a_function_default(databases):
           "CREATE TABLE fn_tmp (id INT PRIMARY KEY, angelegt DATETIME, geaendert DATETIME, tag DATE)",
           "INSERT INTO fn_tmp VALUES (2,'2026-06-06 09:00:00','2026-06-07 10:00:00','2026-06-06')")
 
-    ok, message = asyncio.run(service.mysql_replace_final_from_temp(dst, temp_table="fn_tmp", final_table="fn"))
+    ok, message, _lost = asyncio.run(service.mysql_replace_final_from_temp(dst, temp_table="fn_tmp", final_table="fn"))
     assert ok, message
     row = _rows(DST_DB, "SELECT id, angelegt, geaendert, tag FROM fn")[0]
     assert row[0] == 2
@@ -997,6 +997,41 @@ def test_a_binary_default_is_restored_as_the_same_bytes(databases):
         conn.close()
     assert str(gespeichert).upper() == roh.hex().upper(), gespeichert
 
+
+def test_a_column_the_temp_table_lacks_is_named_and_keeps_its_default(databases):
+    """The fingerprint of the silent loss: every row carries the column's default.
+
+    Shape taken from a real Shopware copy, where user.active was 0 in all 41 rows and
+    nothing in the log said why. Here the destination has a column the temp table does
+    not, and the replace has to name it.
+    """
+    _exec(DST_DB,
+          "CREATE TABLE nutzer (id INT PRIMARY KEY, name VARCHAR(40) NOT NULL, "
+          "active TINYINT(1) NOT NULL DEFAULT 0)",
+          "CREATE TABLE rolle (id INT PRIMARY KEY, nutzer_id INT, "
+          "CONSTRAINT fk_n FOREIGN KEY (nutzer_id) REFERENCES nutzer(id))",
+          "INSERT INTO nutzer VALUES (1, 'alt', 1)",
+          # the temp table apitap would have left behind, without `active`
+          "CREATE TABLE nutzer_tmp (id INT PRIMARY KEY, name VARCHAR(40) NOT NULL)",
+          "INSERT INTO nutzer_tmp VALUES (1, 'neu'), (2, 'zwei')")
+
+    ok, message, lost = asyncio.run(
+        _service().mysql_replace_final_from_temp(
+            _profile("local", DST_DB), temp_table="nutzer_tmp", final_table="nutzer"
+        )
+    )
+    assert ok, message
+    assert lost == ["active"], lost
+
+    conn = pymysql.connect(**_conn_args(), database=DST_DB, autocommit=True)
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT id, name, active FROM nutzer ORDER BY id")
+            rows = cur.fetchall()
+    finally:
+        conn.close()
+    # The data is there, the column is at its default: exactly what used to go unnoticed.
+    assert rows == ((1, "neu", 0), (2, "zwei", 0)), rows
 
 def test_an_empty_listing_says_which_schema_it_read(databases):
     """The field overrides the profile, so an empty list has to name where it looked."""

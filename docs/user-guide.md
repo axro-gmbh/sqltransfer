@@ -182,6 +182,8 @@ Not carried over: triggers, views, partitioning and column comments. **All of th
 
 **Indexes are copied from the source.** For MySQL to MySQL the app creates the same indexes at the destination as in the source, including UNIQUE, FULLTEXT and prefix indexes. This happens before the swap, so the table is fully indexed from the first moment. On large tables it costs noticeable time, and the log then says "Building … index(es)". When the source is PostgreSQL, the destination table only gets its primary key.
 
+**When a column does not come along.** A table other tables point at is not swapped; its rows are replaced in place. If apitap did not bring one of its columns, the row goes in without it and the column keeps its default, which for a nullable foreign key means NULL in every row. The log now names that case with table and column as a WARN. When you see such a line, compare that column against the source before you work with the copy.
+
 **Foreign keys are copied too**, including rules such as `ON DELETE CASCADE`. They are created at the end of the run, once every table is there, shown as "Restoring foreign keys" in the log. The existing rows are not checked while doing so, exactly like a database import: tables from a live source are copied minutes apart and therefore do not always match row for row. Foreign keys pointing into another schema are not copied, and the log names them as WARN.
 
 **Empty source tables** lead to an empty destination table: if it is missing it gets created, and if it still holds old rows those are removed. Both appear as WARN in the log. If the app creates an empty table whose foreign key targets are still missing, it sets those foreign keys in a second pass at the end.

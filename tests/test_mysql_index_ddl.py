@@ -68,6 +68,25 @@ def test_insert_columns_only_use_what_both_tables_have():
     assert build_mysql_insert_columns(final, ["id", "price", "extra"]) == ["id", "price"]
 
 
+def test_the_columns_the_insert_cannot_carry_are_named():
+    """A column missing in the temp table used to vanish without a word: the row goes in
+    without it and the column keeps its default, so a nullable foreign key ends up NULL
+    on every row. That has to be reported, not swallowed."""
+    from sqltransfer_app.transfer import mysql_dropped_insert_columns
+
+    final = [("id", False), ("active", False), ("order_date", True)]
+    temp = ["id", "order_date"]
+    # order_date is generated, so leaving it out is correct and not a finding.
+    assert mysql_dropped_insert_columns(final, temp) == ["active"]
+
+
+def test_nothing_is_named_when_both_tables_agree():
+    from sqltransfer_app.transfer import mysql_dropped_insert_columns
+
+    final = [("id", False), ("price", False), ("order_date", True)]
+    assert mysql_dropped_insert_columns(final, ["id", "price", "order_date"]) == []
+
+
 def test_insert_columns_refuse_a_table_with_nothing_to_copy():
     from sqltransfer_app.transfer import build_mysql_insert_columns
 

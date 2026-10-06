@@ -561,6 +561,19 @@ def build_mysql_insert_columns(
     return usable
 
 
+def mysql_dropped_insert_columns(
+    final_columns: list[tuple[str, bool]], temp_columns: list[str]
+) -> list[str]:
+    """Destination columns the INSERT cannot carry, because the temp table lacks them.
+
+    Such a column keeps its default on every row, which for a nullable foreign key means
+    NULL everywhere. That used to happen silently; it is reported now. A generated column
+    is not among them, leaving those out is the point.
+    """
+    available = {name.lower() for name in temp_columns}
+    return [name for name, generated in final_columns if not generated and name.lower() not in available]
+
+
 # PostgreSQL has no `extra` column; MySQL has no `is_generated`.
 _COLUMNS_SQL = (
     "SELECT column_name, data_type, character_maximum_length, is_generated "
@@ -866,11 +879,17 @@ class TransferService:
         *,
         temp_table: str,
         final_table: str,
-    ) -> tuple[bool, str]:
+    ) -> tuple[bool, str, list[str]]:
+        """(ok, message, columns the INSERT could not carry).
+
+        A column the temp table lacks keeps its default on every row; the caller has to
+        be able to say which one, rather than hand back a copy with a silently empty
+        column.
+        """
         endpoint: ResolvedEndpoint | None = None
         try:
             if destination.db_type != "mysql":
-                return False, "Destination is not MySQL"
+                return False, "Destination is not MySQL", []
             endpoint = self._resolve_profile(destination)
             host = endpoint.tunnel.local_host if endpoint.tunnel else destination.host
             port = endpoint.tunnel.local_port if endpoint.tunnel else destination.port
@@ -952,16 +971,22 @@ class TransferService:
         *,
         temp_table: str,
         final_table: str,
-    ) -> tuple[bool, str]:
+    ) -> tuple[bool, str, list[str]]:
+        """(ok, message, columns the INSERT could not carry).
+
+        A column the temp table lacks keeps its default on every row; the caller has to
+        be able to say which one, rather than hand back a copy with a silently empty
+        column.
+        """
         endpoint: ResolvedEndpoint | None = None
         try:
             if destination.db_type != "mysql":
-                return False, "Destination is not MySQL"
+                return False, "Destination is not MySQL", []
             endpoint = self._resolve_profile(destination)
             host = endpoint.tunnel.local_host if endpoint.tunnel else destination.host
             port = endpoint.tunnel.local_port if endpoint.tunnel else destination.port
             password = self.secret_store.get_secret(destination.password_secret_key) or ""
-            result = await asyncio.to_thread(
+            message, dropped = await asyncio.to_thread(
                 _mysql_replace_final_from_temp_sync,
                 host,
                 port,
@@ -972,9 +997,9 @@ class TransferService:
                 final_table,
                 tls=endpoint.tls,
             )
-            return True, result
+            return True, message, dropped
         except Exception as exc:  # noqa: BLE001
-            return False, str(exc)
+            return False, str(exc), []
         finally:
             if endpoint and endpoint.tunnel:
                 self.tunnel_manager.close_tunnel(endpoint.tunnel)
@@ -2095,6 +2120,7 @@ def _mysql_replace_final_from_temp_sync(
                 )
                 temp_columns = [str(r[0]) for r in cur.fetchall()]
                 names = build_mysql_insert_columns(final_columns, temp_columns)
+                dropped = mysql_dropped_insert_columns(final_columns, temp_columns)
                 column_list = ", ".join(_quote_mysql_ident(name) for name in names)
                 cur.execute(f"DELETE FROM {_quote_mysql_ident(final_table)}")
                 cur.execute(
@@ -2103,7 +2129,8 @@ def _mysql_replace_final_from_temp_sync(
                 )
                 cur.execute(f"DROP TABLE {_quote_mysql_ident(temp_table)}")
                 cur.execute("SET FOREIGN_KEY_CHECKS=1")
-                return f"Replaced data in {final_table} from {temp_table} (in-place, FK-safe)"
+                message = f"Replaced data in {final_table} from {temp_table} (in-place, FK-safe)"
+                return message, dropped
         except Exception as exc:  # noqa: BLE001
             last_exc = exc
             msg = str(exc).lower()
