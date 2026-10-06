@@ -1032,3 +1032,17 @@ def test_a_column_the_temp_table_lacks_is_named_and_keeps_its_default(databases)
         conn.close()
     # The data is there, the column is at its default: exactly what used to go unnoticed.
     assert rows == ((1, "neu", 0), (2, "zwei", 0)), rows
+
+def test_an_empty_listing_says_which_schema_it_read(databases):
+    """The field overrides the profile, so an empty list has to name where it looked."""
+    service = _service()
+    ok, tables, message = asyncio.run(
+        service.list_tables(_profile("remote", SRC_DB), schema_hint="gibt_es_nicht")
+    )
+    assert ok, message
+    assert tables == []
+    assert "gibt_es_nicht" in message and "Source schema hint" in message, message
+
+    ok, tables, message = asyncio.run(service.list_tables(_profile("remote", SRC_DB)))
+    assert ok and tables, message
+    assert SRC_DB in message, message
