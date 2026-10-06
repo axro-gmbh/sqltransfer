@@ -325,6 +325,10 @@ async def main() -> int:
     app_module.TransferService.mysql_swap_temp_to_final = never_swap
     app_module.TransferService.mysql_table_exists = _async((True, ""))
     app_module.TransferService.mysql_table_has_inbound_fk = _async((True, False, ""))
+    # The scenarios below drive the app against profiles whose hosts do not exist, so
+    # every read of the source is answered here. Without this the run stops at the
+    # definition read, which is what a real unreachable source does.
+    app_module.TransferService.table_definitions = _async((True, {}, ""))
     app_module.TransferService.table_columns = _async((True, [Column("email", "varchar")], ""))
     app_module.TransferService.mysql_source_index_clauses = _async((True, {}, ""))
     app_module.TransferService.mysql_source_fk_clauses = _async((True, {}, [], ""))
@@ -511,9 +515,16 @@ async def main() -> int:
     order: list[str] = []
 
     async def record_definition(_self, _dst, table, clauses, tolerate_failures=False):
-        # three calls now: the strict column clauses, the tolerant AUTO_INCREMENT one
-        # before the swap, and the check constraints after it
-        kind = "definition" if not tolerate_failures else ("auto" if "AUTO_INCREMENT" in clauses[0] else "checks")
+        # Three calls: the column clauses and the AUTO_INCREMENT one before the swap,
+        # the check constraints after it. Told apart by what they carry, not by
+        # tolerate_failures: every one of them tolerates a failure now, so that flag
+        # no longer separates them.
+        if "ADD CONSTRAINT" in clauses[0]:
+            kind = "checks"
+        elif "AUTO_INCREMENT" in clauses[0]:
+            kind = "auto"
+        else:
+            kind = "definition"
         order.append(f"{kind}:{table}")
         return True, [], ""
 
