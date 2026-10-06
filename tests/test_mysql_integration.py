@@ -996,3 +996,18 @@ def test_a_binary_default_is_restored_as_the_same_bytes(databases):
     finally:
         conn.close()
     assert str(gespeichert).upper() == roh.hex().upper(), gespeichert
+
+
+def test_an_empty_listing_says_which_schema_it_read(databases):
+    """The field overrides the profile, so an empty list has to name where it looked."""
+    service = _service()
+    ok, tables, message = asyncio.run(
+        service.list_tables(_profile("remote", SRC_DB), schema_hint="gibt_es_nicht")
+    )
+    assert ok, message
+    assert tables == []
+    assert "gibt_es_nicht" in message and "Schema or database" in message, message
+
+    ok, tables, message = asyncio.run(service.list_tables(_profile("remote", SRC_DB)))
+    assert ok and tables, message
+    assert SRC_DB in message, message

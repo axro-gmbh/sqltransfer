@@ -1316,9 +1316,14 @@ class TransferService:
                 limit,
                 tls=endpoint.tls,
             )
+            schema = resolve_table_schema(source.db_type, schema_hint, source.database)
+            where = f"'{schema}' on {source.host}"
             if not rows:
-                return True, [], "No tables found"
-            return True, rows, f"Loaded {len(rows)} table(s)"
+                return True, [], (
+                    f"No tables found in {where}. The field 'Schema or database' decides "
+                    "which one is read and overrides the profile."
+                )
+            return True, rows, f"Loaded {len(rows)} table(s) from {where}"
         except Exception as exc:  # noqa: BLE001
             return False, [], f"Load tables failed: {exc}"
         finally:
@@ -1488,6 +1493,21 @@ class TransferService:
             if endpoint and endpoint.tunnel:
                 self.tunnel_manager.close_tunnel(endpoint.tunnel)
 
+def resolve_table_schema(db_type: str, schema_hint: str | None, database: str | None) -> str:
+    """Which schema a listing reads: the field if it is filled, else the profile.
+
+    The field wins because a whole-database scope names its own database. It is also the
+    reason a listing can come back empty although the profile is fine: the field still
+    held the name from an earlier run against another server.
+    """
+    hint = (schema_hint or "").strip().strip('`"')
+    if hint:
+        return hint
+    if db_type == "postgres":
+        return "public"
+    return (database or "").strip()
+
+
 def _list_tables_sync(
     db_type: str,
     host: str,
@@ -1503,7 +1523,7 @@ def _list_tables_sync(
     if db_type == "postgres":
         import psycopg
 
-        schema = (schema_hint or "public").strip() or "public"
+        schema = resolve_table_schema("postgres", schema_hint, database)
         conn = _pg_connect(tls,
             host=host,
             port=port,
@@ -1544,7 +1564,7 @@ def _list_tables_sync(
     # The scope names its own database; the profile's is only the fallback. Everything
     # after the listing (indexes, definitions) reads the schema off the table name, so
     # a bare name from the wrong database would silently restore nothing.
-    schema = (schema_hint or "").strip().strip('`"') or database
+    schema = resolve_table_schema("mysql", schema_hint, database)
     try:
         with conn.cursor() as cur:
             cur.execute(
