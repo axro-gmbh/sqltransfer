@@ -51,7 +51,7 @@ def test_a_hostile_key_never_reaches_the_statement(db_type, key):
 
 @pytest.mark.parametrize("db_type", ["mysql", "postgres"])
 def test_columns_and_json_paths_live_in_one_statement(db_type):
-    plan = TablePlan(table="kunde", targets=(("email", "email", None),), skipped=(),
+    plan = TablePlan(table="kunde", targets=(("email", "email", None, None),), skipped=(),
                      json_targets=(JsonTarget("custom_fields", ("email",), "email"),))
     sql, params = update_statement(plan, db_type, "pepper")
     assert sql.count("SET ") == 1 and "custom_fields" in sql
