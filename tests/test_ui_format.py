@@ -1,24 +1,39 @@
 from __future__ import annotations
 
 from sqltransfer_app.ui import (
+    LogPanel,
     format_duration,
     format_rows,
     format_started_at,
-    infer_log_level,
     truncate,
 )
 
 
-def test_log_level_detects_errors():
-    assert infer_log_level("Swap failed for order_line_item") == "ERROR"
+def _panel() -> LogPanel:
+    return LogPanel(on_copy=lambda _text: None)
 
 
-def test_log_level_detects_warnings():
-    assert infer_log_level("Inbound FK detected, applying fallback") == "WARN"
+def test_a_table_name_cannot_turn_a_line_into_an_error():
+    """The level used to be guessed from the text, and a Shopware installation really
+    has a table called axro_seo_error_log: every line naming it came out red."""
+    log = _panel()
+    log.append("Transferring table: axro_seo_error_log -> temp apx_1")
+    log.append("Source table axro_seo_error_log is empty, destination already empty")
+    log.append("Building 3 index(es) for sales_channel_skip_list")
+    assert [line.split("] [")[1].split("]")[0] for line in log.text.splitlines()] == ["INFO"] * 3
 
 
-def test_log_level_defaults_to_info():
-    assert infer_log_level("Transferring table: sw6.product") == "INFO"
+def test_a_stated_level_is_kept():
+    log = _panel()
+    log.append("Swap failed for order_line_item", "ERROR")
+    log.append("Check constraint not restored on category: chk_x", "WARN")
+    assert [line.split("] [")[1].split("]")[0] for line in log.text.splitlines()] == ["ERROR", "WARN"]
+
+
+def test_replace_passes_its_level_on():
+    log = _panel()
+    log.replace("connect: postgres source: server does not support TLS", "ERROR")
+    assert "[ERROR]" in log.text
 
 
 def test_rows_use_german_thousands_separator():

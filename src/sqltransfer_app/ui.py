@@ -19,19 +19,6 @@ LEVEL_COLORS: dict[str, str] = {
     "ERROR": ft.Colors.ERROR,
 }
 
-_ERROR_MARKERS = ("failed", "error", "exception", "blocked", "could not", "no output table")
-_WARN_MARKERS = ("deferred", "skip", "fallback", "retry", "warning", "inbound fk")
-
-
-def infer_log_level(line: str) -> str:
-    text = line.lower()
-    if any(marker in text for marker in _ERROR_MARKERS):
-        return "ERROR"
-    if any(marker in text for marker in _WARN_MARKERS):
-        return "WARN"
-    return "INFO"
-
-
 def format_rows(rows: int | None) -> str:
     if not rows:
         return "0"
@@ -186,7 +173,9 @@ class LogPanel:
         return "\n".join(self._lines)
 
     def append(self, line: str, level: str | None = None, stamped: bool = True) -> None:
-        final_level = level or infer_log_level(line)
+        # Stated, never guessed: the level used to be read out of the text, and a
+        # table called axro_seo_error_log turned every line naming it into an error.
+        final_level = level or "INFO"
         stamp = datetime.now().strftime("%H:%M:%S")
         rendered = f"[{stamp}] [{final_level}] {line}" if stamped else line
         self._lines.append(rendered)

@@ -925,7 +925,7 @@ async def main(page: ft.Page) -> None:
         )
         set_status(f"Database test: {'ok' if ok else 'failed'}", "ok" if ok else "error")
         set_progress()
-        log.replace(message)
+        log.replace(message, None if ok else "ERROR")
         notify(message, "ok" if ok else "error")
         db_test_form_button.disabled = False
         page.update()
@@ -959,7 +959,7 @@ async def main(page: ft.Page) -> None:
         )
         set_status(f"Tunnel test: {'ok' if ok else 'failed'}", "ok" if ok else "error")
         set_progress()
-        log.replace(message)
+        log.replace(message, None if ok else "ERROR")
         notify(message, "ok" if ok else "error")
         db_test_tunnel_button.disabled = False
         page.update()
@@ -971,7 +971,7 @@ async def main(page: ft.Page) -> None:
         if not key_path.exists():
             ssh_key.error = "File not found"
             set_status("SSH test: failed", "error")
-            log.replace(f"Missing SSH key file: {key_path}")
+            log.replace(f"Missing SSH key file: {key_path}", "ERROR")
             notify_error(f"SSH key file not found: {key_path}")
             page.update()
             return
@@ -1034,7 +1034,7 @@ async def main(page: ft.Page) -> None:
         page.update()
         ok, message = await transfer_service.test_profile_connection(profile)
         set_status(f"{label.capitalize()} test: {'ok' if ok else 'failed'}", "ok" if ok else "error")
-        log.replace(message)
+        log.replace(message, None if ok else "ERROR")
         notify(message, "ok" if ok else "error")
         set_running(False)
         page.update()
