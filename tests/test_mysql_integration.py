@@ -1046,3 +1046,51 @@ def test_an_empty_listing_says_which_schema_it_read(databases):
     ok, tables, message = asyncio.run(service.list_tables(_profile("remote", SRC_DB)))
     assert ok and tables, message
     assert SRC_DB in message, message
+
+
+def test_a_locked_table_fails_the_swap_cleanly(databases):
+    """A RENAME needs an exclusive metadata lock. Anything holding one (the shop, an
+    indexer, an open transaction) makes it wait.
+
+    Measured before the fix: the client gave up after 20 s with error 2013, the app
+    reported "Swap failed" and stopped the run, and the server then carried the rename
+    out anyway, leaving the backup table behind. The log said the opposite of what had
+    happened. The server has to give up first, with a message that names the blocker.
+    """
+    _exec(DST_DB,
+          "CREATE TABLE sperre (id INT PRIMARY KEY)",
+          "INSERT INTO sperre VALUES (1)",
+          "CREATE TABLE sperre_tmp (id INT PRIMARY KEY)",
+          "INSERT INTO sperre_tmp VALUES (2)")
+
+    blocker = pymysql.connect(**_conn_args(), database=DST_DB, autocommit=False)
+    try:
+        with blocker.cursor() as cur:
+            cur.execute("SELECT * FROM sperre")  # holds the metadata lock
+
+        begonnen = time.monotonic()
+        ok, message = asyncio.run(
+            _service().mysql_swap_temp_to_final(
+                _profile("local", DST_DB), temp_table="sperre_tmp", final_table="sperre"
+            )
+        )
+        gedauert = time.monotonic() - begonnen
+
+        assert not ok, "a blocked swap cannot report success"
+        assert "2013" not in message, f"the client must not be the one giving up: {message}"
+        assert "lock" in message.lower(), message
+        assert gedauert < 25, f"gave up after {gedauert:.0f}s"
+    finally:
+        blocker.rollback()
+        blocker.close()
+
+    # The destination keeps its own content, and no backup table is left behind.
+    conn = pymysql.connect(**_conn_args(), database=DST_DB, autocommit=True)
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT id FROM sperre")
+            assert cur.fetchall() == ((1,),), "the swap must not have happened"
+            cur.execute("SHOW TABLES LIKE 'sperre%%'")
+            assert sorted(r[0] for r in cur.fetchall()) == ["sperre", "sperre_tmp"]
+    finally:
+        conn.close()
