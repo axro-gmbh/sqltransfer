@@ -59,6 +59,14 @@ Du brauchst mindestens zwei: eine Quelle und ein Ziel. **Jedes Profil kann beide
 7. **Test connection** meldet sich wirklich an und sagt dir, ob die Verbindung verschlüsselt ist. **Test through tunnel** prüft zusätzlich den Weg über den Sprungserver. Ist das Passwortfeld leer, nimmt der Test das gespeicherte aus dem Schlüsselbund.
 8. **Save**.
 
+### Produktivdatenbanken sperren
+
+Im Dialog eines Datenbankprofils steht das Kästchen **Production database**. Ist es gesetzt, taucht dieses Profil **im Ziel-Feld nicht mehr auf**. Als Quelle bleibt es verfügbar, denn aus Produktion lesen ist der Normalfall.
+
+In der Profilliste trägt es dann den roten Marker **prod**, damit erkennbar ist, warum es im Ziel fehlt. Markierst du ein Profil, das gerade als Ziel ausgewählt war, wird die Auswahl geleert. Und selbst wenn ein markiertes Profil über einen anderen Weg als Ziel ankommt, etwa aus dem Verlauf, bricht der Lauf ab, bevor etwas geschrieben wird.
+
+Die rote Warnung und die Rückfrage für Ziele außerhalb deines Rechners bleiben davon unberührt. Der Schalter nimmt den Fehlklick aus der Reichweite, er ersetzt nicht das Nachdenken.
+
 ### Profile finden, ändern, löschen
 
 Jede Liste hat ein Suchfeld. Es filtert nach Name, Host, Datenbank und Benutzer, auch mit mehreren Wörtern ("prod shop" zeigt nur, was beides enthält). Ab etwa fünf Profilen scrollt die Liste, statt die Seite zu verlängern.

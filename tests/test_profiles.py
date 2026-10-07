@@ -115,3 +115,38 @@ def test_ssh_filter_matches_name_host_and_user():
     assert [p.name for p in filter_ssh_profiles(profiles, "ops")] == ["other"]
     assert [p.name for p in filter_ssh_profiles(profiles, "jump.example.com")] == ["jump"]
     assert len(filter_ssh_profiles(profiles, "")) == 2
+
+
+# --- production marker ------------------------------------------------------
+
+
+def _profile(name: str, host: str = "db.intern", production: bool = False) -> DBProfile:
+    return DBProfile(id=hash(name) % 1000, name=name, db_type="mysql", host=host, port=3306,
+                     database="sw6", username="sw6", is_production=production)
+
+
+def test_a_production_profile_is_no_destination_candidate():
+    """The warning for remote destinations stays; this takes the mis-click out of reach."""
+    from sqltransfer_app.profiles import destination_candidates
+
+    prod = _profile("Shopware Prod", production=True)
+    lokal = _profile("Shopware lokal", host="127.0.0.1")
+    stage = _profile("Shopware Stage")
+
+    namen = [p.name for p in destination_candidates([prod, lokal, stage])]
+    assert namen == ["Shopware lokal", "Shopware Stage"]
+
+
+def test_the_source_list_keeps_production_profiles():
+    """Reading from production is the normal case and stays untouched."""
+    from sqltransfer_app.profiles import destination_candidates
+
+    alle = [_profile("Shopware Prod", production=True), _profile("lokal", host="127.0.0.1")]
+    assert len(alle) == 2 and len(destination_candidates(alle)) == 1
+
+
+def test_the_marker_shows_why_a_profile_is_missing_in_the_destination_list():
+    from sqltransfer_app.profiles import badges
+
+    assert "prod" in badges(_profile("Shopware Prod", production=True))
+    assert "prod" not in badges(_profile("Shopware Stage"))

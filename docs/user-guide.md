@@ -59,6 +59,14 @@ You need at least two: a source and a destination. **Every profile can be both**
 7. **Test connection** really logs in and tells you whether the session is encrypted. **Test through tunnel** additionally checks the path across the jump host. When the password field is empty, the test uses the stored password from the Keychain.
 8. **Save**.
 
+### Locking production databases
+
+A database profile has a **Production database** checkbox. With it set, the profile is **no longer offered in the destination field**. It stays available as a source, because reading from production is the normal case.
+
+The profile list then carries a red **prod** marker, so it is clear why it is missing from the destination list. Marking a profile that was the current destination clears that choice. And if a marked profile reaches the destination by some other route, from the history for instance, the run stops before anything is written.
+
+The red warning and the question for destinations outside your machine are unchanged. The switch takes the mis-click out of reach; it does not replace thinking.
+
 ### Finding, changing and deleting profiles
 
 Each list has a search field. It filters by name, host, database and user, and several words narrow it further ("prod shop" only shows what contains both). From about five profiles on, the list scrolls instead of stretching the page.

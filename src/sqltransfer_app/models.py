@@ -29,6 +29,9 @@ class DBProfile:
     ssh_profile_id: Optional[int] = None
     tls_mode: str = "auto"  # "auto" | "off" | "required" | "verified", see tls.py
     tls_ca_path: Optional[str] = None
+    # A production database is never offered as a destination. The warning for remote
+    # destinations stays either way; this takes the mis-click out of reach.
+    is_production: bool = False
 
 
 @dataclass(slots=True)
