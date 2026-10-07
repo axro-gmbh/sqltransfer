@@ -194,6 +194,8 @@ Nicht eingeholt werden: Trigger, Views, Partitionierung und Spaltenkommentare. *
 
 **Fremdschlüssel werden ebenfalls übernommen**, samt ihrer Regeln wie `ON DELETE CASCADE`. Sie werden erst am Ende des Laufs gesetzt, wenn alle Tabellen da sind, im Protokoll als "Restoring foreign keys". Die vorhandenen Zeilen prüft die App dabei nicht, genau wie ein Datenbank-Import: Tabellen aus einer laufenden Quelle werden Minuten auseinander kopiert und passen deshalb nicht immer auf die Zeile genau zusammen. Fremdschlüssel, die in ein anderes Schema zeigen, übernimmt die App nicht und nennt sie als WARN.
 
+**Wenn der Tausch blockiert ist.** Der Austausch einer Tabelle braucht eine exklusive Sperre auf sie. Läuft gleichzeitig etwas auf der Zieldatenbank (die Anwendung selbst, ein Indexer, eine offene Transaktion in einem SQL-Werkzeug), wartet der Tausch darauf. Nach 15 Sekunden bricht der Server ab, die Tabelle behält ihren alten Inhalt, und das Protokoll nennt die blockierende Verbindung mit Benutzer, Host und Wartezeit. Dann das Störende beenden und diese Tabelle noch einmal übertragen. Am einfachsten: die Anwendung, die auf der Zieldatenbank arbeitet, während der Übertragung nicht laufen lassen.
+
 **Leere Quelltabellen** führen zu einer leeren Zieltabelle: Fehlt sie, wird sie angelegt, hat sie noch alte Zeilen, werden diese entfernt. Beides steht als WARN im Protokoll. Legt die App eine leere Tabelle an, deren Fremdschlüsselziele noch fehlen, setzt sie die Fremdschlüssel in einem zweiten Durchgang am Ende.
 
 **Abbruch bei anderen Zielen als MySQL.** Dort läuft die Übertragung als ein einziger Vorgang. **Cancel** wird vorgemerkt und im Protokoll bestätigt, wirkt aber erst, wenn der laufende Vorgang von sich aus endet.

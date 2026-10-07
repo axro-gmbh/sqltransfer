@@ -194,6 +194,8 @@ Not carried over: triggers, views, partitioning and column comments. **All of th
 
 **Foreign keys are copied too**, including rules such as `ON DELETE CASCADE`. They are created at the end of the run, once every table is there, shown as "Restoring foreign keys" in the log. The existing rows are not checked while doing so, exactly like a database import: tables from a live source are copied minutes apart and therefore do not always match row for row. Foreign keys pointing into another schema are not copied, and the log names them as WARN.
 
+**When the swap is blocked.** Swapping a table in needs an exclusive lock on it. If something is working on the destination at the same time (the application itself, an indexer, an open transaction in a SQL client), the swap waits for it. After 15 seconds the server gives up, the table keeps its previous content, and the log names the blocking connection with user, host and age. Stop whatever that is and run this table again. Simplest: do not keep the application running against the destination while you copy.
+
 **Empty source tables** lead to an empty destination table: if it is missing it gets created, and if it still holds old rows those are removed. Both appear as WARN in the log. If the app creates an empty table whose foreign key targets are still missing, it sets those foreign keys in a second pass at the end.
 
 **Cancelling with destinations other than MySQL.** There the transfer runs as one single operation. **Cancel** is noted and confirmed in the log, but only takes effect once the running operation ends by itself.
