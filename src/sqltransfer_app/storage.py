@@ -9,7 +9,7 @@ from .models import DBProfile, SSHProfile
 
 DB_PROFILE_COLUMNS = (
     "name, db_type, host, port, database_name, username, "
-    "password_secret_key, use_ssh, ssh_profile_id, tls_mode, tls_ca_path"
+    "password_secret_key, use_ssh, ssh_profile_id, tls_mode, tls_ca_path, is_production"
 )
 
 
@@ -63,6 +63,7 @@ class Storage:
                     ssh_profile_id INTEGER,
                     tls_mode TEXT NOT NULL DEFAULT 'auto',
                     tls_ca_path TEXT,
+                    is_production INTEGER NOT NULL DEFAULT 0,
                     FOREIGN KEY (ssh_profile_id) REFERENCES ssh_profiles(id)
                 );
 
@@ -115,6 +116,9 @@ class Storage:
             conn.execute("ALTER TABLE db_profiles ADD COLUMN tls_mode TEXT NOT NULL DEFAULT 'auto'")
         if "tls_ca_path" not in profile_cols:
             conn.execute("ALTER TABLE db_profiles ADD COLUMN tls_ca_path TEXT")
+        if "is_production" not in profile_cols:
+            # Nothing is marked in an existing database; the developer decides which.
+            conn.execute("ALTER TABLE db_profiles ADD COLUMN is_production INTEGER NOT NULL DEFAULT 0")
         if "role" in profile_cols:
             self._drop_role_column(conn)
 
@@ -153,6 +157,7 @@ class Storage:
                 ssh_profile_id INTEGER,
                 tls_mode TEXT NOT NULL DEFAULT 'auto',
                 tls_ca_path TEXT,
+                is_production INTEGER NOT NULL DEFAULT 0,
                 FOREIGN KEY (ssh_profile_id) REFERENCES ssh_profiles(id)
             );
             INSERT INTO db_profiles_rebuilt (id, {DB_PROFILE_COLUMNS})
@@ -258,12 +263,14 @@ class Storage:
             profile.ssh_profile_id,
             profile.tls_mode or "auto",
             profile.tls_ca_path or None,
+            1 if profile.is_production else 0,
         )
         with self._connect() as conn:
             if profile.id is None:
                 try:
                     cur = conn.execute(
-                        f"INSERT INTO db_profiles({DB_PROFILE_COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        f"INSERT INTO db_profiles({DB_PROFILE_COLUMNS}) "
+                        f"VALUES ({', '.join('?' * len(DB_PROFILE_COLUMNS.split(',')))})",
                         values,
                     )
                 except sqlite3.IntegrityError as exc:
@@ -296,6 +303,7 @@ class Storage:
                 ssh_profile_id=r["ssh_profile_id"],
                 tls_mode=r["tls_mode"] or "auto",
                 tls_ca_path=r["tls_ca_path"],
+                is_production=bool(r["is_production"]),
             )
             for r in rows
         ]
@@ -305,7 +313,8 @@ class Storage:
             row = conn.execute(
                 """
                 SELECT id, name, db_type, host, port, database_name, username,
-                       password_secret_key, use_ssh, ssh_profile_id, tls_mode, tls_ca_path
+                       password_secret_key, use_ssh, ssh_profile_id, tls_mode, tls_ca_path,
+                       is_production
                 FROM db_profiles
                 WHERE id = ?
                 """,
@@ -326,6 +335,7 @@ class Storage:
             ssh_profile_id=row["ssh_profile_id"],
             tls_mode=row["tls_mode"] or "auto",
             tls_ca_path=row["tls_ca_path"],
+            is_production=bool(row["is_production"]),
         )
 
     def delete_db_profile(self, profile_id: int) -> None:

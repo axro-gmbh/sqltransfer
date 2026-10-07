@@ -48,9 +48,22 @@ def ssh_label(profile: SSHProfile) -> str:
     return f"{profile.name} ({profile.username}@{profile.host}:{profile.port})"
 
 
+def destination_candidates(profiles: Iterable[DBProfile]) -> list[DBProfile]:
+    """Everything that may be written to: a production profile is left out.
+
+    Reading from production is the normal case, so the source list keeps them. What
+    protects the remaining remote destinations is still the warning and the question
+    before the run; this only takes the mis-click out of reach.
+    """
+    return [p for p in profiles if not p.is_production]
+
+
 def badges(profile: DBProfile) -> tuple[str, ...]:
     """Short markers for a list row: where it points, and what deviates from plain."""
     marks = ["local" if is_local(profile) else "remote"]
+    if profile.is_production:
+        # Says why this profile is missing from the destination list.
+        marks.append("prod")
     if profile.use_ssh:
         marks.append("SSH")
     if profile.tls_mode and profile.tls_mode != "auto":
