@@ -165,3 +165,37 @@ def test_opening_an_already_migrated_database_changes_nothing(tmp_path: Path):
     before = [(p.id, p.name, p.host) for p in Storage(path).list_db_profiles()]
 
     assert [(p.id, p.name, p.host) for p in Storage(path).list_db_profiles()] == before
+
+
+def test_a_production_profile_keeps_its_marker(tmp_path):
+    """Marked profiles are never offered as a destination, so the marker has to last."""
+    store = Storage(tmp_path / "p.db")
+    pid = store.save_db_profile(
+        DBProfile(id=None, name="prod", db_type="mysql", host="db.intern", port=3306,
+                  database="sw6", username="sw6", is_production=True)
+    )
+
+    wieder = {p.id: p for p in Storage(tmp_path / "p.db").list_db_profiles()}
+    assert wieder[pid].is_production is True
+
+    store.save_db_profile(
+        DBProfile(id=pid, name="prod", db_type="mysql", host="db.intern", port=3306,
+                  database="sw6", username="sw6", is_production=False)
+    )
+    assert {p.id: p for p in store.list_db_profiles()}[pid].is_production is False
+
+
+def test_an_old_database_has_no_production_profiles(tmp_path):
+    import sqlite3
+
+    path = tmp_path / "alt.db"
+    Storage(path)
+    with sqlite3.connect(path) as conn:
+        conn.execute("ALTER TABLE db_profiles DROP COLUMN is_production")
+        conn.execute(
+            "INSERT INTO db_profiles(name, db_type, host, port, database_name, username) "
+            "VALUES ('alt', 'mysql', 'h', 3306, 'd', 'u')"
+        )
+
+    profile = [p for p in Storage(path).list_db_profiles() if p.name == "alt"][0]
+    assert profile.is_production is False

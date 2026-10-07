@@ -18,6 +18,7 @@ from .models import DBProfile, SSHProfile, TransferResult
 from .profiles import (
     DestinationWarning,
     badges,
+    destination_candidates,
     destination_warning,
     endpoint_label,
     filter_db_profiles,
@@ -246,6 +247,10 @@ async def main(page: ft.Page) -> None:
         col={"sm": 12, "md": 6},
     )
     db_use_ssh = ft.Checkbox(label="Use SSH tunnel")
+    db_is_production = ft.Checkbox(
+        label="Production database",
+        tooltip="Never offered as a destination. Reading from it stays possible.",
+    )
     db_ssh_profile = ft.Dropdown(label="SSH profile", col={"sm": 12, "md": 6})
     db_tls_mode = ft.Dropdown(
         label="Encryption",
@@ -488,11 +493,14 @@ async def main(page: ft.Page) -> None:
         # Every profile can be either end now; what protects the remote ones is the
         # warning below the destination and the question before the run.
         source_profile.options = profile_options(profiles)
-        destination_profile.options = profile_options(profiles)
-        known = {str(p.id) for p in profiles}
-        for dropdown in (source_profile, destination_profile):
-            if dropdown.value not in known:
-                dropdown.value = None
+        ziele = destination_candidates(profiles)
+        destination_profile.options = profile_options(ziele)
+        if source_profile.value not in {str(p.id) for p in profiles}:
+            source_profile.value = None
+        # A profile marked as production after it was chosen must not stay selected,
+        # or the run would write to something the list no longer offers.
+        if destination_profile.value not in {str(p.id) for p in ziele}:
+            destination_profile.value = None
         shown = filter_db_profiles(profiles, db_search.value)
         db_rows.height = _list_height(len(shown), 5, 56)
         db_rows.controls = [
@@ -768,6 +776,7 @@ async def main(page: ft.Page) -> None:
         db_password.value = ""
         db_password.helper = "Leave empty to keep the stored one" if profile else "Stored in the macOS Keychain"
         db_use_ssh.value = bool(profile.use_ssh) if profile else False
+        db_is_production.value = bool(profile.is_production) if profile else False
         db_ssh_profile.value = str(profile.ssh_profile_id) if (profile and profile.ssh_profile_id) else ""
         sync_tunnel_fields()
         db_tls_mode.value = (profile.tls_mode or "auto") if profile else "auto"
@@ -867,6 +876,7 @@ async def main(page: ft.Page) -> None:
                     ssh_profile_id=int(db_ssh_profile.value) if (db_use_ssh.value and db_ssh_profile.value) else None,
                     tls_mode=db_tls_mode.value or "auto",
                     tls_ca_path=form_ca_path(),
+                    is_production=bool(db_is_production.value),
                 )
             )
             dismiss(saved_dialog)
@@ -923,6 +933,7 @@ async def main(page: ft.Page) -> None:
             password_secret_key=existing.password_secret_key if existing else None,
             tls_mode=db_tls_mode.value or "auto",
             tls_ca_path=form_ca_path(),
+            is_production=bool(db_is_production.value),
         )
 
     async def test_db_form_task() -> None:
@@ -1190,6 +1201,14 @@ async def main(page: ft.Page) -> None:
         if src.id == dst.id:
             notify_error("Source and destination are the same profile")
             set_status("Source and destination are the same profile", "error")
+            page.update()
+            return None
+        if dst.is_production:
+            # The list does not offer it, but a stale selection or a reloaded scope
+            # must not slip through either.
+            message = f"'{dst.name}' is marked as a production database and is never written to"
+            notify_error(message)
+            set_status(message, "error")
             page.update()
             return None
         return src, dst
@@ -2134,7 +2153,8 @@ async def main(page: ft.Page) -> None:
                     size=11,
                     color=ft.Colors.ON_SURFACE_VARIANT,
                 ),
-                ft.Row([db_use_ssh, db_test_form_button, db_test_tunnel_button], spacing=8, wrap=True),
+                ft.Row([db_use_ssh, db_is_production], spacing=16, wrap=True),
+                ft.Row([db_test_form_button, db_test_tunnel_button], spacing=8, wrap=True),
             ],
             db_save_button,
         )

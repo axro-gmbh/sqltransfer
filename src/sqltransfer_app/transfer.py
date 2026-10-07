@@ -1938,6 +1938,35 @@ def _short_backup_name(final_table: str) -> str:
     return f"{trimmed}{suffix}"
 
 
+# How long a RENAME may wait for its exclusive metadata lock. The server enforces it,
+# not the client: when the client gave up first (read_timeout), it reported a failure
+# while the server went on to carry the rename out anyway as soon as the lock came free,
+# leaving the backup table behind and the log saying the opposite of what happened.
+SWAP_LOCK_WAIT_SECONDS = 15
+
+
+def _mysql_lock_holders(cur, database: str) -> str:
+    """Who is holding a transaction open in this database, for the error message."""
+    try:
+        cur.execute(
+            "SELECT p.id, p.user, p.host, p.command, p.time, LEFT(COALESCE(p.info, ''), 60) "
+            "FROM information_schema.innodb_trx t "
+            "JOIN information_schema.processlist p ON p.id = t.trx_mysql_thread_id "
+            "WHERE p.id <> CONNECTION_ID() AND p.db = %s LIMIT 3",
+            (database,),
+        )
+        rows = cur.fetchall()
+    except Exception:  # noqa: BLE001
+        return ""
+    if not rows:
+        return ""
+    wer = "; ".join(
+        f"connection {r[0]} ({r[1]}@{r[2]}, {r[3]}, {r[4]}s{', ' + str(r[5]) if r[5] else ''})"
+        for r in rows
+    )
+    return f" Open transaction(s) in this database: {wer}."
+
+
 def _mysql_swap_table_sync(
     host: str,
     port: int,
@@ -1958,12 +1987,15 @@ def _mysql_swap_table_sync(
         password=password,
         database=database,
         connect_timeout=5,
-        read_timeout=20,
-        write_timeout=20,
+        # Well above the lock wait, so the server decides and the connection survives
+        # to tell us what happened.
+        read_timeout=600,
+        write_timeout=600,
         autocommit=True,
     )
     try:
         with conn.cursor() as cur:
+            cur.execute(f"SET SESSION lock_wait_timeout = {int(SWAP_LOCK_WAIT_SECONDS)}")
             cur.execute(
                 """
                 SELECT COUNT(*)
@@ -1980,7 +2012,18 @@ def _mysql_swap_table_sync(
                     f"RENAME TABLE {_quote_mysql_ident(final_table)} TO {_quote_mysql_ident(backup)}, "
                     f"{_quote_mysql_ident(temp_table)} TO {_quote_mysql_ident(final_table)}"
                 )
-                cur.execute(stmt)
+                try:
+                    cur.execute(stmt)
+                except Exception as exc:  # noqa: BLE001
+                    if "1205" in str(exc) or "lock wait timeout" in str(exc).lower():
+                        raise RuntimeError(
+                            f"{final_table} is locked by another connection, so the swap did not "
+                            f"happen and the table kept its previous content. Stop whatever is "
+                            f"using the destination (a running application, an indexer, an open "
+                            f"transaction) and run this table again."
+                            + _mysql_lock_holders(cur, database)
+                        ) from exc
+                    raise
                 try:
                     cur.execute(f"DROP TABLE {_quote_mysql_ident(backup)}")
                     return f"Swapped {temp_table} -> {final_table} (backup dropped: {backup})"
@@ -1990,9 +2033,18 @@ def _mysql_swap_table_sync(
                         f"drop failed: {drop_exc})"
                     )
 
-            cur.execute(
-                f"RENAME TABLE {_quote_mysql_ident(temp_table)} TO {_quote_mysql_ident(final_table)}"
-            )
+            try:
+                cur.execute(
+                    f"RENAME TABLE {_quote_mysql_ident(temp_table)} TO {_quote_mysql_ident(final_table)}"
+                )
+            except Exception as exc:  # noqa: BLE001
+                if "1205" in str(exc) or "lock wait timeout" in str(exc).lower():
+                    raise RuntimeError(
+                        f"{temp_table} could not be renamed to {final_table}, something holds a "
+                        f"lock on it. Nothing was changed."
+                        + _mysql_lock_holders(cur, database)
+                    ) from exc
+                raise
             return f"Renamed {temp_table} -> {final_table}"
     finally:
         conn.close()

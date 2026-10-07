@@ -59,6 +59,14 @@ Du brauchst mindestens zwei: eine Quelle und ein Ziel. **Jedes Profil kann beide
 7. **Test connection** meldet sich wirklich an und sagt dir, ob die Verbindung verschlüsselt ist. **Test through tunnel** prüft zusätzlich den Weg über den Sprungserver. Ist das Passwortfeld leer, nimmt der Test das gespeicherte aus dem Schlüsselbund.
 8. **Save**.
 
+### Produktivdatenbanken sperren
+
+Im Dialog eines Datenbankprofils steht das Kästchen **Production database**. Ist es gesetzt, taucht dieses Profil **im Ziel-Feld nicht mehr auf**. Als Quelle bleibt es verfügbar, denn aus Produktion lesen ist der Normalfall.
+
+In der Profilliste trägt es dann den roten Marker **prod**, damit erkennbar ist, warum es im Ziel fehlt. Markierst du ein Profil, das gerade als Ziel ausgewählt war, wird die Auswahl geleert. Und selbst wenn ein markiertes Profil über einen anderen Weg als Ziel ankommt, etwa aus dem Verlauf, bricht der Lauf ab, bevor etwas geschrieben wird.
+
+Die rote Warnung und die Rückfrage für Ziele außerhalb deines Rechners bleiben davon unberührt. Der Schalter nimmt den Fehlklick aus der Reichweite, er ersetzt nicht das Nachdenken.
+
 ### Profile finden, ändern, löschen
 
 Jede Liste hat ein Suchfeld. Es filtert nach Name, Host, Datenbank und Benutzer, auch mit mehreren Wörtern ("prod shop" zeigt nur, was beides enthält). Ab etwa fünf Profilen scrollt die Liste, statt die Seite zu verlängern.
@@ -193,6 +201,8 @@ Nicht eingeholt werden: Trigger, Views, Partitionierung und Spaltenkommentare. *
 **Wenn eine Spalte nicht mitkommt.** Tabellen, auf die andere zeigen, werden nicht getauscht, sondern an ihrer Stelle neu gefüllt. Bringt apitap dabei eine Spalte nicht mit, wird die Zeile ohne sie eingefügt und die Spalte behält ihren Standardwert, bei einem nullbaren Fremdschlüssel also NULL in jeder Zeile. Das Protokoll nennt diesen Fall jetzt mit Tabelle und Spalte als WARN. Steht so eine Zeile da, vergleiche die Spalte mit der Quelle, bevor du mit der Kopie arbeitest.
 
 **Fremdschlüssel werden ebenfalls übernommen**, samt ihrer Regeln wie `ON DELETE CASCADE`. Sie werden erst am Ende des Laufs gesetzt, wenn alle Tabellen da sind, im Protokoll als "Restoring foreign keys". Die vorhandenen Zeilen prüft die App dabei nicht, genau wie ein Datenbank-Import: Tabellen aus einer laufenden Quelle werden Minuten auseinander kopiert und passen deshalb nicht immer auf die Zeile genau zusammen. Fremdschlüssel, die in ein anderes Schema zeigen, übernimmt die App nicht und nennt sie als WARN.
+
+**Wenn der Tausch blockiert ist.** Der Austausch einer Tabelle braucht eine exklusive Sperre auf sie. Läuft gleichzeitig etwas auf der Zieldatenbank (die Anwendung selbst, ein Indexer, eine offene Transaktion in einem SQL-Werkzeug), wartet der Tausch darauf. Nach 15 Sekunden bricht der Server ab, die Tabelle behält ihren alten Inhalt, und das Protokoll nennt die blockierende Verbindung mit Benutzer, Host und Wartezeit. Dann das Störende beenden und diese Tabelle noch einmal übertragen. Am einfachsten: die Anwendung, die auf der Zieldatenbank arbeitet, während der Übertragung nicht laufen lassen.
 
 **Leere Quelltabellen** führen zu einer leeren Zieltabelle: Fehlt sie, wird sie angelegt, hat sie noch alte Zeilen, werden diese entfernt. Beides steht als WARN im Protokoll. Legt die App eine leere Tabelle an, deren Fremdschlüsselziele noch fehlen, setzt sie die Fremdschlüssel in einem zweiten Durchgang am Ende.
 

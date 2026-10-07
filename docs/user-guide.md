@@ -59,6 +59,14 @@ You need at least two: a source and a destination. **Every profile can be both**
 7. **Test connection** really logs in and tells you whether the session is encrypted. **Test through tunnel** additionally checks the path across the jump host. When the password field is empty, the test uses the stored password from the Keychain.
 8. **Save**.
 
+### Locking production databases
+
+A database profile has a **Production database** checkbox. With it set, the profile is **no longer offered in the destination field**. It stays available as a source, because reading from production is the normal case.
+
+The profile list then carries a red **prod** marker, so it is clear why it is missing from the destination list. Marking a profile that was the current destination clears that choice. And if a marked profile reaches the destination by some other route, from the history for instance, the run stops before anything is written.
+
+The red warning and the question for destinations outside your machine are unchanged. The switch takes the mis-click out of reach; it does not replace thinking.
+
 ### Finding, changing and deleting profiles
 
 Each list has a search field. It filters by name, host, database and user, and several words narrow it further ("prod shop" only shows what contains both). From about five profiles on, the list scrolls instead of stretching the page.
@@ -193,6 +201,8 @@ Not carried over: triggers, views, partitioning and column comments. **All of th
 **When a column does not come along.** A table other tables point at is not swapped; its rows are replaced in place. If apitap did not bring one of its columns, the row goes in without it and the column keeps its default, which for a nullable foreign key means NULL in every row. The log now names that case with table and column as a WARN. When you see such a line, compare that column against the source before you work with the copy.
 
 **Foreign keys are copied too**, including rules such as `ON DELETE CASCADE`. They are created at the end of the run, once every table is there, shown as "Restoring foreign keys" in the log. The existing rows are not checked while doing so, exactly like a database import: tables from a live source are copied minutes apart and therefore do not always match row for row. Foreign keys pointing into another schema are not copied, and the log names them as WARN.
+
+**When the swap is blocked.** Swapping a table in needs an exclusive lock on it. If something is working on the destination at the same time (the application itself, an indexer, an open transaction in a SQL client), the swap waits for it. After 15 seconds the server gives up, the table keeps its previous content, and the log names the blocking connection with user, host and age. Stop whatever that is and run this table again. Simplest: do not keep the application running against the destination while you copy.
 
 **Empty source tables** lead to an empty destination table: if it is missing it gets created, and if it still holds old rows those are removed. Both appear as WARN in the log. If the app creates an empty table whose foreign key targets are still missing, it sets those foreign keys in a second pass at the end.
 
