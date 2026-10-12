@@ -154,6 +154,10 @@ The **Transfer** section has a switch, **Anonymize personal data**. It is on as 
 
 **JSON is rewritten too.** Columns of type `json` are searched automatically. When the JSON sits in a text column (the normal case in Shopware, `custom_fields` for example), add a rule with the kind **Look inside the JSON**. Your other rules then apply to the **key names**: `*mail*` covers the key `email` just as it covers a column `email`. The structure stays, only values change, and keys without a rule are left alone.
 
+**JSON in a text column is only seen with a rule.** A column of type `json` is searched automatically, a text or longtext column is not: it needs its own rule of kind **Look inside the JSON** on its **column name**. Wildcards help when a table has several of them (`*_data` covers `from_data`, `rma_data` and `to_data`). Which column is meant is what **Preview plan** tells you: it samples a row of every text column without a rule and reports `axro_rma.rma_data looks like JSON but has no rule`.
+
+**Legacy rows that are not JSON cost nothing.** A grown table holds an empty string or truncated text in such a column now and then. Those rows keep their values, the others are rewritten, and the log says how many were left. Only when **no** row holds valid JSON is the column refused, because then the rule sits on the wrong column.
+
 Three limits: values inside **arrays** (`{"positions":[{"email":...}]}`) are reported but not replaced. Nesting is followed to the **fourth level**. And values that are **not strings** (a phone number stored as a number) stay as they are, so the application does not read back a different type. All three appear as WARN in the log.
 
 **See it before it happens:** **Preview plan** lists the affected columns before a single row is copied. After the run the log says what was replaced. Columns that look personal but have no rule appear as WARN, with the reason.

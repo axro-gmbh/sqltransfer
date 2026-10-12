@@ -148,6 +148,10 @@ Im Bereich **Transfer** steht der Schalter **Anonymize personal data**. Er ist a
 
 **Auch in JSON wird ersetzt.** Spalten vom Typ `json` werden automatisch durchsucht. Liegt das JSON in einer Textspalte (bei Shopware der Normalfall, etwa `custom_fields`), legst du dafür eine Regel mit der Art **Look inside the JSON** an. Darin greifen deine übrigen Regeln auf die **Schlüsselnamen**: `*mail*` trifft dann den Schlüssel `email` genauso wie eine Spalte `email`. Die Struktur bleibt, nur die Werte ändern sich, und Schlüssel ohne Regel bleiben unberührt.
 
+**JSON in einer Textspalte sieht die App nur mit Regel.** Eine Spalte vom Typ `json` wird automatisch durchsucht, eine Text- oder Longtext-Spalte nicht: Die braucht eine eigene Regel mit der Art **Look inside the JSON** auf ihren **Spaltennamen**. Platzhalter helfen, wenn eine Tabelle mehrere solcher Spalten hat (`*_data` trifft `from_data`, `rma_data` und `to_data`). Welche Spalte gemeint ist, sagt dir **Preview plan**: Es prüft bei Textspalten ohne Regel eine Zeile und meldet `axro_rma.rma_data looks like JSON but has no rule`.
+
+**Alte Zeilen, die kein JSON sind, kosten nichts.** In gewachsenen Tabellen steht in so einer Spalte auch mal ein leerer String oder abgeschnittener Text. Diese Zeilen bleiben, wie sie sind, die übrigen werden ersetzt, und das Protokoll nennt die Anzahl. Nur wenn in **keiner** Zeile gültiges JSON steht, wird die Spalte abgelehnt, denn dann sitzt die Regel auf der falschen Spalte.
+
 Drei Grenzen dabei: Werte in **Listen** (`{"positionen":[{"email":...}]}`) werden gemeldet, aber nicht ersetzt. Verschachtelung wird bis zur **vierten Ebene** verfolgt. Und Werte, die **keine Zeichenkette** sind (eine Telefonnummer als Zahl), bleiben stehen, damit die Anwendung keinen anderen Typ zurückbekommt. Alle drei Fälle stehen als WARN im Protokoll.
 
 **Nach dem Einspielen: dein Administrator-Konto.** Kopierst du die Tabelle `user` mit, sind danach die Konten der Quelle im Ziel und dein lokales fehlt. Lege es neu an, sonst kommst du nicht mehr in die Administration:

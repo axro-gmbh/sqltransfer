@@ -288,9 +288,20 @@ def _json_assignment(column: str, targets: list["JsonTarget"], db_type: str) -> 
             current = f"JSON_UNQUOTE(JSON_EXTRACT({quoted}, {PATH_TOKEN}))"
             replacement = _replacement(target.kind, current, db_type)
             # JSON_REPLACE touches only paths that exist: a row without the key keeps its value.
-            expression = f"JSON_REPLACE({expression}, {PATH_TOKEN}, {replacement})"
-            path_values += [path, path]
-        return f"{quoted} = {expression}", path_values
+            neu_ausdruck = f"JSON_REPLACE({expression}, {PATH_TOKEN}, {replacement})"
+            # Counted, not assumed: a replacement may embed the read value more than
+            # once (a full name takes first and last name from the same hash), and every
+            # embedding carries the path again. Assuming two cost the parameters their
+            # order and the run died with "coroutine raised StopIteration".
+            path_values += [path] * (neu_ausdruck.count(PATH_TOKEN) - expression.count(PATH_TOKEN))
+            expression = neu_ausdruck
+        # A grown table holds rows that are not JSON at all (an empty string, a
+        # truncated payload). They keep their value; one of them used to cost the
+        # whole column, because the discovery refused it and nothing was rewritten.
+        return (
+            f"{quoted} = CASE WHEN {quoted} IS NULL THEN NULL "
+            f"WHEN NOT JSON_VALID({quoted}) THEN {quoted} ELSE {expression} END"
+        ), path_values
 
     column_type = (targets[0].column_type or "jsonb").lower()
     expression = f"{quoted}::jsonb"
@@ -299,13 +310,18 @@ def _json_assignment(column: str, targets: list["JsonTarget"], db_type: str) -> 
         current = f"({quoted}::jsonb #>> {PATH_TOKEN})"
         replacement = _replacement(target.kind, current, db_type)
         # create_missing = false does what JSON_REPLACE does on the other side.
-        expression = f"jsonb_set({expression}, {PATH_TOKEN}, to_jsonb({replacement}), false)"
-        path_values += [keys, keys]
+        neu_ausdruck = f"jsonb_set({expression}, {PATH_TOKEN}, to_jsonb({replacement}), false)"
+        path_values += [keys] * (neu_ausdruck.count(PATH_TOKEN) - expression.count(PATH_TOKEN))
+        expression = neu_ausdruck
     if column_type == "json":
         expression = f"({expression})::json"
     elif column_type != "jsonb":
         expression = f"({expression})::text"
-    return f"{quoted} = {expression}", path_values
+    return (
+        f"{quoted} = CASE WHEN {quoted} IS NULL THEN NULL "
+        f"WHEN pg_input_is_valid({quoted}::text, 'jsonb') THEN {expression} "
+        f"ELSE {quoted} END"
+    ), path_values
 
 
 def _bind(sql: str, salt: str, path_values: list, keep_values: list | None = None) -> tuple[str, list]:
@@ -391,6 +407,24 @@ def json_path_text(column: str, path: tuple[str, ...]) -> str:
     return column + "$" + "".join('."' + key.replace('"', '""') + '"' for key in path)
 
 
+def json_candidates(columns: Sequence[Column], rules: Sequence[Rule]) -> list[str]:
+    """Text columns that no rule mentions and that might hold JSON.
+
+    A JSON document in a text column needs a rule of kind "json" to be looked into.
+    Without one the column is invisible: its name does not look personal either, so
+    nothing is reported and nothing happens. The preview samples a row of each of these
+    and says which ones really hold JSON.
+    """
+    out: list[str] = []
+    for column in columns:
+        if column.generated or (column.data_type or "").lower() not in TEXT_TYPES:
+            continue
+        if match_rule(column.name, rules) is not None:
+            continue
+        out.append(column.name)
+    return out
+
+
 def plan_json_column(column: str, nodes, rules):
     """Decide per discovered path: rewrite it, descend into it, or report it.
 
@@ -405,8 +439,14 @@ def plan_json_column(column: str, nodes, rules):
         if not node.path:
             # Discovery reports the root when the value is not an object at all.
             if "OBJECT" not in node.types:
-                kind = "array" if "ARRAY" in node.types else "value"
-                skipped.append((column, f"the whole value is an {kind}, not searched"))
+                # Name the type: it decides what to do next, and the old wording
+                # ("an value") dropped exactly that.
+                typen = ", ".join(sorted(t.lower() for t in node.types)) or "unknown"
+                artikel = "an" if typen[0] in "aeiou" else "a"
+                skipped.append((
+                    column,
+                    f"the whole value is {artikel} {typen}, not an object, so no keys were searched",
+                ))
             continue
         if "TOO_DEEP" in node.types:
             skipped.append((text_path, "nested deeper than four levels, not searched"))

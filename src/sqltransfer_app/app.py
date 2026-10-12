@@ -13,7 +13,8 @@ import flet as ft
 
 from . import __version__, ui
 
-from .anonymize import KINDS, JsonTarget, Rule, json_path_text, plan_json_column, plan_table
+from .anonymize import (KINDS, JsonTarget, Rule, json_candidates, json_path_text,
+                        plan_json_column, plan_table)
 from .models import DBProfile, SSHProfile, TransferResult
 from .profiles import (
     DestinationWarning,
@@ -140,22 +141,23 @@ async def main(page: ft.Page) -> None:
                 spacing=8,
             ),
             content=ft.Column(
-                [ft.Text(line, size=13) for line in lines],
+                # The message may carry several lines; an empty one still needs a row.
+                [ft.Text(line, size=13) for line in (message.splitlines() or [message])],
                 spacing=6,
                 tight=True,
                 width=460,
             ),
             actions=[
-                ft.TextButton("Cancel", on_click=lambda _: settle(False)),
+                ft.TextButton("Cancel", on_click=close),
                 ft.FilledButton(
                     confirm_label,
                     icon=ft.Icons.WARNING_AMBER_ROUNDED,
                     style=ft.ButtonStyle(bgcolor=ft.Colors.ERROR, color=ft.Colors.ON_ERROR),
-                    on_click=lambda _: settle(True),
+                    on_click=accept,
                 ),
             ],
             actions_alignment=ft.MainAxisAlignment.END,
-            on_dismiss=lambda _: settle(False),
+            # Dismissing it means no; the dialog is already gone, so nothing to close.
         )
         page.show_dialog(question)
 
@@ -1239,6 +1241,9 @@ async def main(page: ft.Page) -> None:
                 # One unreadable column must not stop a transfer; say so and move on.
                 log.append(f"{label}.{column} was not searched: {message}", "WARN")
                 continue
+            if message:
+                # Rows that are not JSON keep their values; that is worth seeing.
+                log.append(message, "WARN")
             found, skipped_paths, _descend = plan_json_column(column, nodes, rules)
             json_targets += [replace(target, column_type=column_type) for target in found]
             json_skipped += list(skipped_paths)
@@ -1405,9 +1410,27 @@ async def main(page: ft.Page) -> None:
                     if not ok:
                         log.append(f"{table}.{column} could not be searched: {message}", "WARN")
                         continue
+                    if message:
+                        log.append(message, "WARN")
                     found, skipped_paths, _descend = plan_json_column(column, nodes, rules)
                     would += [json_path_text(t.column, t.path) for t in found]
                     reported += list(skipped_paths)
+                # A JSON document in a text column without a rule is invisible: nothing
+                # looks into it, and its name does not look personal either. The preview
+                # is the place to say so, one sampled row per candidate column.
+                kandidaten = json_candidates(columns, rules)
+                if kandidaten:
+                    probe_ok, mit_json, probe_msg = await transfer_service.columns_holding_json(
+                        src, table, kandidaten
+                    )
+                    if not probe_ok:
+                        log.append(f"Could not sample the text columns of {table}: {probe_msg}", "WARN")
+                    for column in mit_json:
+                        log.append(
+                            f"{table}.{column} looks like JSON but has no rule; add a rule with kind "
+                            f"'Look inside the JSON' on '{column}' to include it",
+                            "WARN",
+                        )
                 if would:
                     log.append(f"Would anonymize {table}: " + ", ".join(would))
                 for column, reason in reported:
