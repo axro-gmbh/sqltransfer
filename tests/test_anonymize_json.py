@@ -71,7 +71,9 @@ def test_a_json_rule_never_applies_to_a_key():
 def test_a_root_that_is_not_an_object_is_reported():
     targets, skipped, _d = plan_json_column("daten", [_node((), "ARRAY")], RULES)
     assert targets == ()
-    assert skipped == (("daten", "the whole value is an array, not searched"),)
+    assert skipped == (
+        ("daten", "the whole value is an array, not an object, so no keys were searched"),
+    )
 
 
 def test_a_node_the_discovery_stopped_at_is_reported():
@@ -82,3 +84,36 @@ def test_a_node_the_discovery_stopped_at_is_reported():
 def test_a_key_the_database_could_not_return_is_reported():
     _t, skipped, _d = plan_json_column("daten", [_node(("x", "?"), "UNREADABLE")], RULES)
     assert skipped == (('daten$."x"."?"', "key could not be read"),)
+
+
+def test_a_root_that_is_not_an_object_names_its_type():
+    """The message used to say "the whole value is an value", dropping the one fact
+    that mattered: what the value actually is. Seen on axro_rma.rma_data with 25088
+    rows, where the type decides what the developer has to do next."""
+    from sqltransfer_app.anonymize import JsonNode, Rule, plan_json_column
+
+    regeln = [Rule(id=1, pattern="*mail*", kind="email")]
+    for typen, erwartet in (
+        (frozenset({"STRING"}), "string"),
+        (frozenset({"ARRAY"}), "array"),
+        (frozenset({"INTEGER"}), "integer"),
+        (frozenset({"NULL"}), "null"),
+    ):
+        _found, skipped, _descend = plan_json_column(
+            "rma_data", [JsonNode(path=(), types=typen)], regeln
+        )
+        assert skipped, typen
+        grund = skipped[0][1]
+        assert erwartet in grund, f"{typen} -> {grund}"
+        assert "an value" not in grund, grund
+
+
+def test_a_root_of_mixed_types_names_them_all():
+    from sqltransfer_app.anonymize import JsonNode, Rule, plan_json_column
+
+    _found, skipped, _descend = plan_json_column(
+        "rma_data", [JsonNode(path=(), types=frozenset({"STRING", "INTEGER"}))],
+        [Rule(id=1, pattern="*mail*", kind="email")],
+    )
+    grund = skipped[0][1]
+    assert "integer" in grund and "string" in grund, grund

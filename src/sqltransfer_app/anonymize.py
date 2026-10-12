@@ -439,8 +439,14 @@ def plan_json_column(column: str, nodes, rules):
         if not node.path:
             # Discovery reports the root when the value is not an object at all.
             if "OBJECT" not in node.types:
-                kind = "array" if "ARRAY" in node.types else "value"
-                skipped.append((column, f"the whole value is an {kind}, not searched"))
+                # Name the type: it decides what to do next, and the old wording
+                # ("an value") dropped exactly that.
+                typen = ", ".join(sorted(t.lower() for t in node.types)) or "unknown"
+                artikel = "an" if typen[0] in "aeiou" else "a"
+                skipped.append((
+                    column,
+                    f"the whole value is {artikel} {typen}, not an object, so no keys were searched",
+                ))
             continue
         if "TOO_DEEP" in node.types:
             skipped.append((text_path, "nested deeper than four levels, not searched"))
