@@ -141,22 +141,23 @@ async def main(page: ft.Page) -> None:
                 spacing=8,
             ),
             content=ft.Column(
-                [ft.Text(line, size=13) for line in lines],
+                # The message may carry several lines; an empty one still needs a row.
+                [ft.Text(line, size=13) for line in (message.splitlines() or [message])],
                 spacing=6,
                 tight=True,
                 width=460,
             ),
             actions=[
-                ft.TextButton("Cancel", on_click=lambda _: settle(False)),
+                ft.TextButton("Cancel", on_click=close),
                 ft.FilledButton(
                     confirm_label,
                     icon=ft.Icons.WARNING_AMBER_ROUNDED,
                     style=ft.ButtonStyle(bgcolor=ft.Colors.ERROR, color=ft.Colors.ON_ERROR),
-                    on_click=lambda _: settle(True),
+                    on_click=accept,
                 ),
             ],
             actions_alignment=ft.MainAxisAlignment.END,
-            on_dismiss=lambda _: settle(False),
+            # Dismissing it means no; the dialog is already gone, so nothing to close.
         )
         page.show_dialog(question)
 
