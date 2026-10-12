@@ -261,6 +261,27 @@ def json_text_value(value: object) -> str:
     return str(value)
 
 
+# What JSON_TYPE can answer, on both servers. MariaDB 10.6.11 cuts the answer to four
+# characters as soon as the query uses DISTINCT ("OBJE"), which made a column of
+# objects look like a scalar and hid every nested object. The queries ask for a CAST
+# now; this list is the belt for a server that still cuts.
+_JSON_TYPE_NAMES = (
+    "OBJECT", "ARRAY", "STRING", "INTEGER", "DOUBLE", "DECIMAL", "BOOLEAN", "NULL",
+    "DATETIME", "DATE", "TIME", "TIMESTAMP", "BLOB", "BIT", "OPAQUE", "UNSIGNED INTEGER",
+)
+
+
+def canonical_json_type(value: object) -> str:
+    """The JSON type by name, whole again even when the server cut it short."""
+    raw = json_text_value(value).upper().strip()
+    if not raw or raw == "NULL":
+        return "NULL"
+    for name in _JSON_TYPE_NAMES:
+        if name == raw or (len(raw) >= 3 and name.startswith(raw)):
+            return name
+    return raw
+
+
 def _json_paths_sync(
     host: str,
     port: int,
@@ -319,7 +340,7 @@ def _json_paths_sync(
             # quietly yielding no keys at all.
             if db_type == "mysql":
                 cur.execute(
-                    f"SELECT DISTINCT JSON_TYPE({quoted_column}) FROM {quoted_table} "
+                    f"SELECT DISTINCT CAST(JSON_TYPE({quoted_column}) AS CHAR(16)) FROM {quoted_table} "
                     f"WHERE {quoted_column} IS NOT NULL AND {valid}"
                 )
             else:
@@ -327,7 +348,7 @@ def _json_paths_sync(
                     f"SELECT DISTINCT jsonb_typeof({quoted_column}::jsonb) FROM {quoted_table} "
                     f"WHERE {quoted_column} IS NOT NULL AND {valid}"
                 )
-            root_types = {json_text_value(row[0]).upper() for row in cur.fetchall()}
+            root_types = {canonical_json_type(row[0]) for row in cur.fetchall()}
             if root_types and "OBJECT" not in root_types:
                 return [JsonNode(path=(), types=frozenset(root_types))], invalid_rows
 
@@ -345,8 +366,8 @@ def _json_paths_sync(
                             branches.append(
                                 f"SELECT DISTINCT {index} AS parent_index, "
                                 f"CAST(jt.k AS CHAR CHARACTER SET utf8mb4) COLLATE utf8mb4_bin AS k, "
-                                f"JSON_TYPE(JSON_EXTRACT(t.{quoted_column}, CONCAT(%s, '.\"', "
-                                f"{_MYSQL_KEY_ESCAPE}, '\"'))) AS t "
+                                f"CAST(JSON_TYPE(JSON_EXTRACT(t.{quoted_column}, CONCAT(%s, '.\"', "
+                                f"{_MYSQL_KEY_ESCAPE}, '\"'))) AS CHAR(16)) AS t "
                                 f"FROM {quoted_table} t, JSON_TABLE(JSON_KEYS(t.{quoted_column}, %s), "
                                 f"'$[*]' COLUMNS (k VARCHAR(1024) CHARACTER SET utf8mb4 "
                                 f"COLLATE utf8mb4_bin PATH '$')) jt WHERE t.{quoted_column} IS NOT NULL AND {valid_t}"
@@ -369,7 +390,7 @@ def _json_paths_sync(
                             seen.setdefault((*parent, "?"), set()).add("UNREADABLE")
                             continue
                         seen.setdefault((*parent, json_text_value(key)), set()).add(
-                            json_text_value(json_type).upper()
+                            canonical_json_type(json_type)
                         )
 
                 for path, types in seen.items():

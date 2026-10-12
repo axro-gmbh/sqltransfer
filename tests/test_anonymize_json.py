@@ -133,3 +133,26 @@ def test_a_driver_that_returns_bytes_is_decoded():
     assert json_text_value(None) == "NULL"
     # A key name with umlauts survives, bytes or not.
     assert json_text_value("straße".encode()) == "straße"
+
+
+def test_a_truncated_json_type_is_still_understood():
+    """MariaDB 10.6.11 truncates JSON_TYPE to four characters under DISTINCT.
+
+    'OBJE' instead of 'OBJECT' made the root check fail and nested objects invisible,
+    so a column of 25088 objects was reported as "the whole value is an value". The
+    query asks for a CAST now; this is the belt for a server that still cuts.
+    """
+    from sqltransfer_app.transfer import canonical_json_type
+
+    assert canonical_json_type("OBJE") == "OBJECT"
+    assert canonical_json_type("OBJECT") == "OBJECT"
+    assert canonical_json_type("ARRA") == "ARRAY"
+    assert canonical_json_type("STRI") == "STRING"
+    assert canonical_json_type("INTE") == "INTEGER"
+    assert canonical_json_type("DOUB") == "DOUBLE"
+    assert canonical_json_type("BOOL") == "BOOLEAN"
+    assert canonical_json_type("NULL") == "NULL"
+    assert canonical_json_type(b"OBJE") == "OBJECT"
+    assert canonical_json_type(None) == "NULL"
+    # Something nobody expected stays as it is, rather than becoming a wrong type.
+    assert canonical_json_type("WHAT") == "WHAT"

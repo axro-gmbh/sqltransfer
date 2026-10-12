@@ -104,8 +104,13 @@ python -m pytest -q
 ```
 
 The window takes 15 to 20 seconds on first start. Integration tests against real MySQL,
-PostgreSQL and SSH servers are skipped unless their environment variable is set; each test file
-explains how to start a disposable server for it.
+MariaDB, PostgreSQL and SSH servers are skipped unless their environment variable is set; each
+test file explains how to start a disposable server for it.
+
+MariaDB has its own lane because it answers differently from MySQL where it matters: 10.6.11
+cuts `JSON_TYPE` to four characters under `DISTINCT`, which made a column full of JSON objects
+look like a scalar and hid every nested object. Destinations in the team run MariaDB, so that
+lane is not optional in spirit, only in setup.
 
 ### Build and release
 
