@@ -117,3 +117,19 @@ def test_a_root_of_mixed_types_names_them_all():
     )
     grund = skipped[0][1]
     assert "integer" in grund and "string" in grund, grund
+
+
+def test_a_driver_that_returns_bytes_is_decoded():
+    """MariaDB handed JSON_TYPE back as bytes, and str(b'OBJECT') is "b'OBJECT'".
+
+    The root check then found no OBJECT, bailed out, and the message said "the whole
+    value is an value" for a column that holds 25088 perfectly good objects.
+    """
+    from sqltransfer_app.transfer import json_text_value
+
+    assert json_text_value(b"OBJECT") == "OBJECT"
+    assert json_text_value(bytearray(b"ARRAY")) == "ARRAY"
+    assert json_text_value("OBJECT") == "OBJECT"
+    assert json_text_value(None) == "NULL"
+    # A key name with umlauts survives, bytes or not.
+    assert json_text_value("straße".encode()) == "straße"

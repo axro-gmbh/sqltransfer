@@ -1110,3 +1110,39 @@ def test_a_text_column_full_of_json_without_a_rule_is_sampled(databases):
     )
     assert ok, message
     assert mit_json == ["rma_data"], mit_json
+
+
+def test_json_paths_survive_a_driver_that_answers_in_bytes(databases, monkeypatch):
+    """Real case on a MariaDB destination: JSON_TYPE came back as b'OBJECT'.
+
+    str(b"OBJECT") is "b'OBJECT'", so the root check found no object, gave up, and the
+    log said "the whole value is an value" for a column holding 25088 objects. The
+    connection here answers in bytes on purpose, like that server did.
+    """
+    from sqltransfer_app import transfer as transfer_module
+
+    _exec(DST_DB, "DROP TABLE IF EXISTS rma_bytes",
+          "CREATE TABLE rma_bytes (id INT PRIMARY KEY, "
+          "rma_data LONGTEXT COLLATE utf8mb4_bin NOT NULL CHECK (json_valid(`rma_data`)))",
+          """INSERT INTO rma_bytes VALUES
+             (1, '{"Rma":{"email":"mmayar@axro.de","contact":"Muhammed Mayar"}}'),
+             (2, '{"Rma":{"email":"nancy@muchocartucho.es","contact":"nancy"}}')""")
+
+    echt = transfer_module._mysql_connect
+
+    def binary_results(tls, **kwargs):
+        conn = echt(tls, **kwargs)
+        with conn.cursor() as cur:
+            cur.execute("SET SESSION character_set_results = binary")
+        return conn
+
+    monkeypatch.setattr(transfer_module, "_mysql_connect", binary_results)
+
+    ok, nodes, message = asyncio.run(
+        _service().json_paths(_profile("local", DST_DB), "rma_bytes", "rma_data")
+    )
+    assert ok, message
+    pfade = [n.path for n in nodes]
+    assert ("Rma", "email") in pfade, pfade
+    assert ("Rma", "contact") in pfade, pfade
+    assert () not in pfade, "the root must not be reported as a non-object"

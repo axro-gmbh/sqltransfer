@@ -246,6 +246,21 @@ def _columns_holding_json_sync(
     return found
 
 
+def json_text_value(value: object) -> str:
+    """A text value from the driver, whatever it hands back.
+
+    MariaDB returned JSON_TYPE as bytes, and str(b"OBJECT") is "b'OBJECT'". The root
+    check then found no OBJECT, gave up, and reported "the whole value is an value" for
+    a column holding 25088 objects. Key names come back the same way, so they are
+    decoded here too.
+    """
+    if value is None:
+        return "NULL"
+    if isinstance(value, (bytes, bytearray)):
+        return bytes(value).decode("utf-8", "replace")
+    return str(value)
+
+
 def _json_paths_sync(
     host: str,
     port: int,
@@ -312,7 +327,7 @@ def _json_paths_sync(
                     f"SELECT DISTINCT jsonb_typeof({quoted_column}::jsonb) FROM {quoted_table} "
                     f"WHERE {quoted_column} IS NOT NULL AND {valid}"
                 )
-            root_types = {str(row[0] or "NULL").upper() for row in cur.fetchall()}
+            root_types = {json_text_value(row[0]).upper() for row in cur.fetchall()}
             if root_types and "OBJECT" not in root_types:
                 return [JsonNode(path=(), types=frozenset(root_types))], invalid_rows
 
@@ -353,7 +368,9 @@ def _json_paths_sync(
                         if key is None:
                             seen.setdefault((*parent, "?"), set()).add("UNREADABLE")
                             continue
-                        seen.setdefault((*parent, str(key)), set()).add(str(json_type or "NULL").upper())
+                        seen.setdefault((*parent, json_text_value(key)), set()).add(
+                            json_text_value(json_type).upper()
+                        )
 
                 for path, types in seen.items():
                     nodes.append(JsonNode(path=path, types=frozenset(types)))
