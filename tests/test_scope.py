@@ -80,3 +80,35 @@ def test_postgresql_falls_back_to_public():
 
     assert resolve_table_schema("postgres", None, "ediapi") == "public"
     assert resolve_table_schema("postgres", "sales", "ediapi") == "sales"
+
+
+# --- text columns that hold JSON but have no rule ---------------------------
+
+
+def test_a_text_column_without_a_rule_is_named_as_a_json_candidate():
+    """Real case: axro_rma.rma_data is a LONGTEXT full of JSON. Without a rule of kind
+    "Look inside the JSON" the app never looked into it and said nothing either, because
+    the column name does not look personal."""
+    from sqltransfer_app.anonymize import Column, Rule
+    from sqltransfer_app.anonymize import json_candidates
+
+    spalten = [Column("id", "int"), Column("rma_data", "longtext"), Column("notiz", "text"),
+               Column("custom_fields", "json")]
+    regeln = [Rule(id=1, pattern="*mail*", kind="email")]
+
+    # Nothing is sampled here; the function only says which columns are worth a look.
+    assert json_candidates(spalten, regeln) == ["rma_data", "notiz"]
+
+
+def test_a_column_that_already_has_a_json_rule_is_no_candidate():
+    from sqltransfer_app.anonymize import Column, Rule, json_candidates
+
+    spalten = [Column("rma_data", "longtext")]
+    assert json_candidates(spalten, [Rule(id=1, pattern="rma_data", kind="json")]) == []
+
+
+def test_a_column_with_another_rule_is_no_candidate():
+    from sqltransfer_app.anonymize import Column, Rule, json_candidates
+
+    spalten = [Column("email", "varchar")]
+    assert json_candidates(spalten, [Rule(id=1, pattern="*mail*", kind="email")]) == []

@@ -11,7 +11,9 @@ def _plan(*json_targets: JsonTarget, table: str = "kunde") -> TablePlan:
 
 def test_mysql_passes_the_path_as_a_parameter():
     sql, params = update_statement(_plan(JsonTarget("custom_fields", ("email",), "email")), "mysql", "s")
-    assert sql.startswith("UPDATE `kunde` SET `custom_fields` = JSON_REPLACE(`custom_fields`, %s,")
+    # The assignment is wrapped in the validity guard, the rewriting itself is unchanged.
+    assert sql.startswith("UPDATE `kunde` SET `custom_fields` = CASE WHEN")
+    assert "JSON_REPLACE(`custom_fields`, %s," in sql
     assert "JSON_UNQUOTE(JSON_EXTRACT(`custom_fields`, %s))" in sql
     assert '$."email"' not in sql                      # the path is data, not text
     assert params.count('$."email"') == 2
@@ -66,10 +68,12 @@ def test_postgres_casts_back_to_the_column_type(column_type, expected):
         _plan(JsonTarget("custom_fields", ("email",), "email", column_type)), "postgres", "s"
     )
     assert '"custom_fields"::jsonb' in sql
+    # The cast sits on the rewriting branch of the guard, not at the end of the statement.
+    zweig = sql.split("THEN ")[-2] if "THEN " in sql else sql
     if expected:
-        assert sql.rstrip().endswith(expected)
+        assert f"{expected} ELSE" in sql, sql
     else:
-        assert not sql.rstrip().endswith("::text") and not sql.rstrip().endswith("::json")
+        assert "::text ELSE" not in sql and "::json ELSE" not in sql, sql
 
 
 def test_mysql_needs_no_cast():
@@ -77,3 +81,21 @@ def test_mysql_needs_no_cast():
         _plan(JsonTarget("custom_fields", ("email",), "email", "longtext")), "mysql", "s"
     )
     assert "::" not in sql
+
+
+@pytest.mark.parametrize("db_type", ["mysql", "postgres"])
+def test_a_row_that_is_not_valid_json_keeps_its_value(db_type):
+    """A grown table holds legacy rows: an empty string, a truncated payload.
+
+    One of them used to cost the whole column: the discovery refused it and nothing in
+    that column was anonymized. The valid rows have to be rewritten and the others left
+    exactly as they are.
+    """
+    plan = TablePlan(table="axro_rma", targets=(), skipped=(),
+                     json_targets=(JsonTarget("rma_data", ("Rma", "email"), "email", "longtext"),))
+    sql, _params = update_statement(plan, db_type, "pepper")
+
+    pruefung = "JSON_VALID" if db_type == "mysql" else "pg_input_is_valid"
+    assert pruefung in sql, sql
+    # The column keeps its own value where the check fails.
+    assert "CASE WHEN" in sql and "END" in sql, sql

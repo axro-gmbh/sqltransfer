@@ -290,7 +290,13 @@ def _json_assignment(column: str, targets: list["JsonTarget"], db_type: str) -> 
             # JSON_REPLACE touches only paths that exist: a row without the key keeps its value.
             expression = f"JSON_REPLACE({expression}, {PATH_TOKEN}, {replacement})"
             path_values += [path, path]
-        return f"{quoted} = {expression}", path_values
+        # A grown table holds rows that are not JSON at all (an empty string, a
+        # truncated payload). They keep their value; one of them used to cost the
+        # whole column, because the discovery refused it and nothing was rewritten.
+        return (
+            f"{quoted} = CASE WHEN {quoted} IS NULL THEN NULL "
+            f"WHEN NOT JSON_VALID({quoted}) THEN {quoted} ELSE {expression} END"
+        ), path_values
 
     column_type = (targets[0].column_type or "jsonb").lower()
     expression = f"{quoted}::jsonb"
@@ -305,7 +311,11 @@ def _json_assignment(column: str, targets: list["JsonTarget"], db_type: str) -> 
         expression = f"({expression})::json"
     elif column_type != "jsonb":
         expression = f"({expression})::text"
-    return f"{quoted} = {expression}", path_values
+    return (
+        f"{quoted} = CASE WHEN {quoted} IS NULL THEN NULL "
+        f"WHEN pg_input_is_valid({quoted}::text, 'jsonb') THEN {expression} "
+        f"ELSE {quoted} END"
+    ), path_values
 
 
 def _bind(sql: str, salt: str, path_values: list, keep_values: list | None = None) -> tuple[str, list]:
@@ -389,6 +399,24 @@ class JsonTarget:
 def json_path_text(column: str, path: tuple[str, ...]) -> str:
     """How a path is written in the log and in MySQL: column$."a"."b"."""
     return column + "$" + "".join('."' + key.replace('"', '""') + '"' for key in path)
+
+
+def json_candidates(columns: Sequence[Column], rules: Sequence[Rule]) -> list[str]:
+    """Text columns that no rule mentions and that might hold JSON.
+
+    A JSON document in a text column needs a rule of kind "json" to be looked into.
+    Without one the column is invisible: its name does not look personal either, so
+    nothing is reported and nothing happens. The preview samples a row of each of these
+    and says which ones really hold JSON.
+    """
+    out: list[str] = []
+    for column in columns:
+        if column.generated or (column.data_type or "").lower() not in TEXT_TYPES:
+            continue
+        if match_rule(column.name, rules) is not None:
+            continue
+        out.append(column.name)
+    return out
 
 
 def plan_json_column(column: str, nodes, rules):

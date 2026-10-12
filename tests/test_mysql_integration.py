@@ -1094,3 +1094,19 @@ def test_a_locked_table_fails_the_swap_cleanly(databases):
             assert sorted(r[0] for r in cur.fetchall()) == ["sperre", "sperre_tmp"]
     finally:
         conn.close()
+
+
+def test_a_text_column_full_of_json_without_a_rule_is_sampled(databases):
+    """What the preview uses to name the column the user is looking for."""
+    _exec(DST_DB, "DROP TABLE IF EXISTS axro_rma",
+          "CREATE TABLE axro_rma (id INT PRIMARY KEY, rma_data LONGTEXT, notiz TEXT, leer TEXT)",
+          """INSERT INTO axro_rma VALUES
+             (1, '{"Rma":{"email":"n@x.es"}}', 'das ist kein json', NULL),
+             (2, '{"Rma":{"email":"m@x.es"}}', 'prosa', '')""")
+
+    ok, mit_json, message = asyncio.run(
+        _service().columns_holding_json(_profile("local", DST_DB), "axro_rma",
+                                        ["rma_data", "notiz", "leer"])
+    )
+    assert ok, message
+    assert mit_json == ["rma_data"], mit_json

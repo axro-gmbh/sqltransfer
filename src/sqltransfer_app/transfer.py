@@ -199,6 +199,53 @@ _JSON_LEVEL_BATCH = 25  # parents per discovery statement
 _MYSQL_KEY_ESCAPE = r"""REPLACE(REPLACE(jt.k, '\\', '\\\\'), '"', '\\"')"""
 
 
+def _columns_holding_json_sync(
+    host: str,
+    port: int,
+    database: str,
+    username: str,
+    password: str,
+    db_type: str,
+    table: str,
+    columns: list[str],
+    *,
+    tls: TlsSettings,
+) -> list[str]:
+    """One query over one row per column: which of them parse as a JSON object or array."""
+    if db_type == "mysql":
+        conn = _mysql_connect(tls, host=host, port=port, user=username, password=password,
+                              database=database, connect_timeout=5, read_timeout=60, autocommit=True)
+    else:
+        conn = _pg_connect(tls, host=host, port=port, user=username, password=password,
+                           dbname=database, connect_timeout=5, autocommit=True)
+    quote = _quote_mysql_ident if db_type == "mysql" else _quote_pg_ident
+    quoted_table = ".".join(quote(part.strip('`"')) for part in table.split("."))
+    found: list[str] = []
+    try:
+        with conn.cursor() as cur:
+            for column in columns:
+                quoted = quote(column)
+                if db_type == "mysql":
+                    pruefung = f"JSON_VALID({quoted}) AND JSON_TYPE({quoted}) IN ('OBJECT', 'ARRAY')"
+                else:
+                    pruefung = (
+                        f"pg_input_is_valid({quoted}::text, 'jsonb') "
+                        f"AND jsonb_typeof({quoted}::jsonb) IN ('object', 'array')"
+                    )
+                try:
+                    cur.execute(
+                        f"SELECT 1 FROM {quoted_table} WHERE {quoted} IS NOT NULL AND {quoted} <> '' "
+                        f"AND {pruefung} LIMIT 1"
+                    )
+                except Exception:  # noqa: BLE001
+                    continue  # a column the server will not test this way is simply not reported
+                if cur.fetchone():
+                    found.append(column)
+    finally:
+        conn.close()
+    return found
+
+
 def _json_paths_sync(
     host: str,
     port: int,
@@ -211,7 +258,7 @@ def _json_paths_sync(
     max_depth: int,
     *,
     tls: TlsSettings,
-) -> list[Column]:
+) -> tuple[list[JsonNode], int]:
     """Discover the key paths of a JSON column, one query per level over all rows.
 
     Returns JsonNode-shaped data: every path seen, with every JSON type observed for
@@ -226,39 +273,48 @@ def _json_paths_sync(
     quote = _quote_mysql_ident if db_type == "mysql" else _quote_pg_ident
     quoted_table = ".".join(quote(part.strip('`"')) for part in table.split("."))
     quoted_column = quote(column)
+    # A grown table holds rows that are not JSON (an empty string, a truncated payload).
+    # They are left out of the search and keep their value; one of them used to cost the
+    # whole column, so nothing in it was ever anonymized.
+    if db_type == "mysql":
+        valid = f"JSON_VALID({quoted_column})"
+        valid_t = f"JSON_VALID(t.{quoted_column})"
+    else:
+        valid = f"pg_input_is_valid({quoted_column}::text, 'jsonb')"
+        valid_t = f"pg_input_is_valid(t.{quoted_column}::text, 'jsonb')"
     nodes: list[JsonNode] = []
+    invalid_rows = 0
     try:
         with conn.cursor() as cur:
-            if db_type == "mysql":
-                cur.execute(
-                    f"SELECT COUNT(*) FROM {quoted_table} WHERE {quoted_column} IS NOT NULL "
-                    f"AND NOT JSON_VALID({quoted_column})"
-                )
-                if int(cur.fetchone()[0]):
-                    raise ValueError(f"{table}.{column} does not hold valid JSON in every row")
-            else:
-                cur.execute(
-                    f"SELECT COUNT(*) FROM {quoted_table} WHERE {quoted_column} IS NOT NULL "
-                    f"AND pg_input_is_valid({quoted_column}::text, 'jsonb') IS NOT TRUE"
-                )
-                if int(cur.fetchone()[0]):
-                    raise ValueError(f"{table}.{column} does not hold valid JSON in every row")
+            cur.execute(
+                f"SELECT SUM(NOT {valid}), SUM({valid}) FROM {quoted_table} "
+                f"WHERE {quoted_column} IS NOT NULL"
+                if db_type == "mysql" else
+                f"SELECT COUNT(*) FILTER (WHERE NOT {valid}), COUNT(*) FILTER (WHERE {valid}) "
+                f"FROM {quoted_table} WHERE {quoted_column} IS NOT NULL"
+            )
+            schlecht, gut = cur.fetchone()
+            invalid_rows = int(schlecht or 0)
+            if invalid_rows and not int(gut or 0):
+                # Not a single row is JSON: the rule is on the wrong column, and saying
+                # so is more use than a note about skipped rows.
+                raise ValueError(f"{table}.{column} does not hold valid JSON in any row")
 
             # What the whole value is: an array or a scalar is reported rather than
             # quietly yielding no keys at all.
             if db_type == "mysql":
                 cur.execute(
                     f"SELECT DISTINCT JSON_TYPE({quoted_column}) FROM {quoted_table} "
-                    f"WHERE {quoted_column} IS NOT NULL"
+                    f"WHERE {quoted_column} IS NOT NULL AND {valid}"
                 )
             else:
                 cur.execute(
                     f"SELECT DISTINCT jsonb_typeof({quoted_column}::jsonb) FROM {quoted_table} "
-                    f"WHERE {quoted_column} IS NOT NULL"
+                    f"WHERE {quoted_column} IS NOT NULL AND {valid}"
                 )
             root_types = {str(row[0] or "NULL").upper() for row in cur.fetchall()}
             if root_types and "OBJECT" not in root_types:
-                return [JsonNode(path=(), types=frozenset(root_types))]
+                return [JsonNode(path=(), types=frozenset(root_types))], invalid_rows
 
             parents: list[tuple[str, ...]] = [()]
             for _depth in range(max_depth):
@@ -278,7 +334,7 @@ def _json_paths_sync(
                                 f"{_MYSQL_KEY_ESCAPE}, '\"'))) AS t "
                                 f"FROM {quoted_table} t, JSON_TABLE(JSON_KEYS(t.{quoted_column}, %s), "
                                 f"'$[*]' COLUMNS (k VARCHAR(1024) CHARACTER SET utf8mb4 "
-                                f"COLLATE utf8mb4_bin PATH '$')) jt WHERE t.{quoted_column} IS NOT NULL"
+                                f"COLLATE utf8mb4_bin PATH '$')) jt WHERE t.{quoted_column} IS NOT NULL AND {valid_t}"
                             )
                             args += [mysql_json_path(parent), mysql_json_path(parent)]
                         else:
@@ -287,7 +343,7 @@ def _json_paths_sync(
                                 f"SELECT DISTINCT {index} AS parent_index, k, "
                                 f"jsonb_typeof(({at_parent}) -> k) AS t "
                                 f"FROM {quoted_table} t, LATERAL jsonb_object_keys({at_parent}) k "
-                                f"WHERE t.{quoted_column} IS NOT NULL "
+                                f"WHERE t.{quoted_column} IS NOT NULL AND {valid_t} "
                                 f"AND jsonb_typeof({at_parent}) = 'object'"
                             )
                             args += [list(parent)] * (3 if parent else 0)
@@ -311,7 +367,7 @@ def _json_paths_sync(
                 nodes.append(JsonNode(path=parent, types=frozenset({"TOO_DEEP"})))
     finally:
         conn.close()
-    return nodes
+    return nodes, invalid_rows
 
 
 _MYSQL_ESCAPES = {"0": "\0", "n": "\n", "r": "\r", "t": "\t", "b": "\b",
@@ -1448,13 +1504,42 @@ class TransferService:
             if endpoint and endpoint.tunnel:
                 self.tunnel_manager.close_tunnel(endpoint.tunnel)
 
+    async def columns_holding_json(
+        self, profile: DBProfile, table: str, columns: list[str]
+    ) -> tuple[bool, list[str], str]:
+        """Of the given text columns, the ones whose content really is JSON.
+
+        One query, one row sampled per column. Used by the preview to name a column
+        that holds JSON but has no rule, which is otherwise invisible: nothing looks
+        into it and nothing says why.
+        """
+        if not columns:
+            return True, [], ""
+        endpoint: ResolvedEndpoint | None = None
+        try:
+            endpoint = self._resolve_profile(profile)
+            host = endpoint.tunnel.local_host if endpoint.tunnel else profile.host
+            port = endpoint.tunnel.local_port if endpoint.tunnel else profile.port
+            password = self.secret_store.get_secret(profile.password_secret_key) or ""
+            found = await asyncio.to_thread(
+                _columns_holding_json_sync, host, port, profile.database, profile.username,
+                password, profile.db_type, table, columns, tls=endpoint.tls,
+            )
+            return True, found, ""
+        except Exception as exc:  # noqa: BLE001
+            return False, [], str(exc)
+        finally:
+            if endpoint and endpoint.tunnel:
+                self.tunnel_manager.close_tunnel(endpoint.tunnel)
+
     async def json_paths(
         self, profile: DBProfile, table: str, column: str, max_depth: int = 4
     ) -> tuple[bool, list[JsonNode], str]:
-        """Key paths inside a JSON column: (ok, nodes, error).
+        """Key paths inside a JSON column: (ok, nodes, note).
 
-        A column that does not hold valid JSON is an error for that column, not for
-        the run: the caller reports it and leaves the column alone.
+        Rows that are not valid JSON are left out of the search and keep their values;
+        the note says how many. Only a failure to read the column at all is an error,
+        and then for that column, not for the run.
         """
         endpoint: ResolvedEndpoint | None = None
         try:
@@ -1462,10 +1547,15 @@ class TransferService:
             host = endpoint.tunnel.local_host if endpoint.tunnel else profile.host
             port = endpoint.tunnel.local_port if endpoint.tunnel else profile.port
             password = self.secret_store.get_secret(profile.password_secret_key) or ""
-            nodes = await asyncio.to_thread(
+            nodes, invalid_rows = await asyncio.to_thread(
                 _json_paths_sync, host, port, profile.database, profile.username, password,
                 profile.db_type, table, column, max_depth, tls=endpoint.tls,
             )
+            if invalid_rows:
+                return True, nodes, (
+                    f"{invalid_rows} row(s) in {table}.{column} are not valid JSON; those rows "
+                    "keep their values, the others are rewritten"
+                )
             return True, nodes, ""
         except Exception as exc:  # noqa: BLE001
             return False, [], str(exc)
