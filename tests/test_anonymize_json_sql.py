@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from sqltransfer_app.anonymize import JsonTarget, TablePlan, update_statement
+from sqltransfer_app.anonymize import KINDS, JsonTarget, TablePlan, update_statement
 
 
 def _plan(*json_targets: JsonTarget, table: str = "kunde") -> TablePlan:
@@ -99,3 +99,34 @@ def test_a_row_that_is_not_valid_json_keeps_its_value(db_type):
     assert pruefung in sql, sql
     # The column keeps its own value where the check fails.
     assert "CASE WHEN" in sql and "END" in sql, sql
+
+
+@pytest.mark.parametrize("db_type", ["mysql", "postgres"])
+@pytest.mark.parametrize("kind", [k for k, _label in KINDS if k not in ("json",)])
+def test_every_kind_works_inside_json(kind, db_type):
+    """One parameter per placeholder, for every kind a rule can carry.
+
+    A replacement may embed the read value more than once: a full name takes first and
+    last name from the same hash. The path was counted once per embedding, so the
+    parameters ran out and the whole run died with "coroutine raised StopIteration"
+    before anything was written. Found with a rule 'contact' of kind fullname.
+    """
+    plan = TablePlan(table="axro_rma", targets=(), skipped=(),
+                     json_targets=(JsonTarget("rma_data", ("Rma", "contact"), kind, "longtext"),))
+    sql, params = update_statement(plan, db_type, "pepper")
+    assert len(params) == sql.count("%s"), f"{kind}: {len(params)} parameters for {sql.count('%s')} placeholders"
+
+
+@pytest.mark.parametrize("db_type", ["mysql", "postgres"])
+def test_several_kinds_in_one_column_keep_their_order(db_type):
+    plan = TablePlan(table="axro_rma", targets=(), skipped=(),
+                     json_targets=(JsonTarget("rma_data", ("Rma", "email"), "email", "longtext"),
+                                   JsonTarget("rma_data", ("Rma", "contact"), "fullname", "longtext"),
+                                   JsonTarget("rma_data", ("Rma", "ort"), "city", "longtext")))
+    sql, params = update_statement(plan, db_type, "pepper")
+    assert len(params) == sql.count("%s")
+    # Every path appears as a parameter, the salt fills the rest.
+    pfade = [p for p in params if p != "pepper"]
+    assert any("contact" in str(p) for p in pfade), pfade
+    assert any("email" in str(p) for p in pfade), pfade
+    assert any("ort" in str(p) for p in pfade), pfade

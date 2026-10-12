@@ -288,8 +288,13 @@ def _json_assignment(column: str, targets: list["JsonTarget"], db_type: str) -> 
             current = f"JSON_UNQUOTE(JSON_EXTRACT({quoted}, {PATH_TOKEN}))"
             replacement = _replacement(target.kind, current, db_type)
             # JSON_REPLACE touches only paths that exist: a row without the key keeps its value.
-            expression = f"JSON_REPLACE({expression}, {PATH_TOKEN}, {replacement})"
-            path_values += [path, path]
+            neu_ausdruck = f"JSON_REPLACE({expression}, {PATH_TOKEN}, {replacement})"
+            # Counted, not assumed: a replacement may embed the read value more than
+            # once (a full name takes first and last name from the same hash), and every
+            # embedding carries the path again. Assuming two cost the parameters their
+            # order and the run died with "coroutine raised StopIteration".
+            path_values += [path] * (neu_ausdruck.count(PATH_TOKEN) - expression.count(PATH_TOKEN))
+            expression = neu_ausdruck
         # A grown table holds rows that are not JSON at all (an empty string, a
         # truncated payload). They keep their value; one of them used to cost the
         # whole column, because the discovery refused it and nothing was rewritten.
@@ -305,8 +310,9 @@ def _json_assignment(column: str, targets: list["JsonTarget"], db_type: str) -> 
         current = f"({quoted}::jsonb #>> {PATH_TOKEN})"
         replacement = _replacement(target.kind, current, db_type)
         # create_missing = false does what JSON_REPLACE does on the other side.
-        expression = f"jsonb_set({expression}, {PATH_TOKEN}, to_jsonb({replacement}), false)"
-        path_values += [keys, keys]
+        neu_ausdruck = f"jsonb_set({expression}, {PATH_TOKEN}, to_jsonb({replacement}), false)"
+        path_values += [keys] * (neu_ausdruck.count(PATH_TOKEN) - expression.count(PATH_TOKEN))
+        expression = neu_ausdruck
     if column_type == "json":
         expression = f"({expression})::json"
     elif column_type != "jsonb":
