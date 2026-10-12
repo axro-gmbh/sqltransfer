@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from sqltransfer_app.anonymize import JsonTarget, TablePlan, update_statement
+from sqltransfer_app.anonymize import KINDS, JsonTarget, TablePlan, update_statement
 
 
 def _plan(*json_targets: JsonTarget, table: str = "kunde") -> TablePlan:
@@ -11,7 +11,9 @@ def _plan(*json_targets: JsonTarget, table: str = "kunde") -> TablePlan:
 
 def test_mysql_passes_the_path_as_a_parameter():
     sql, params = update_statement(_plan(JsonTarget("custom_fields", ("email",), "email")), "mysql", "s")
-    assert sql.startswith("UPDATE `kunde` SET `custom_fields` = JSON_REPLACE(`custom_fields`, %s,")
+    # The assignment is wrapped in the validity guard, the rewriting itself is unchanged.
+    assert sql.startswith("UPDATE `kunde` SET `custom_fields` = CASE WHEN")
+    assert "JSON_REPLACE(`custom_fields`, %s," in sql
     assert "JSON_UNQUOTE(JSON_EXTRACT(`custom_fields`, %s))" in sql
     assert '$."email"' not in sql                      # the path is data, not text
     assert params.count('$."email"') == 2
@@ -66,10 +68,12 @@ def test_postgres_casts_back_to_the_column_type(column_type, expected):
         _plan(JsonTarget("custom_fields", ("email",), "email", column_type)), "postgres", "s"
     )
     assert '"custom_fields"::jsonb' in sql
+    # The cast sits on the rewriting branch of the guard, not at the end of the statement.
+    zweig = sql.split("THEN ")[-2] if "THEN " in sql else sql
     if expected:
-        assert sql.rstrip().endswith(expected)
+        assert f"{expected} ELSE" in sql, sql
     else:
-        assert not sql.rstrip().endswith("::text") and not sql.rstrip().endswith("::json")
+        assert "::text ELSE" not in sql and "::json ELSE" not in sql, sql
 
 
 def test_mysql_needs_no_cast():
@@ -77,3 +81,52 @@ def test_mysql_needs_no_cast():
         _plan(JsonTarget("custom_fields", ("email",), "email", "longtext")), "mysql", "s"
     )
     assert "::" not in sql
+
+
+@pytest.mark.parametrize("db_type", ["mysql", "postgres"])
+def test_a_row_that_is_not_valid_json_keeps_its_value(db_type):
+    """A grown table holds legacy rows: an empty string, a truncated payload.
+
+    One of them used to cost the whole column: the discovery refused it and nothing in
+    that column was anonymized. The valid rows have to be rewritten and the others left
+    exactly as they are.
+    """
+    plan = TablePlan(table="axro_rma", targets=(), skipped=(),
+                     json_targets=(JsonTarget("rma_data", ("Rma", "email"), "email", "longtext"),))
+    sql, _params = update_statement(plan, db_type, "pepper")
+
+    pruefung = "JSON_VALID" if db_type == "mysql" else "pg_input_is_valid"
+    assert pruefung in sql, sql
+    # The column keeps its own value where the check fails.
+    assert "CASE WHEN" in sql and "END" in sql, sql
+
+
+@pytest.mark.parametrize("db_type", ["mysql", "postgres"])
+@pytest.mark.parametrize("kind", [k for k, _label in KINDS if k not in ("json",)])
+def test_every_kind_works_inside_json(kind, db_type):
+    """One parameter per placeholder, for every kind a rule can carry.
+
+    A replacement may embed the read value more than once: a full name takes first and
+    last name from the same hash. The path was counted once per embedding, so the
+    parameters ran out and the whole run died with "coroutine raised StopIteration"
+    before anything was written. Found with a rule 'contact' of kind fullname.
+    """
+    plan = TablePlan(table="axro_rma", targets=(), skipped=(),
+                     json_targets=(JsonTarget("rma_data", ("Rma", "contact"), kind, "longtext"),))
+    sql, params = update_statement(plan, db_type, "pepper")
+    assert len(params) == sql.count("%s"), f"{kind}: {len(params)} parameters for {sql.count('%s')} placeholders"
+
+
+@pytest.mark.parametrize("db_type", ["mysql", "postgres"])
+def test_several_kinds_in_one_column_keep_their_order(db_type):
+    plan = TablePlan(table="axro_rma", targets=(), skipped=(),
+                     json_targets=(JsonTarget("rma_data", ("Rma", "email"), "email", "longtext"),
+                                   JsonTarget("rma_data", ("Rma", "contact"), "fullname", "longtext"),
+                                   JsonTarget("rma_data", ("Rma", "ort"), "city", "longtext")))
+    sql, params = update_statement(plan, db_type, "pepper")
+    assert len(params) == sql.count("%s")
+    # Every path appears as a parameter, the salt fills the rest.
+    pfade = [p for p in params if p != "pepper"]
+    assert any("contact" in str(p) for p in pfade), pfade
+    assert any("email" in str(p) for p in pfade), pfade
+    assert any("ort" in str(p) for p in pfade), pfade
